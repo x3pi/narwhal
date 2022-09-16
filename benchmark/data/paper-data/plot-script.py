@@ -20,6 +20,9 @@ from itertools import cycle
 
 # --- PARSE DATA ---
 
+import matplotlib
+matplotlib.rcParams['pdf.fonttype'] = 42
+matplotlib.rcParams['ps.fonttype'] = 42
 
 class Setup:
     def __init__(self, faults, nodes, workers, collocate, rate, tx_size):
