@@ -218,12 +218,13 @@ impl Worker {
         );
 
         // The `Helper` is dedicated to reply to batch requests from other workers.
-        Helper::spawn(
+        let helper = Helper::new(
             self.id,
             self.committee.clone(),
             self.store.clone(),
             /* rx_request */ rx_helper,
         );
+        helper.spawn();
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
         // batch's digest to the `PrimaryConnector` that will send it to our primary.

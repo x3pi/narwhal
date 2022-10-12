@@ -9,10 +9,8 @@ pub struct WorkerMetrics {
     pub batch_sealed_total: IntCounterVec,
     pub quorum_waiter_time_millis_total: IntCounter,
     pub batch_persisted_total: IntCounterVec,
-    // pub commands_received: IntCounterVec,
-    // pub emergency_breaks: IntCounter,
-    // pub direction: IntCounterVec,
-    // pub speed: IntCounterVec,
+    pub batch_requests_total: IntCounterVec,
+    pub batch_request_replies_total: IntCounterVec,
 }
 
 impl WorkerMetrics {
@@ -27,7 +25,7 @@ impl WorkerMetrics {
             batch_sealed_total: register_int_counter_vec_with_registry!(
                 "batch_sealed_total",
                 "Total number of sealed batches",
-                &["reason"], // Full or timeout.
+                &["reason"], // Batch bull or timeout.
                 registry,
             )
             .unwrap(),
@@ -44,28 +42,20 @@ impl WorkerMetrics {
                 registry
             )
             .unwrap(),
-            // commands_received: register_int_counter_vec_with_registry!(
-            //     "commands_received",
-            //     "Number of commands received",
-            //     &["status"],
-            //     registry
-            // )
-            // .unwrap(),
-            // emergency_breaks: register_int_counter_with_registry!(
-            //     "emergency_breaks",
-            //     "Emergency breaks",
-            //     registry,
-            // )
-            // .unwrap(),
-            // direction: register_int_counter_vec_with_registry!(
-            //     "direction",
-            //     "Direction",
-            //     &["direction"],
-            //     registry
-            // )
-            // .unwrap(),
-            // speed: register_int_counter_vec_with_registry!("speed", "Speed", &["speed"], registry)
-            //     .unwrap(),
+            batch_requests_total: register_int_counter_vec_with_registry!(
+                "batch_requests_total",
+                "Total number of batch requests",
+                &["origin"], // The requestor
+                registry
+            )
+            .unwrap(),
+            batch_request_replies_total: register_int_counter_vec_with_registry!(
+                "batch_request_replies_total",
+                "Total number of batch replies",
+                &["origin"], // The requestor
+                registry
+            )
+            .unwrap(),
         }
     }
 }

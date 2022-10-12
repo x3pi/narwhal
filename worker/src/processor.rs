@@ -57,7 +57,7 @@ impl Processor {
         self
     }
 
-    /// Spawn a QuorumWaiter in a new task.
+    /// Spawn a Processor in a new task.
     pub fn spawn(mut self) {
         tokio::spawn(async move {
             self.run().await;

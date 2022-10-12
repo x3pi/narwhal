@@ -47,7 +47,7 @@ pub struct BatchMaker {
 }
 
 impl BatchMaker {
-    /// Create a new batch maker instance.
+    /// Create a BatchMaker maker instance.
     pub fn new(
         batch_size: usize,
         max_batch_delay: u64,
@@ -74,7 +74,7 @@ impl BatchMaker {
         self
     }
 
-    /// Spawn a batch maker in a new task.
+    /// Spawn a BatchMaker in a new task.
     pub fn spawn(mut self) {
         tokio::spawn(async move {
             self.run().await;
@@ -93,15 +93,7 @@ impl BatchMaker {
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
-
-                        if let Some(metrics) = self.metrics.as_ref() {
-                            metrics
-                                .batch_sealed_total
-                                .with_label_values(&["full"])
-                                .inc();
-                        }
-
-                        self.seal().await;
+                        self.seal("full").await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
                 },
@@ -109,15 +101,7 @@ impl BatchMaker {
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     if !self.current_batch.is_empty() {
-
-                        if let Some(metrics) = self.metrics.as_ref() {
-                            metrics
-                                .batch_sealed_total
-                                .with_label_values(&["timeout"])
-                                .inc();
-                        }
-
-                        self.seal().await;
+                        self.seal("timeout").await;
                     }
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                 }
@@ -129,11 +113,15 @@ impl BatchMaker {
     }
 
     /// Seal and broadcast the current batch.
-    async fn seal(&mut self) {
+    async fn seal(&mut self, reason: &str) {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
 
         if let Some(metrics) = self.metrics.as_ref() {
+            metrics
+                .batch_sealed_total
+                .with_label_values(&[reason])
+                .inc();
             metrics
                 .batch_size_bytes_total
                 .inc_by(self.current_batch_size as u64);
