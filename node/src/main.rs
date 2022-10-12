@@ -1,4 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::metrics::start_prometheus_server;
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
@@ -7,9 +8,12 @@ use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
 use env_logger::Env;
 use primary::{Certificate, Primary};
+use prometheus::default_registry;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::Worker;
+
+mod metrics;
 
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -32,6 +36,7 @@ async fn main() -> Result<()> {
                 .args_from_usage("--committee=<FILE> 'The file containing committee information'")
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
+                .args_from_usage("--prometheus=[Addr] 'The prometheus server address'")
                 .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
                 .subcommand(
                     SubCommand::with_name("worker")
@@ -91,6 +96,15 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
+    // Make a prometheus registry and start a prometheus server.
+    let registry = default_registry();
+    if let Some(address) = matches.value_of("prometheus") {
+        let socket_address = address
+            .parse()
+            .context("Invalid prometheus socket address")?;
+        let _handle = start_prometheus_server(socket_address, &registry);
+    }
+
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
@@ -121,7 +135,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .unwrap()
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
-            Worker::spawn(keypair.name, id, committee, parameters, store);
+            Worker::spawn(keypair.name, id, committee, parameters, store, &registry);
         }
         _ => unreachable!(),
     }

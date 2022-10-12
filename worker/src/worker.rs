@@ -13,6 +13,7 @@ use futures::sink::SinkExt as _;
 use log::{error, info, warn};
 use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
+use prometheus::Registry;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use store::Store;
@@ -59,6 +60,7 @@ impl Worker {
         committee: Committee,
         parameters: Parameters,
         store: Store,
+        registry: &Registry,
     ) {
         // Define a worker instance.
         let worker = Self {
@@ -71,9 +73,9 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages();
-        worker.handle_clients_transactions(tx_primary.clone());
-        worker.handle_workers_messages(tx_primary);
+        worker.handle_primary_messages(registry);
+        worker.handle_clients_transactions(tx_primary.clone(), registry);
+        worker.handle_workers_messages(tx_primary, registry);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -99,7 +101,7 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(&self, registry: &Registry) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from our primary.
@@ -126,7 +128,8 @@ impl Worker {
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
-        );
+        )
+        .set_metrics(registry);
         synchronizer.spawn();
 
         info!(
@@ -136,7 +139,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+    fn handle_clients_transactions(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        registry: &Registry,
+    ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -167,7 +174,8 @@ impl Worker {
                 .iter()
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
-        );
+        )
+        .set_metrics(registry);
         batch_maker.spawn();
 
         // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -177,7 +185,8 @@ impl Worker {
             /* stake */ self.committee.stake(&self.name),
             /* rx_message */ rx_quorum_waiter,
             /* tx_batch */ tx_processor,
-        );
+        )
+        .set_metrics(registry);
         quorum_waiter.spawn();
 
         // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the `PrimaryConnector`
@@ -188,7 +197,8 @@ impl Worker {
             /* rx_batch */ rx_processor,
             /* tx_digest */ tx_primary,
             /* own_batch */ true,
-        );
+        )
+        .set_metrics(registry);
         processor.spawn();
 
         info!(
@@ -198,7 +208,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from other workers.
-    fn handle_workers_messages(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+    fn handle_workers_messages(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        registry: &Registry,
+    ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
@@ -224,7 +238,8 @@ impl Worker {
             self.committee.clone(),
             self.store.clone(),
             /* rx_request */ rx_helper,
-        );
+        )
+        .set_metrics(registry);
         helper.spawn();
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
@@ -235,7 +250,8 @@ impl Worker {
             /* rx_batch */ rx_processor,
             /* tx_digest */ tx_primary,
             /* own_batch */ false,
-        );
+        )
+        .set_metrics(registry);
         processor.spawn();
 
         info!(
