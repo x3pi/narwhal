@@ -117,7 +117,7 @@ impl Worker {
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
         // it receives from the primary (which are mainly notifications that we are out of sync).
-        Synchronizer::spawn(
+        let synchronizer = Synchronizer::new(
             self.name,
             self.id,
             self.committee.clone(),
@@ -127,6 +127,7 @@ impl Worker {
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
         );
+        synchronizer.spawn();
 
         info!(
             "Worker {} listening to primary messages on {}",

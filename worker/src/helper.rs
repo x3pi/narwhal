@@ -74,7 +74,7 @@ impl Helper {
             };
             if let Some(metrics) = self.metrics.as_ref() {
                 metrics
-                    .batch_requests_total
+                    .batch_requests_received_total
                     .with_label_values(&[&format!("{origin}")])
                     .inc();
             }

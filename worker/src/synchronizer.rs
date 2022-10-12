@@ -1,5 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::worker::{Round, WorkerMessage};
+use crate::{
+    metrics::WorkerMetrics,
+    worker::{Round, WorkerMessage},
+};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -8,6 +11,7 @@ use futures::stream::StreamExt as _;
 use log::{debug, error};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
+use prometheus::Registry;
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::{Store, StoreError};
@@ -46,13 +50,16 @@ pub struct Synchronizer {
     round: Round,
     /// Keeps the digests (of batches) that are waiting to be processed by the primary. Their
     /// processing will resume when we get the missing batches in the store or we no longer need them.
-    /// It also keeps the round number and a timestamp (`u128`) of each request we sent.
-    pending: HashMap<Digest, (Round, Sender<()>, u128)>,
+    /// It also keeps the round number, a timestamp (`u128`) of each request we sent, and the attempted
+    /// target for the first request (useful for metrics).
+    pending: HashMap<Digest, (Round, Sender<()>, u128, PublicKey)>,
+    /// Prometheus metrics.
+    metrics: Option<WorkerMetrics>,
 }
 
 impl Synchronizer {
     #[allow(clippy::too_many_arguments)]
-    pub fn spawn(
+    pub fn new(
         name: PublicKey,
         id: WorkerId,
         committee: Committee,
@@ -61,23 +68,33 @@ impl Synchronizer {
         sync_retry_delay: u64,
         sync_retry_nodes: usize,
         rx_message: Receiver<PrimaryWorkerMessage>,
-    ) {
+    ) -> Self {
+        Self {
+            name,
+            id,
+            committee,
+            store,
+            gc_depth,
+            sync_retry_delay,
+            sync_retry_nodes,
+            rx_message,
+            network: SimpleSender::new(),
+            round: Round::default(),
+            pending: HashMap::new(),
+            metrics: None,
+        }
+    }
+
+    /// Configure prometheus metrics.
+    pub fn set_metrics(mut self, registry: &Registry) -> Self {
+        self.metrics = Some(WorkerMetrics::new(registry));
+        self
+    }
+
+    /// Spawn a Synchronizer in a new task.
+    pub fn spawn(mut self) {
         tokio::spawn(async move {
-            Self {
-                name,
-                id,
-                committee,
-                store,
-                gc_depth,
-                sync_retry_delay,
-                sync_retry_nodes,
-                rx_message,
-                network: SimpleSender::new(),
-                round: Round::default(),
-                pending: HashMap::new(),
-            }
-            .run()
-            .await;
+            self.run().await;
         });
     }
 
@@ -136,12 +153,19 @@ impl Synchronizer {
                                 }
                             }
 
+                            if let Some(metrics) = self.metrics.as_ref() {
+                                metrics
+                                    .batch_sync_total
+                                    .with_label_values(&[&format!("{target}")])
+                                    .inc_by(missing.len() as u64);
+                            }
+
                             // Add the digest to the waiter.
                             let deliver = digest.clone();
                             let (tx_cancel, rx_cancel) = channel(1);
                             let fut = Self::waiter(digest.clone(), self.store.clone(), deliver, rx_cancel);
                             waiting.push(fut);
-                            self.pending.insert(digest, (self.round, tx_cancel, now));
+                            self.pending.insert(digest, (self.round, tx_cancel, now, target));
                         }
 
                         // Send sync request to a single node. If this fails, we will send it
@@ -167,12 +191,12 @@ impl Synchronizer {
                         }
 
                         let mut gc_round = self.round - self.gc_depth;
-                        for (r, handler, _) in self.pending.values() {
+                        for (r, handler, _, _) in self.pending.values() {
                             if r <= &gc_round {
                                 let _ = handler.send(()).await;
                             }
                         }
-                        self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
+                        self.pending.retain(|_, (r, _, _, _)| r > &mut gc_round);
                     }
                 },
 
@@ -199,10 +223,17 @@ impl Synchronizer {
                         .as_millis();
 
                     let mut retry = Vec::new();
-                    for (digest, (_, _, timestamp)) in &self.pending {
+                    for (digest, (_, _, timestamp, attempted_target)) in &self.pending {
                         if timestamp + (self.sync_retry_delay as u128) < now {
                             debug!("Requesting sync for batch {} (retry)", digest);
                             retry.push(digest.clone());
+
+                            if let Some(metrics) = self.metrics.as_ref() {
+                                metrics
+                                    .batch_sync_retries_total
+                                    .with_label_values(&[&format!("{attempted_target}")])
+                                    .inc()
+                            }
                         }
                     }
                     if !retry.is_empty() {
