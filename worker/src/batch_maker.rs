@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::quorum_waiter::QuorumWaiterMessage;
 use crate::worker::WorkerMessage;
+use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterMessage};
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
@@ -10,6 +10,7 @@ use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
+use prometheus::Registry;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -41,29 +42,42 @@ pub struct BatchMaker {
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
+    /// Prometheus metrics.
+    metrics: Option<WorkerMetrics>,
 }
 
 impl BatchMaker {
-    pub fn spawn(
+    /// Create a new batch maker instance.
+    pub fn new(
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
-    ) {
+    ) -> Self {
+        Self {
+            batch_size,
+            max_batch_delay,
+            rx_transaction,
+            tx_message,
+            workers_addresses,
+            current_batch: Batch::with_capacity(batch_size * 2),
+            current_batch_size: 0,
+            network: ReliableSender::new(),
+            metrics: None,
+        }
+    }
+
+    /// Configure prometheus metrics.
+    pub fn set_metrics(mut self, registry: &Registry) -> Self {
+        self.metrics = Some(WorkerMetrics::new(registry));
+        self
+    }
+
+    /// Spawn a batch maker in a new task.
+    pub fn spawn(mut self) {
         tokio::spawn(async move {
-            Self {
-                batch_size,
-                max_batch_delay,
-                rx_transaction,
-                tx_message,
-                workers_addresses,
-                current_batch: Batch::with_capacity(batch_size * 2),
-                current_batch_size: 0,
-                network: ReliableSender::new(),
-            }
-            .run()
-            .await;
+            self.run().await;
         });
     }
 
@@ -79,6 +93,14 @@ impl BatchMaker {
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
+
+                        if let Some(metrics) = self.metrics.as_ref() {
+                            metrics
+                                .batch_sealed_total
+                                .with_label_values(&["full"])
+                                .inc();
+                        }
+
                         self.seal().await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
@@ -87,6 +109,14 @@ impl BatchMaker {
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     if !self.current_batch.is_empty() {
+
+                        if let Some(metrics) = self.metrics.as_ref() {
+                            metrics
+                                .batch_sealed_total
+                                .with_label_values(&["timeout"])
+                                .inc();
+                        }
+
                         self.seal().await;
                     }
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -102,6 +132,12 @@ impl BatchMaker {
     async fn seal(&mut self) {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
+
+        if let Some(metrics) = self.metrics.as_ref() {
+            metrics
+                .batch_size_bytes_total
+                .inc_by(self.current_batch_size as u64);
+        }
 
         // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]

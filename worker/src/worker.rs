@@ -155,7 +155,7 @@ impl Worker {
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
         // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
         // gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
-        BatchMaker::spawn(
+        let batch_maker = BatchMaker::new(
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
@@ -167,25 +167,28 @@ impl Worker {
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
         );
+        batch_maker.spawn();
 
         // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
         // the batch to the `Processor`.
-        QuorumWaiter::spawn(
+        let quorum_waiter = QuorumWaiter::new(
             self.committee.clone(),
             /* stake */ self.committee.stake(&self.name),
             /* rx_message */ rx_quorum_waiter,
             /* tx_batch */ tx_processor,
         );
+        quorum_waiter.spawn();
 
         // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the `PrimaryConnector`
         // that will send it to our primary machine.
-        Processor::spawn(
+        let processor = Processor::new(
             self.id,
             self.store.clone(),
             /* rx_batch */ rx_processor,
             /* tx_digest */ tx_primary,
             /* own_batch */ true,
         );
+        processor.spawn();
 
         info!(
             "Worker {} listening to client transactions on {}",
@@ -224,13 +227,14 @@ impl Worker {
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
         // batch's digest to the `PrimaryConnector` that will send it to our primary.
-        Processor::spawn(
+        let processor = Processor::new(
             self.id,
             self.store.clone(),
             /* rx_batch */ rx_processor,
             /* tx_digest */ tx_primary,
             /* own_batch */ false,
         );
+        processor.spawn();
 
         info!(
             "Worker {} listening to worker messages on {}",

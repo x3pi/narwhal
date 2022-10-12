@@ -1,11 +1,15 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::processor::SerializedBatchMessage;
+use crate::{metrics::WorkerMetrics, processor::SerializedBatchMessage};
 use config::{Committee, Stake};
 use crypto::PublicKey;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use network::CancelHandler;
-use tokio::sync::mpsc::{Receiver, Sender};
+use prometheus::Registry;
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    time::Instant,
+};
 
 #[cfg(test)]
 #[path = "tests/quorum_waiter_tests.rs"]
@@ -29,25 +33,37 @@ pub struct QuorumWaiter {
     rx_message: Receiver<QuorumWaiterMessage>,
     /// Channel to deliver batches for which we have enough acknowledgements.
     tx_batch: Sender<SerializedBatchMessage>,
+    /// Prometheus metrics.
+    metrics: Option<WorkerMetrics>,
 }
 
 impl QuorumWaiter {
-    /// Spawn a new QuorumWaiter.
-    pub fn spawn(
+    /// Create a new QuorumWaiter.
+    pub fn new(
         committee: Committee,
         stake: Stake,
         rx_message: Receiver<QuorumWaiterMessage>,
         tx_batch: Sender<Vec<u8>>,
-    ) {
+    ) -> Self {
+        Self {
+            committee,
+            stake,
+            rx_message,
+            tx_batch,
+            metrics: None,
+        }
+    }
+
+    /// Configure prometheus metrics.
+    pub fn set_metrics(mut self, registry: &Registry) -> Self {
+        self.metrics = Some(WorkerMetrics::new(registry));
+        self
+    }
+
+    /// Spawn a QuorumWaiter in a new task.
+    pub fn spawn(mut self) {
         tokio::spawn(async move {
-            Self {
-                committee,
-                stake,
-                rx_message,
-                tx_batch,
-            }
-            .run()
-            .await;
+            self.run().await;
         });
     }
 
@@ -60,6 +76,8 @@ impl QuorumWaiter {
     /// Main loop.
     async fn run(&mut self) {
         while let Some(QuorumWaiterMessage { batch, handlers }) = self.rx_message.recv().await {
+            let start = Instant::now();
+
             let mut wait_for_quorum: FuturesUnordered<_> = handlers
                 .into_iter()
                 .map(|(name, handler)| {
@@ -79,6 +97,12 @@ impl QuorumWaiter {
                         .send(batch)
                         .await
                         .expect("Failed to deliver batch");
+
+                    if let Some(metrics) = self.metrics.as_ref() {
+                        let duration = start.elapsed().as_millis() as u64;
+                        metrics.quorum_waiter_time_millis_total.inc_by(duration);
+                    }
+
                     break;
                 }
             }

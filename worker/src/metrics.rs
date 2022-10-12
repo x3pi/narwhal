@@ -6,7 +6,7 @@ use prometheus::{
 #[derive(Clone)]
 pub struct WorkerMetrics {
     pub batch_size_bytes_total: IntCounter,
-    pub batch_disseminated_total: IntCounter,
+    pub batch_sealed_total: IntCounterVec,
     pub quorum_waiter_time_millis_total: IntCounter,
     pub batch_persisted_total: IntCounterVec,
     // pub commands_received: IntCounterVec,
@@ -24,9 +24,10 @@ impl WorkerMetrics {
                 registry,
             )
             .unwrap(),
-            batch_disseminated_total: register_int_counter_with_registry!(
-                "batch_disseminated_total",
-                "Total number of disseminated batches",
+            batch_sealed_total: register_int_counter_vec_with_registry!(
+                "batch_sealed_total",
+                "Total number of sealed batches",
+                &["reason"], // Full or timeout.
                 registry,
             )
             .unwrap(),
@@ -39,7 +40,7 @@ impl WorkerMetrics {
             batch_persisted_total: register_int_counter_vec_with_registry!(
                 "batch_persisted_total",
                 "Total number of batch persisted",
-                &["batch_persisted_total"], // Owned or from other workers.
+                &["origin"], // Owned or from other workers.
                 registry
             )
             .unwrap(),
