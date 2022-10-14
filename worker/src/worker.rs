@@ -60,7 +60,7 @@ impl Worker {
         committee: Committee,
         parameters: Parameters,
         store: Store,
-        registry: &Registry,
+        registry: Option<&Registry>,
     ) {
         // Define a worker instance.
         let worker = Self {
@@ -101,7 +101,7 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self, registry: &Registry) {
+    fn handle_primary_messages(&self, registry: Option<&Registry>) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from our primary.
@@ -128,8 +128,11 @@ impl Worker {
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
-        )
-        .set_metrics(registry);
+        );
+        let synchronizer = match registry.as_ref() {
+            Some(registry) => synchronizer.set_metrics(registry),
+            None => synchronizer,
+        };
         synchronizer.spawn();
 
         info!(
@@ -142,7 +145,7 @@ impl Worker {
     fn handle_clients_transactions(
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
-        registry: &Registry,
+        registry: Option<&Registry>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -174,8 +177,11 @@ impl Worker {
                 .iter()
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
-        )
-        .set_metrics(registry);
+        );
+        let batch_maker = match registry.as_ref() {
+            Some(registry) => batch_maker.set_metrics(registry),
+            None => batch_maker,
+        };
         batch_maker.spawn();
 
         // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
@@ -185,8 +191,11 @@ impl Worker {
             /* stake */ self.committee.stake(&self.name),
             /* rx_message */ rx_quorum_waiter,
             /* tx_batch */ tx_processor,
-        )
-        .set_metrics(registry);
+        );
+        let quorum_waiter = match registry.as_ref() {
+            Some(registry) => quorum_waiter.set_metrics(registry),
+            None => quorum_waiter,
+        };
         quorum_waiter.spawn();
 
         // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the `PrimaryConnector`
@@ -197,8 +206,11 @@ impl Worker {
             /* rx_batch */ rx_processor,
             /* tx_digest */ tx_primary,
             /* own_batch */ true,
-        )
-        .set_metrics(registry);
+        );
+        let processor = match registry.as_ref() {
+            Some(registry) => processor.set_metrics(registry),
+            None => processor,
+        };
         processor.spawn();
 
         info!(
@@ -211,7 +223,7 @@ impl Worker {
     fn handle_workers_messages(
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
-        registry: &Registry,
+        registry: Option<&Registry>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -238,8 +250,11 @@ impl Worker {
             self.committee.clone(),
             self.store.clone(),
             /* rx_request */ rx_helper,
-        )
-        .set_metrics(registry);
+        );
+        let helper = match registry.as_ref() {
+            Some(registry) => helper.set_metrics(registry),
+            None => helper,
+        };
         helper.spawn();
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
@@ -250,8 +265,11 @@ impl Worker {
             /* rx_batch */ rx_processor,
             /* tx_digest */ tx_primary,
             /* own_batch */ false,
-        )
-        .set_metrics(registry);
+        );
+        let processor = match registry.as_ref() {
+            Some(registry) => processor.set_metrics(registry),
+            None => processor,
+        };
         processor.spawn();
 
         info!(

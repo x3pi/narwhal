@@ -97,13 +97,19 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
     // Make a prometheus registry and start a prometheus server.
-    let registry = default_registry();
-    if let Some(address) = matches.value_of("prometheus") {
-        let socket_address = address
-            .parse()
-            .context("Invalid prometheus socket address")?;
-        let _handle = start_prometheus_server(socket_address, &registry);
-    }
+    let registry = match matches.value_of("prometheus") {
+        Some(address) => {
+            let registry = default_registry();
+
+            let socket_address = address
+                .parse()
+                .context("Invalid prometheus socket address")?;
+            let _handle = start_prometheus_server(socket_address, &registry);
+
+            Some(registry)
+        }
+        None => None,
+    };
 
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
@@ -135,7 +141,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .unwrap()
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
-            Worker::spawn(keypair.name, id, committee, parameters, store, &registry);
+            Worker::spawn(keypair.name, id, committee, parameters, store, registry);
         }
         _ => unreachable!(),
     }

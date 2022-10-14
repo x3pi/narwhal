@@ -43,7 +43,9 @@ class CommandMaker:
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
         return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters} worker --id {id}')
+                f'--store {store} --parameters {parameters} '
+                f'worker --id {id}'
+                )
 
     @staticmethod
     def run_client(address, size, rate, nodes):
