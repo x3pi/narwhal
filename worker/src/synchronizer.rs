@@ -11,9 +11,8 @@ use futures::stream::StreamExt as _;
 use log::{debug, error};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
-use prometheus::Registry;
-use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{collections::HashMap, sync::Arc};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
@@ -54,7 +53,7 @@ pub struct Synchronizer {
     /// target for the first request (useful for metrics).
     pending: HashMap<Digest, (Round, Sender<()>, u128, PublicKey)>,
     /// Prometheus metrics.
-    metrics: Option<WorkerMetrics>,
+    metrics: Option<Arc<WorkerMetrics>>,
 }
 
 impl Synchronizer {
@@ -86,8 +85,8 @@ impl Synchronizer {
     }
 
     /// Configure prometheus metrics.
-    pub fn set_metrics(mut self, registry: &Registry) -> Self {
-        self.metrics = Some(WorkerMetrics::new(registry));
+    pub fn set_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 

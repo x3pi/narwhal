@@ -1,10 +1,13 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
+use crate::{
+    batch_maker::{Batch, BatchMaker, Transaction},
+    metrics::WorkerMetrics,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
@@ -15,7 +18,7 @@ use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
-use std::error::Error;
+use std::{error::Error, sync::Arc};
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 
@@ -71,11 +74,14 @@ impl Worker {
             store,
         };
 
+        // Set the worker metrics.
+        let metrics = registry.map(|x| Arc::new(WorkerMetrics::new(x)));
+
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages(registry);
-        worker.handle_clients_transactions(tx_primary.clone(), registry);
-        worker.handle_workers_messages(tx_primary, registry);
+        worker.handle_primary_messages(metrics.clone());
+        worker.handle_clients_transactions(tx_primary.clone(), metrics.clone());
+        worker.handle_workers_messages(tx_primary, metrics);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -101,7 +107,7 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self, registry: Option<&Registry>) {
+    fn handle_primary_messages(&self, metrics: Option<Arc<WorkerMetrics>>) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from our primary.
@@ -129,8 +135,8 @@ impl Worker {
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
         );
-        let synchronizer = match registry.as_ref() {
-            Some(registry) => synchronizer.set_metrics(registry),
+        let synchronizer = match metrics {
+            Some(metrics) => synchronizer.set_metrics(metrics),
             None => synchronizer,
         };
         synchronizer.spawn();
@@ -145,7 +151,7 @@ impl Worker {
     fn handle_clients_transactions(
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
-        registry: Option<&Registry>,
+        metrics: Option<Arc<WorkerMetrics>>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -178,8 +184,8 @@ impl Worker {
                 .map(|(name, addresses)| (*name, addresses.worker_to_worker))
                 .collect(),
         );
-        let batch_maker = match registry.as_ref() {
-            Some(registry) => batch_maker.set_metrics(registry),
+        let batch_maker = match metrics.clone() {
+            Some(metrics) => batch_maker.set_metrics(metrics),
             None => batch_maker,
         };
         batch_maker.spawn();
@@ -192,8 +198,8 @@ impl Worker {
             /* rx_message */ rx_quorum_waiter,
             /* tx_batch */ tx_processor,
         );
-        let quorum_waiter = match registry.as_ref() {
-            Some(registry) => quorum_waiter.set_metrics(registry),
+        let quorum_waiter = match metrics.clone() {
+            Some(metrics) => quorum_waiter.set_metrics(metrics),
             None => quorum_waiter,
         };
         quorum_waiter.spawn();
@@ -207,8 +213,8 @@ impl Worker {
             /* tx_digest */ tx_primary,
             /* own_batch */ true,
         );
-        let processor = match registry.as_ref() {
-            Some(registry) => processor.set_metrics(registry),
+        let processor = match metrics {
+            Some(metrics) => processor.set_metrics(metrics),
             None => processor,
         };
         processor.spawn();
@@ -223,7 +229,7 @@ impl Worker {
     fn handle_workers_messages(
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
-        registry: Option<&Registry>,
+        metrics: Option<Arc<WorkerMetrics>>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -251,8 +257,8 @@ impl Worker {
             self.store.clone(),
             /* rx_request */ rx_helper,
         );
-        let helper = match registry.as_ref() {
-            Some(registry) => helper.set_metrics(registry),
+        let helper = match metrics.clone() {
+            Some(metrics) => helper.set_metrics(metrics),
             None => helper,
         };
         helper.spawn();
@@ -266,8 +272,8 @@ impl Worker {
             /* tx_digest */ tx_primary,
             /* own_batch */ false,
         );
-        let processor = match registry.as_ref() {
-            Some(registry) => processor.set_metrics(registry),
+        let processor = match metrics {
+            Some(metrics) => processor.set_metrics(metrics),
             None => processor,
         };
         processor.spawn();

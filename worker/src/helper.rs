@@ -1,10 +1,11 @@
+use std::sync::Arc;
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{error, warn};
 use network::SimpleSender;
-use prometheus::Registry;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -27,7 +28,7 @@ pub struct Helper {
     /// A network sender to send the batches to the other workers.
     network: SimpleSender,
     /// Prometheus metrics.
-    metrics: Option<WorkerMetrics>,
+    metrics: Option<Arc<WorkerMetrics>>,
 }
 
 impl Helper {
@@ -48,8 +49,8 @@ impl Helper {
     }
 
     /// Configure prometheus metrics.
-    pub fn set_metrics(mut self, registry: &Registry) -> Self {
-        self.metrics = Some(WorkerMetrics::new(registry));
+    pub fn set_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 

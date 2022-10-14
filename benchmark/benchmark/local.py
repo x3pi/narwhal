@@ -5,13 +5,14 @@ from os.path import basename, splitext
 from time import sleep
 
 from benchmark.commands import CommandMaker
-from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError
+from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError, LocalPrometheusAddress
 from benchmark.logs import LogParser, ParseError
 from benchmark.utils import Print, BenchError, PathMaker
 
 
 class LocalBench:
     BASE_PORT = 3000
+    PROMETHEUS_PORT_OFFSET = 100
 
     def __init__(self, bench_parameters_dict, node_parameters_dict):
         try:
@@ -102,12 +103,20 @@ class LocalBench:
             # Run the workers (except the faulty ones).
             for i, addresses in enumerate(workers_addresses):
                 for (id, address) in addresses:
+                    if self.metrics:
+                        prometheus_address = LocalPrometheusAddress.make(
+                            address, self.PROMETHEUS_PORT_OFFSET
+                        )
+                    else:
+                        prometheus_address = None
+
                     cmd = CommandMaker.run_worker(
                         PathMaker.key_file(i),
                         PathMaker.committee_file(),
                         PathMaker.db_path(i, id),
                         PathMaker.parameters_file(),
                         id,  # The worker's id.
+                        metrics=prometheus_address,
                         debug=debug
                     )
                     log_file = PathMaker.worker_log_file(i, id)

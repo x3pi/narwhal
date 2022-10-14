@@ -5,8 +5,7 @@ use crypto::Digest;
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use primary::WorkerPrimaryMessage;
-use prometheus::Registry;
-use std::convert::TryInto;
+use std::{convert::TryInto, sync::Arc};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
@@ -29,7 +28,7 @@ pub struct Processor {
     /// Whether we are processing our own batches or the batches of other nodes.
     own_digest: bool,
     /// Prometheus metrics.
-    metrics: Option<WorkerMetrics>,
+    metrics: Option<Arc<WorkerMetrics>>,
 }
 
 impl Processor {
@@ -52,8 +51,8 @@ impl Processor {
     }
 
     /// Configure prometheus metrics.
-    pub fn set_metrics(mut self, registry: &Registry) -> Self {
-        self.metrics = Some(WorkerMetrics::new(registry));
+    pub fn set_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 

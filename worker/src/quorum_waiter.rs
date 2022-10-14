@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::{metrics::WorkerMetrics, processor::SerializedBatchMessage};
 use config::{Committee, Stake};
@@ -5,7 +7,6 @@ use crypto::PublicKey;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use network::CancelHandler;
-use prometheus::Registry;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::Instant,
@@ -34,7 +35,7 @@ pub struct QuorumWaiter {
     /// Channel to deliver batches for which we have enough acknowledgements.
     tx_batch: Sender<SerializedBatchMessage>,
     /// Prometheus metrics.
-    metrics: Option<WorkerMetrics>,
+    metrics: Option<Arc<WorkerMetrics>>,
 }
 
 impl QuorumWaiter {
@@ -55,8 +56,8 @@ impl QuorumWaiter {
     }
 
     /// Configure prometheus metrics.
-    pub fn set_metrics(mut self, registry: &Registry) -> Self {
-        self.metrics = Some(WorkerMetrics::new(registry));
+    pub fn set_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 

@@ -150,15 +150,28 @@ class Committee:
         assert isinstance(address, str)
         return address.split(':')[0]
 
+    @staticmethod
+    def port(address):
+        assert isinstance(address, str)
+        return address.split(':')[1]
+
 
 class LocalCommittee(Committee):
-    def __init__(self, names, port, workers):
+    def __init__(self, names, base_port, workers):
         assert isinstance(names, list)
         assert all(isinstance(x, str) for x in names)
-        assert isinstance(port, int)
+        assert isinstance(base_port, int)
         assert isinstance(workers, int) and workers > 0
         addresses = OrderedDict((x, ['127.0.0.1']*(1+workers)) for x in names)
-        super().__init__(addresses, port)
+        super().__init__(addresses, base_port)
+
+
+class LocalPrometheusAddress:
+    @staticmethod
+    def make(base_address, port_offset):
+        ip = Committee.ip(base_address)
+        port = int(Committee.port(base_address))
+        return f'{ip}:{port + port_offset}'
 
 
 class NodeParameters:
@@ -203,7 +216,6 @@ class BenchParameters:
                 raise ConfigError('Missing input rate')
             self.rate = [int(x) for x in rate]
 
-            
             self.workers = int(json['workers'])
 
             if 'collocate' in json:
@@ -212,10 +224,16 @@ class BenchParameters:
                 self.collocate = True
 
             self.tx_size = int(json['tx_size'])
-           
+
             self.duration = int(json['duration'])
 
             self.runs = int(json['runs']) if 'runs' in json else 1
+
+            if 'metrics' in json:
+                self.metrics = bool(json['metrics'])
+            else:
+                self.metrics = False
+
         except KeyError as e:
             raise ConfigError(f'Malformed bench parameters: missing key {e}')
 

@@ -36,16 +36,17 @@ class CommandMaker:
                 f'--store {store} --parameters {parameters} primary')
 
     @staticmethod
-    def run_worker(keys, committee, store, parameters, id, debug=False):
+    def run_worker(keys, committee, store, parameters, id, metrics=None, debug=False):
         assert isinstance(keys, str)
         assert isinstance(committee, str)
         assert isinstance(parameters, str)
+        assert isinstance(metrics, str) or metrics is None
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
+        prometheus = f'--prometheus {metrics}' if metrics is not None else ''
         return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters} '
-                f'worker --id {id}'
-                )
+                f'--store {store} --parameters {parameters} {prometheus} '
+                f'worker --id {id}')
 
     @staticmethod
     def run_client(address, size, rate, nodes):

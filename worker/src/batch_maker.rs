@@ -10,10 +10,9 @@ use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
-use prometheus::Registry;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -43,7 +42,7 @@ pub struct BatchMaker {
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
     /// Prometheus metrics.
-    metrics: Option<WorkerMetrics>,
+    metrics: Option<Arc<WorkerMetrics>>,
 }
 
 impl BatchMaker {
@@ -69,8 +68,9 @@ impl BatchMaker {
     }
 
     /// Configure prometheus metrics.
-    pub fn set_metrics(mut self, registry: &Registry) -> Self {
-        self.metrics = Some(WorkerMetrics::new(registry));
+    /// Configure prometheus metrics.
+    pub fn set_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
+        self.metrics = Some(metrics);
         self
     }
 
