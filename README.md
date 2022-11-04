@@ -1,3 +1,6 @@
+> **Note to readers:** MystenLabs is make this codebase [production ready](https://github.com/MystenLabs/sui/tree/main/narwhal).
+
+
 # Narwhal and Tusk
 
 [![build status](https://img.shields.io/github/workflow/status/asonnino/narwhal/Rust/master?style=flat-square&logo=github)](https://github.com/asonnino/narwhal/actions)
