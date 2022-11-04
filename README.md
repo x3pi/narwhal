@@ -1,4 +1,4 @@
-> **Note to readers:** MystenLabs is making this codebase production ready [here](https://github.com/MystenLabs/sui/tree/main/narwhal).
+> **Note to readers:** MystenLabs is making this codebase production-ready [here](https://github.com/MystenLabs/sui/tree/main/narwhal).
 
 
 # Narwhal and Tusk
