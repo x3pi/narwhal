@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header, Vote};
 use bytes::Bytes;
-use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
+use config::{Authority, Committee, ExecutorAddresses, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
 use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
 use futures::sink::SinkExt as _;
@@ -53,12 +53,16 @@ pub fn committee() -> Committee {
                 .iter()
                 .cloned()
                 .collect();
+                let executor = ExecutorAddresses {
+                    worker_to_executor: format!("127.0.0.1:{}", 600 + i).parse().unwrap(),
+                };
                 (
                     *id,
                     Authority {
                         stake: 1,
                         primary,
                         workers,
+                        executor,
                     },
                 )
             })

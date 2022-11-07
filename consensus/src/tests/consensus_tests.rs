@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use config::{Authority, PrimaryAddresses};
+use config::{Authority, ExecutorAddresses, PrimaryAddresses};
 use crypto::{generate_keypair, SecretKey};
 use primary::Header;
 use rand::rngs::StdRng;
@@ -29,6 +29,9 @@ pub fn mock_committee() -> Committee {
                             worker_to_primary: "0.0.0.0:0".parse().unwrap(),
                         },
                         workers: HashMap::default(),
+                        executor: ExecutorAddresses {
+                            worker_to_executor: "0.0.0.0:0".parse().unwrap(),
+                        },
                     },
                 )
             })

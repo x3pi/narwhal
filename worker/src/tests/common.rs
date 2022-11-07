@@ -2,7 +2,7 @@
 use crate::batch_maker::{Batch, Transaction};
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
-use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
+use config::{Authority, Committee, ExecutorAddresses, PrimaryAddresses, WorkerAddresses};
 use crypto::{generate_keypair, Digest, PublicKey, SecretKey};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
@@ -44,12 +44,16 @@ pub fn committee() -> Committee {
                 .iter()
                 .cloned()
                 .collect();
+                let executor = ExecutorAddresses {
+                    worker_to_executor: format!("127.0.0.1:{}", 600 + i).parse().unwrap(),
+                };
                 (
                     *id,
                     Authority {
                         stake: 1,
                         primary,
                         workers,
+                        executor,
                     },
                 )
             })

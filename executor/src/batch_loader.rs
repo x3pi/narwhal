@@ -93,7 +93,7 @@ impl BatchLoader {
                 .committee
                 .worker(&self.name, &worker)
                 .expect(&format!("Our worker {} is not in the committee", worker))
-                .executor_to_worker;
+                .worker_to_worker;
             let message = WorkerMessage::ExecutorRequest(digests, self.name);
             let serialized =
                 bincode::serialize(&message).expect("(Failed to serialize executor message");
