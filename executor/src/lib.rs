@@ -1,82 +1,86 @@
-use crypto::{Digest, Hash};
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
-use serde::{Deserialize, Serialize};
+use crate::batch_loader::BatchLoader;
+use crate::core::Core;
+use async_trait::async_trait;
+use batch_loader::SerializedBatchMessage;
+use bytes::Bytes;
+use config::{Committee, Parameters};
+use crypto::PublicKey;
+use log::info;
+use network::{MessageHandler, Writer};
+use primary::Certificate;
+use store::Store;
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 mod batch_loader;
+mod core;
+mod transaction;
 
-/// The object's version number.
-pub type ObjectVersion = u64;
+/// The default channel capacity for each channel of the executor.
+pub const CHANNEL_CAPACITY: usize = 1_000;
 
-/// A dumb object in the system.
-#[derive(Serialize, Deserialize)]
-pub struct Object {
-    /// The unique object's id.
-    pub id: Digest,
-    /// The object's content. This field is used to set the object's size.
-    pub content: Vec<u8>,
-    /// The object's version number.
-    pub version: ObjectVersion,
-}
+pub struct Executor;
 
-impl Hash for Object {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(&self.content);
-        hasher.update(self.version.to_le_bytes());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+impl Executor {
+    pub fn spawn(
+        name: PublicKey,
+        committee: Committee,
+        parameters: Parameters,
+        store_path: &str,
+        rx_consensus: Receiver<Certificate>,
+    ) {
+        let (tx_worker, rx_worker) = channel(CHANNEL_CAPACITY);
+        let (tx_core, rx_core) = channel(CHANNEL_CAPACITY);
+
+        // Spawn the network receiver listening to messages from the other primaries.
+        let mut address = committee
+            .executor(&name)
+            .expect("Our public key is not in the committee")
+            .worker_to_executor;
+        address.set_ip("0.0.0.0".parse().unwrap());
+        NetworkReceiver::spawn(
+            address,
+            /* handler */
+            ExecutorReceiverHandler { tx_worker },
+        );
+        info!("Executor {} listening to batches on {}", name, address);
+
+        // Make the data store.
+        let store = Store::new(store_path).expect("Failed to create a store");
+
+        // The `BatchLoader` download the batches of all certificates referenced by sequenced
+        // certificates into the local store.
+        BatchLoader::spawn(
+            name,
+            committee,
+            store,
+            rx_consensus,
+            rx_worker,
+            tx_core,
+            parameters.sync_retry_delay,
+        );
+
+        // The execution `Core` execute every sequenced transaction.
+        Core::spawn(/* rx_batch_loader */ rx_core);
     }
 }
 
-impl Object {
-    /// Create a new object with the specified content.
-    pub fn new(content: Vec<u8>) -> Self {
-        let object = Self {
-            id: Digest::default(),
-            content,
-            version: ObjectVersion::default(),
-        };
-        Self {
-            id: object.digest(),
-            ..object
-        }
-    }
+/// Defines how the network receiver handles incoming workers messages.
+#[derive(Clone)]
+struct ExecutorReceiverHandler {
+    tx_worker: Sender<SerializedBatchMessage>,
 }
 
-/// A transaction updating or creating objects.
-#[derive(Serialize, Deserialize)]
-pub struct Transaction {
-    /// The unique id of the transaction.
-    pub id: Digest,
-    /// The list of objects that this transaction reads or modifies.
-    pub inputs: Vec<Object>,
-    /// Represents the smart contract to execute. In this fake transaction,
-    /// it determines the number of ms of CPU time needed to execute it.
-    pub contract: u64,
-}
-
-impl Hash for Transaction {
-    fn digest(&self) -> Digest {
-        let mut hasher = Sha512::new();
-        hasher.update(&self.contract.to_le_bytes());
-        for object in &self.inputs {
-            hasher.update(&object.id);
-        }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
-    }
-}
-
-impl Transaction {
-    /// Creates a transaction calling a contract with the specified objects.
-    pub fn new(inputs: Vec<Object>, contract: u64) -> Self {
-        let transaction = Self {
-            id: Digest::default(),
-            contract,
-            inputs,
-        };
-        Self {
-            id: transaction.digest(),
-            ..transaction
-        }
+#[async_trait]
+impl MessageHandler for ExecutorReceiverHandler {
+    async fn dispatch(
+        &self,
+        _writer: &mut Writer,
+        serialized: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
+        self.tx_worker
+            .send(serialized.to_vec())
+            .await
+            .expect("failed to send batch to executor");
+        Ok(())
     }
 }

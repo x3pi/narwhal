@@ -131,8 +131,6 @@ pub struct WorkerAddresses {
 
 #[derive(Clone, Deserialize)]
 pub struct ExecutorAddresses {
-    /// Address to receive messages from the primary (WAN).
-    pub primary_to_primary: SocketAddr,
     /// Address to receive messages from our workers (WAN).
     pub worker_to_executor: SocketAddr,
 }
