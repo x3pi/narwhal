@@ -6,6 +6,8 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
 use env_logger::Env;
+#[cfg(feature = "simple_executor")]
+use executor::Executor;
 use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
@@ -97,6 +99,19 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         ("primary", _) => {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+
+            #[cfg(feature = "simple_executor")]
+            {
+                let store_path = store_path.to_owned() + "_executor";
+                Executor::spawn(
+                    keypair.name,
+                    committee.clone(),
+                    parameters.clone(),
+                    &store_path,
+                    rx_output,
+                )
+            }
+
             Primary::spawn(
                 keypair,
                 committee.clone(),
@@ -127,6 +142,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     }
 
     // Analyze the consensus' output.
+    #[cfg(not(feature = "simple_executor"))]
     analyze(rx_output).await;
 
     // If this expression is reached, the program ends and all other tasks terminate.
@@ -134,8 +150,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
+#[cfg(not(feature = "simple_executor"))]
 async fn analyze(mut rx_output: Receiver<Certificate>) {
     while let Some(_certificate) = rx_output.recv().await {
-        // NOTE: Here goes the application logic.
+        // NOTE: Application logic goes here.
     }
 }

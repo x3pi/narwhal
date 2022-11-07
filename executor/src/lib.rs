@@ -1,3 +1,5 @@
+use std::error::Error;
+
 use crate::batch_loader::BatchLoader;
 use crate::core::Core;
 use async_trait::async_trait;
@@ -6,6 +8,7 @@ use bytes::Bytes;
 use config::{Committee, Parameters};
 use crypto::PublicKey;
 use log::info;
+use network::Receiver as NetworkReceiver;
 use network::{MessageHandler, Writer};
 use primary::Certificate;
 use store::Store;

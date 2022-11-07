@@ -22,9 +22,11 @@ crypto = { path = "../crypto" }
 primary = { path = "../primary" }
 worker = { path = "../worker" }
 consensus = { path = "../consensus" }
+executor = { path  = "../executor" }
 
 [features]
 benchmark = ["worker/benchmark", "primary/benchmark", "consensus/benchmark"]
+simple-executor = []
 
 [[bin]]         
 name = "benchmark_client"   

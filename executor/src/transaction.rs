@@ -28,6 +28,7 @@ impl Hash for Object {
 
 impl Object {
     /// Create a new object with the specified content.
+    #[allow(unused)]
     pub fn new(content: Vec<u8>) -> Self {
         let object = Self {
             id: Digest::default(),
@@ -66,6 +67,7 @@ impl Hash for Transaction {
 
 impl Transaction {
     /// Creates a transaction calling a contract with the specified objects.
+    #[allow(unused)]
     pub fn new(inputs: Vec<Object>, contract: u64) -> Self {
         let transaction = Self {
             id: Digest::default(),
