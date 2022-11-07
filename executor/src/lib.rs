@@ -3,6 +3,8 @@ use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use serde::{Deserialize, Serialize};
 
+mod batch_loader;
+
 /// The object's version number.
 pub type ObjectVersion = u64;
 
