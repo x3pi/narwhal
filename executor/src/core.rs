@@ -31,13 +31,15 @@ impl Core {
     }
 
     /// Simple function simulating a CPU-intensive execution.
-    #[no_mangle]
     async fn burn_cpu() {
-        let mut _x = 0;
-        loop {
-            _x += 1;
-            _x -= 1;
+        fn x() {
+            let mut _x = 0;
+            loop {
+                _x += 1;
+                _x -= 1;
+            }
         }
+        std::hint::black_box(x())
     }
 
     /// Main loop receiving batches to execute.
@@ -66,7 +68,7 @@ impl Core {
 
                         // Execute the transaction.
                         let duration = Duration::from_millis(transaction.contract);
-                        let _ = timeout(duration, std::hint::black_box(Self::burn_cpu())).await;
+                        let _ = timeout(duration, Self::burn_cpu()).await;
 
                         #[cfg(not(feature = "benchmark"))]
                         {
