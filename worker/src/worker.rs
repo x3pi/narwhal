@@ -1,10 +1,13 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
+use crate::{
+    batch_maker::{Batch, BatchMaker, Transaction},
+    helper::ExecutorHelper,
+};
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
@@ -37,6 +40,7 @@ pub type SerializedBatchDigestMessage = Vec<u8>;
 pub enum WorkerMessage {
     Batch(Batch),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
+    ExecutorRequest(Vec<Digest>, /* origin */ PublicKey),
 }
 
 pub struct Worker {
@@ -197,6 +201,7 @@ impl Worker {
     fn handle_workers_messages(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
+        let (tx_executor_helper, rx_executor_helper) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from other workers.
         let mut address = self
@@ -211,6 +216,7 @@ impl Worker {
             WorkerReceiverHandler {
                 tx_helper,
                 tx_processor,
+                tx_executor_helper,
             },
         );
 
@@ -220,6 +226,14 @@ impl Worker {
             self.committee.clone(),
             self.store.clone(),
             /* rx_request */ rx_helper,
+        );
+
+        // Used by the executor of this authority to fetch transactions' data.
+        ExecutorHelper::spawn(
+            self.name,
+            self.committee.clone(),
+            self.store.clone(),
+            /* rx_request */ rx_executor_helper,
         );
 
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
@@ -265,6 +279,7 @@ impl MessageHandler for TxReceiverHandler {
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
+    tx_executor_helper: Sender<(Vec<Digest>, PublicKey)>,
 }
 
 #[async_trait]
@@ -285,6 +300,11 @@ impl MessageHandler for WorkerReceiverHandler {
                 .send((missing, requestor))
                 .await
                 .expect("Failed to send batch request"),
+            Ok(WorkerMessage::ExecutorRequest(missing, requestor)) => self
+                .tx_executor_helper
+                .send((missing, requestor))
+                .await
+                .expect("Failed to send executor request"),
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())

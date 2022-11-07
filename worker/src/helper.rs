@@ -49,7 +49,7 @@ impl Helper {
         while let Some((digests, origin)) = self.rx_request.recv().await {
             // TODO [issue #7]: Do some accounting to prevent bad nodes from monopolizing our resources.
 
-            // get the requestors address.
+            // Get the requestors address.
             let address = match self.committee.worker(&origin, &self.id) {
                 Ok(x) => x.worker_to_worker,
                 Err(e) => {
@@ -59,6 +59,65 @@ impl Helper {
             };
 
             // Reply to the request (the best we can).
+            for digest in digests {
+                match self.store.read(digest.to_vec()).await {
+                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
+                    Ok(None) => (),
+                    Err(e) => error!("{}", e),
+                }
+            }
+        }
+    }
+}
+
+pub struct ExecutorHelper {
+    /// The public key of this authority.
+    name: PublicKey,
+    /// The committee information.
+    committee: Committee,
+    /// The persistent storage.
+    store: Store,
+    /// Input channel to receive batch requests.
+    rx_request: Receiver<(Vec<Digest>, PublicKey)>,
+    /// A network sender to send the batches to the other workers.
+    network: SimpleSender,
+}
+
+impl ExecutorHelper {
+    pub fn spawn(
+        name: PublicKey,
+        committee: Committee,
+        store: Store,
+        rx_request: Receiver<(Vec<Digest>, PublicKey)>,
+    ) {
+        tokio::spawn(async move {
+            Self {
+                name,
+                committee,
+                store,
+                rx_request,
+                network: SimpleSender::new(),
+            }
+            .run()
+            .await;
+        });
+    }
+
+    async fn run(&mut self) {
+        while let Some((digests, origin)) = self.rx_request.recv().await {
+            // Only the executor of this validator can send requests.
+            if origin != self.name {
+                warn!("Unexpected batch request from: {}", origin);
+                continue;
+            }
+
+            // Reply to the request (the best we can).
+            let address = self
+                .committee
+                .executor(&self.name)
+                .expect("Our public key is not in the committee")
+                .worker_to_executor;
+
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
                     Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,

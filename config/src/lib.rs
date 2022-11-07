@@ -125,6 +125,16 @@ pub struct WorkerAddresses {
     pub worker_to_worker: SocketAddr,
     /// Address to receive messages from our primary (LAN).
     pub primary_to_worker: SocketAddr,
+    /// Address to receive messages from our executor (WAN).
+    pub executor_to_worker: SocketAddr,
+}
+
+#[derive(Clone, Deserialize)]
+pub struct ExecutorAddresses {
+    /// Address to receive messages from the primary (WAN).
+    pub primary_to_primary: SocketAddr,
+    /// Address to receive messages from our workers (WAN).
+    pub worker_to_executor: SocketAddr,
 }
 
 #[derive(Clone, Deserialize)]
@@ -135,6 +145,8 @@ pub struct Authority {
     pub primary: PrimaryAddresses,
     /// Map of workers' id and their network addresses.
     pub workers: HashMap<WorkerId, WorkerAddresses>,
+    /// The network addresses of the executor.
+    pub executor: ExecutorAddresses,
 }
 
 #[derive(Clone, Deserialize)]
@@ -250,6 +262,14 @@ impl Committee {
                     .map(|(_, addresses)| (*name, addresses.clone()))
             })
             .collect()
+    }
+
+    /// Returns the address of our executor.
+    pub fn executor(&self, myself: &PublicKey) -> Result<ExecutorAddresses, ConfigError> {
+        self.authorities
+            .get(myself)
+            .map(|x| x.executor.clone())
+            .ok_or_else(|| ConfigError::NotInCommittee(*myself))
     }
 }
 
