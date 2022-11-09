@@ -157,6 +157,27 @@ impl Client {
         .await;
     }
 
+    fn best_object_size(&self) -> usize {
+        let mut rng = rand::thread_rng();
+
+        let mut object_size = self.size / self.objects;
+
+        while object_size > 0 {
+            let object_content = vec![0; object_size];
+            let objects = (0..self.objects)
+                .map(|_| Object::random(&mut rng, object_content.clone()))
+                .collect();
+            let tx = Transaction::new(objects, self.execution_time);
+            let serialized = bincode::serialize(&tx).unwrap();
+
+            if serialized.len() <= self.size {
+                break;
+            }
+            object_size -= 1;
+        }
+        object_size
+    }
+
     pub async fn send_executor_transactions(&self) -> Result<()> {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
@@ -177,7 +198,7 @@ impl Client {
         let mut rng = rand::thread_rng();
         let mut counter = 0;
 
-        let object_size = self.size / self.objects;
+        let object_size = self.best_object_size();
         let object_content = vec![0; object_size];
         let mut buf = BytesMut::default();
 
@@ -201,6 +222,11 @@ impl Client {
                     .collect();
                 let tx = Transaction::new(objects, self.execution_time);
                 let serialized = bincode::serialize(&tx).unwrap();
+
+                if counter == 0 && x == 0 {
+                    info!("Actual Objects size: {} B", object_size);
+                    info!("Actual Transaction size: {} B", serialized.len());
+                }
 
                 if x == counter % burst {
                     // NOTE: This log entry is used to compute performance.
