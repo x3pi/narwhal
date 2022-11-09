@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use crate::{batch_loader::SerializedBatchMessage, transaction::Transaction};
 use crypto::Digest;
-use log::{debug, info, warn};
+use log::{debug, info};
 use primary::Certificate;
 use tokio::{sync::mpsc::Receiver, time::Instant};
 use worker::WorkerMessage;
@@ -60,11 +60,11 @@ impl Core {
 
                     // Deserialize each transaction.
                     for serialized_tx in batch {
-                        #[cfg(features = "benchmark")]
+                        #[cfg(feature = "benchmark")]
                         // The first 9 bytes of the serialized transaction are used as identification
                         // tags and are not part of the actual transaction.
                         let bytes = &serialized_tx[9..];
-                        #[cfg(not(features = "benchmark"))]
+                        #[cfg(not(feature = "benchmark"))]
                         let bytes = &serialized_tx;
 
                         let transaction: Transaction = match bincode::deserialize(bytes) {
@@ -73,8 +73,11 @@ impl Core {
                                 #[cfg(feature = "benchmark")]
                                 panic!("Failed to deserialize transaction: {e}");
 
-                                warn!("Failed to deserialize transaction: {e}");
-                                continue;
+                                #[cfg(not(feature = "benchmark"))]
+                                {
+                                    log::warn!("Failed to deserialize transaction: {e}");
+                                    continue;
+                                }
                             }
                         };
 

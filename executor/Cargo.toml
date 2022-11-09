@@ -21,3 +21,6 @@ store = { path = "../store" }
 network = { path = "../network" }
 primary = { path = "../primary" }
 worker = { path = "../worker" }
+
+[features]
+benchmark = []

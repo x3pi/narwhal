@@ -25,7 +25,7 @@ consensus = { path = "../consensus" }
 executor = { path  = "../executor" }
 
 [features]
-benchmark = ["worker/benchmark", "primary/benchmark", "consensus/benchmark"]
+benchmark = ["worker/benchmark", "primary/benchmark", "consensus/benchmark", "executor/benchmark"]
 simple-executor = []
 
 [[bin]]         

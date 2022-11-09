@@ -20,7 +20,7 @@ def local(ctx, debug=True):
         'tx_size': 512,
         'executor': True,
         'num_objects': 2,
-        'exec_time': 1,
+        'exec_time': 5,
         'duration': 20,
     }
     node_params = {

@@ -218,7 +218,7 @@ impl Client {
                 if let Err(e) = transport.send(bytes).await {
                     warn!("Failed to send transaction: {}", e);
                     break 'main;
-                }
+                };
             }
             if now.elapsed().as_millis() > BURST_DURATION as u128 {
                 // NOTE: This log entry is used to compute performance.
