@@ -21,7 +21,7 @@ class Key:
 
 
 class Committee:
-    ''' The committee looks as follows:
+    ''' The committee looks as follows (the executor is optional):
         "authorities: {
             "name": {
                 "stake": 1,
@@ -36,6 +36,9 @@ class Committee:
                         "transactions": x.x.x.x:x
                     },
                     ...
+                },
+                "executor": {
+                    "worker_to_executor": x.x.x.x:x,
                 }
             },
             ...
@@ -79,10 +82,16 @@ class Committee:
                 }
                 port += 3
 
+            executor_addr = {
+                'worker_to_executor': f'{host}:{port}'
+            }
+            port += 1
+
             self.json['authorities'][name] = {
                 'stake': 1,
                 'primary': primary_addr,
-                'workers': workers_addr
+                'workers': workers_addr,
+                'executor': executor_addr
             }
 
     def primary_addresses(self, faults=0):
@@ -203,7 +212,6 @@ class BenchParameters:
                 raise ConfigError('Missing input rate')
             self.rate = [int(x) for x in rate]
 
-            
             self.workers = int(json['workers'])
 
             if 'collocate' in json:
@@ -212,10 +220,24 @@ class BenchParameters:
                 self.collocate = True
 
             self.tx_size = int(json['tx_size'])
-           
+
             self.duration = int(json['duration'])
 
             self.runs = int(json['runs']) if 'runs' in json else 1
+
+            if 'executor' in json:
+                self.executor = bool(json['executor'])
+                self.num_objects = int(json['num_objects'])
+                self.exec_time = int(json['exec_time'])
+                if self.num_objects == 0 or self.exec_time == 0:
+                    raise ConfigError(
+                        'execution time and num of objects cannot be zero'
+                    )
+            else:
+                self.executor = False
+                self.num_objects = 0
+                self.exec_time = 0
+
         except KeyError as e:
             raise ConfigError(f'Malformed bench parameters: missing key {e}')
 

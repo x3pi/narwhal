@@ -17,8 +17,9 @@ class CommandMaker:
         return f'rm -r {PathMaker.logs_path()} ; mkdir -p {PathMaker.logs_path()}'
 
     @staticmethod
-    def compile():
-        return 'cargo build --quiet --release --features benchmark'
+    def compile(executor=False):
+        exec = '--all-features' if executor else '--features benchmark'
+        return f'cargo build --quiet --release {exec}'
 
     @staticmethod
     def generate_key(filename):

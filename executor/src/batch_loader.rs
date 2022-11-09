@@ -161,9 +161,12 @@ impl BatchLoader {
                         .as_slice()[..32]
                         .try_into()
                         .unwrap());
-                    self.store.write(digest.to_vec(), batch).await;
 
-                    debug!("Received batch {digest}");
+                    if !batch.is_empty() {
+                        debug!("Received (serialized) batch message {digest} ({} B)", batch.len());
+                    }
+
+                    self.store.write(digest.to_vec(), batch).await;
 
                     // Clear the pending map.
                     let _ = self.pending.remove(&digest);

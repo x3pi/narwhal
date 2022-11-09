@@ -6,11 +6,11 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
 use env_logger::Env;
-#[cfg(feature = "simple_executor")]
+#[cfg(feature = "simple-executor")]
 use executor::Executor;
-use primary::{Certificate, Primary};
+use primary::Primary;
 use store::Store;
-use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::mpsc::channel;
 use worker::Worker;
 
 /// The default channel capacity.
@@ -100,8 +100,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
 
-            #[cfg(feature = "simple_executor")]
+            #[cfg(feature = "simple-executor")]
             {
+                log::info!("Node compiled with executor");
                 let store_path = store_path.to_owned() + "_executor";
                 Executor::spawn(
                     keypair.name,
@@ -142,16 +143,19 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     }
 
     // Analyze the consensus' output.
-    #[cfg(not(feature = "simple_executor"))]
+    #[cfg(not(feature = "simple-executor"))]
     analyze(rx_output).await;
 
     // If this expression is reached, the program ends and all other tasks terminate.
-    unreachable!();
+    // unreachable!();
+    loop {
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    }
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
-#[cfg(not(feature = "simple_executor"))]
-async fn analyze(mut rx_output: Receiver<Certificate>) {
+#[cfg(not(feature = "simple-executor"))]
+async fn analyze(mut rx_output: tokio::sync::mpsc::Receiver<primary::Certificate>) {
     while let Some(_certificate) = rx_output.recv().await {
         // NOTE: Application logic goes here.
     }

@@ -97,11 +97,13 @@ async fn main() -> Result<()> {
 
     // Start the benchmark.
     if client.bytes_transactions() {
+        info!("Sending bytes transactions");
         client
             .send_bytes_transactions()
             .await
             .context("Failed to submit transactions")
     } else {
+        info!("Sending executable transactions");
         client
             .send_executor_transactions()
             .await

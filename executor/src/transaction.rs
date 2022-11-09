@@ -64,13 +64,13 @@ pub struct Transaction {
     pub inputs: Vec<Object>,
     /// Represents the smart contract to execute. In this fake transaction,
     /// it determines the number of ms of CPU time needed to execute it.
-    pub contract: u64,
+    pub execution_time: u64,
 }
 
 impl Hash for Transaction {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(&self.contract.to_le_bytes());
+        hasher.update(&self.execution_time.to_le_bytes());
         for object in &self.inputs {
             hasher.update(&object.id);
         }
@@ -81,10 +81,10 @@ impl Hash for Transaction {
 impl Transaction {
     /// Creates a transaction calling a contract with the specified objects.
     #[allow(unused)]
-    pub fn new(inputs: Vec<Object>, contract: u64) -> Self {
+    pub fn new(inputs: Vec<Object>, execution_time: u64) -> Self {
         let transaction = Self {
             id: Digest::default(),
-            contract,
+            execution_time,
             inputs,
         };
         Self {

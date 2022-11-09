@@ -2,9 +2,9 @@ use std::time::Duration;
 
 use crate::{batch_loader::SerializedBatchMessage, transaction::Transaction};
 use crypto::Digest;
-use log::{info, warn};
+use log::{debug, info, warn};
 use primary::Certificate;
-use tokio::{sync::mpsc::Receiver, time::timeout};
+use tokio::{sync::mpsc::Receiver, time::Instant};
 use worker::WorkerMessage;
 
 #[derive(Debug)]
@@ -31,11 +31,17 @@ impl Core {
     }
 
     /// Simple function simulating a CPU-intensive execution.
-    async fn burn_cpu() {
+    async fn burn_cpu(duration: Duration) {
+        let now = Instant::now();
         let mut _x = 0;
         loop {
-            _x += 1;
-            _x -= 1;
+            while _x < 1_000_000 {
+                _x += 1;
+            }
+            _x = 0;
+            if now.elapsed() >= duration {
+                return;
+            }
         }
     }
 
@@ -50,6 +56,8 @@ impl Core {
 
             match bincode::deserialize(&batch) {
                 Ok(WorkerMessage::Batch(batch)) => {
+                    debug!("Executing batch {digest} ({} tx)", batch.len());
+
                     // Deserialize each transaction.
                     for serialized_tx in batch {
                         #[cfg(features = "benchmark")]
@@ -71,8 +79,10 @@ impl Core {
                         };
 
                         // Execute the transaction.
-                        let duration = Duration::from_millis(transaction.contract);
-                        let _ = timeout(duration, std::hint::black_box(Self::burn_cpu())).await;
+                        if transaction.execution_time != 0 {
+                            let duration = Duration::from_millis(transaction.execution_time);
+                            Self::burn_cpu(duration).await;
+                        }
 
                         #[cfg(not(feature = "benchmark"))]
                         {
