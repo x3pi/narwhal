@@ -1,6 +1,7 @@
 use crypto::{Digest, Hash};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 /// The object's version number.
@@ -38,6 +39,18 @@ impl Object {
         Self {
             id: object.digest(),
             ..object
+        }
+    }
+
+    /// Create a new object with the specified content and a random id.
+    #[allow(unused)]
+    pub fn random<R: RngCore>(rng: &mut R, content: Vec<u8>) -> Self {
+        let mut id = [0u8; 32];
+        rng.fill_bytes(&mut id);
+        Self {
+            id: Digest(id),
+            content,
+            version: ObjectVersion::default(),
         }
     }
 }

@@ -16,7 +16,7 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 
 mod batch_loader;
 mod core;
-mod transaction;
+pub mod transaction;
 
 /// The default channel capacity for each channel of the executor.
 pub const CHANNEL_CAPACITY: usize = 1_000;

@@ -32,14 +32,11 @@ impl Core {
 
     /// Simple function simulating a CPU-intensive execution.
     async fn burn_cpu() {
-        fn x() {
-            let mut _x = 0;
-            loop {
-                _x += 1;
-                _x -= 1;
-            }
+        let mut _x = 0;
+        loop {
+            _x += 1;
+            _x -= 1;
         }
-        std::hint::black_box(x())
     }
 
     /// Main loop receiving batches to execute.
@@ -55,7 +52,14 @@ impl Core {
                 Ok(WorkerMessage::Batch(batch)) => {
                     // Deserialize each transaction.
                     for serialized_tx in batch {
-                        let transaction: Transaction = match bincode::deserialize(&serialized_tx) {
+                        #[cfg(features = "benchmark")]
+                        // The first 9 bytes of the serialized transaction are used as identification
+                        // tags and are not part of the actual transaction.
+                        let bytes = &serialized_tx[9..];
+                        #[cfg(not(features = "benchmark"))]
+                        let bytes = &serialized_tx;
+
+                        let transaction: Transaction = match bincode::deserialize(bytes) {
                             Ok(x) => x,
                             Err(e) => {
                                 #[cfg(feature = "benchmark")]
@@ -68,7 +72,7 @@ impl Core {
 
                         // Execute the transaction.
                         let duration = Duration::from_millis(transaction.contract);
-                        let _ = timeout(duration, Self::burn_cpu()).await;
+                        let _ = timeout(duration, std::hint::black_box(Self::burn_cpu())).await;
 
                         #[cfg(not(feature = "benchmark"))]
                         {
