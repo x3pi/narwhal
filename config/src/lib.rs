@@ -142,7 +142,7 @@ pub struct Authority {
     /// Map of workers' id and their network addresses.
     pub workers: HashMap<WorkerId, WorkerAddresses>,
     /// The network addresses of the executor.
-    pub executor: ExecutorAddresses,
+    pub executor: Option<ExecutorAddresses>,
 }
 
 #[derive(Clone, Deserialize)]
@@ -266,6 +266,7 @@ impl Committee {
             .get(myself)
             .map(|x| x.executor.clone())
             .ok_or_else(|| ConfigError::NotInCommittee(*myself))
+            .map(|x| x.expect("Primary request executor address when there is no executor"))
     }
 }
 
