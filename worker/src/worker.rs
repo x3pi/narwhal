@@ -10,7 +10,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use bytes::Bytes;
-use config::{Committee, Parameters, WorkerId};
+use config::{Committee, Parameters, UpdatableParameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use log::{error, info, warn};
@@ -18,7 +18,10 @@ use network::{MessageHandler, Receiver, Writer};
 use primary::PrimaryWorkerMessage;
 use prometheus::Registry;
 use serde::{Deserialize, Serialize};
-use std::{error::Error, sync::Arc};
+use std::{
+    error::Error,
+    sync::{Arc, RwLock},
+};
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
 
@@ -52,6 +55,8 @@ pub struct Worker {
     committee: Committee,
     /// The configuration parameters.
     parameters: Parameters,
+    /// The updatable configuration parameters.
+    updatable_parameters: Arc<RwLock<UpdatableParameters>>,
     /// The persistent storage.
     store: Store,
 }
@@ -62,6 +67,7 @@ impl Worker {
         id: WorkerId,
         committee: Committee,
         parameters: Parameters,
+        updatable_parameters: Arc<RwLock<UpdatableParameters>>,
         store: Store,
         registry: Option<&Registry>,
     ) {
@@ -71,6 +77,7 @@ impl Worker {
             id,
             committee,
             parameters,
+            updatable_parameters,
             store,
         };
 
@@ -131,8 +138,7 @@ impl Worker {
             self.committee.clone(),
             self.store.clone(),
             self.parameters.gc_depth,
-            self.parameters.sync_retry_delay,
-            self.parameters.sync_retry_nodes,
+            self.updatable_parameters.clone(),
             /* rx_message */ rx_synchronizer,
         );
         let synchronizer = match metrics {
@@ -173,8 +179,7 @@ impl Worker {
         // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
         // gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
         let batch_maker = BatchMaker::new(
-            self.parameters.batch_size,
-            self.parameters.max_batch_delay,
+            self.updatable_parameters.clone(),
             /* rx_transaction */ rx_batch_maker,
             /* tx_message */ tx_quorum_waiter,
             /* workers_addresses */

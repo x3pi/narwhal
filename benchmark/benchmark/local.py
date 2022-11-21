@@ -2,8 +2,9 @@
 import subprocess
 from math import ceil
 from os.path import basename, splitext
-from time import sleep
+import time
 
+from benchmark.agent import FakeAgent
 from benchmark.commands import CommandMaker
 from benchmark.config import Key, LocalCommittee, NodeParameters, BenchParameters, ConfigError, LocalPrometheusAddress
 from benchmark.logs import LogParser, ParseError
@@ -50,7 +51,7 @@ class LocalBench:
             # Cleanup all files.
             cmd = f'{CommandMaker.clean_logs()} ; {CommandMaker.cleanup()}'
             subprocess.run([cmd], shell=True, stderr=subprocess.DEVNULL)
-            sleep(0.5)  # Removing the store may take time.
+            time.sleep(0.5)  # Removing the store may take time.
 
             # Recompile the latest code.
             cmd = CommandMaker.compile().split()
@@ -122,9 +123,25 @@ class LocalBench:
                     log_file = PathMaker.worker_log_file(i, id)
                     self._background_run(cmd, log_file)
 
-            # Wait for all transactions to be processed.
+            # Make the agent observing the network and updating the nodes'
+            # parameters. The agent waits for the duration of the benchmark
+            # before returning.
             Print.info(f'Running benchmark ({self.duration} sec)...')
-            sleep(self.duration)
+            if self.metrics:
+                prometheus_addresses = []
+                for addresses in workers_addresses:
+                    for (_id, address) in addresses:
+                        prometheus_addresses += [LocalPrometheusAddress.make(
+                            address, self.PROMETHEUS_PORT_OFFSET
+                        )]
+
+                FakeAgent(
+                    self.duration, self.node_parameters, prometheus_addresses
+                ).run()
+            else:
+                time.sleep(self.duration)
+
+            # Kill the nodes.
             self._kill_nodes()
 
             # Parse logs and return the parser.

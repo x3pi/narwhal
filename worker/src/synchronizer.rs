@@ -4,15 +4,18 @@ use crate::{
     worker::{Round, WorkerMessage},
 };
 use bytes::Bytes;
-use config::{Committee, WorkerId};
+use config::{Committee, UpdatableParameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::HashMap, sync::Arc};
+use std::{
+    sync::RwLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use store::{Store, StoreError};
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
@@ -36,11 +39,8 @@ pub struct Synchronizer {
     store: Store,
     /// The depth of the garbage collection.
     gc_depth: Round,
-    /// The delay to wait before re-trying to send sync requests.
-    sync_retry_delay: u64,
-    /// Determine with how many nodes to sync when re-trying to send sync-requests. These nodes
-    /// are picked at random from the committee.
-    sync_retry_nodes: usize,
+    /// The validators' updatable parameters.
+    parameters: Arc<RwLock<UpdatableParameters>>,
     /// Input channel to receive the commands from the primary.
     rx_message: Receiver<PrimaryWorkerMessage>,
     /// A network sender to send requests to the other workers.
@@ -64,8 +64,7 @@ impl Synchronizer {
         committee: Committee,
         store: Store,
         gc_depth: Round,
-        sync_retry_delay: u64,
-        sync_retry_nodes: usize,
+        parameters: Arc<RwLock<UpdatableParameters>>,
         rx_message: Receiver<PrimaryWorkerMessage>,
     ) -> Self {
         Self {
@@ -74,8 +73,7 @@ impl Synchronizer {
             committee,
             store,
             gc_depth,
-            sync_retry_delay,
-            sync_retry_nodes,
+            parameters,
             rx_message,
             network: SimpleSender::new(),
             round: Round::default(),
@@ -222,8 +220,12 @@ impl Synchronizer {
                         .as_millis();
 
                     let mut retry = Vec::new();
+                    let sync_retry_delay = {
+                        let guard = self.parameters.read().unwrap();
+                        guard.sync_retry_delay.clone()
+                    };
                     for (digest, (_, _, timestamp, attempted_target)) in &self.pending {
-                        if timestamp + (self.sync_retry_delay as u128) < now {
+                        if timestamp + (sync_retry_delay as u128) < now {
                             debug!("Requesting sync for batch {} (retry)", digest);
                             retry.push(digest.clone());
 
@@ -242,8 +244,9 @@ impl Synchronizer {
                             .collect();
                         let message = WorkerMessage::BatchRequest(retry, self.name);
                         let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
+                        let sync_retry_nodes = self.parameters.read().unwrap().sync_retry_nodes;
                         self.network
-                            .lucky_broadcast(addresses, Bytes::from(serialized), self.sync_retry_nodes)
+                            .lucky_broadcast(addresses, Bytes::from(serialized), sync_retry_nodes)
                             .await;
                     }
 

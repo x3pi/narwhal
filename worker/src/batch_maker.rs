@@ -2,6 +2,7 @@
 use crate::worker::WorkerMessage;
 use crate::{metrics::WorkerMetrics, quorum_waiter::QuorumWaiterMessage};
 use bytes::Bytes;
+use config::UpdatableParameters;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
 use crypto::PublicKey;
@@ -12,7 +13,10 @@ use log::info;
 use network::ReliableSender;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, RwLock},
+};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -25,10 +29,8 @@ pub type Batch = Vec<Transaction>;
 
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
-    /// The preferred batch size (in bytes).
-    batch_size: usize,
-    /// The maximum delay after which to seal the batch (in ms).
-    max_batch_delay: u64,
+    /// The validator's parameters.
+    parameters: Arc<RwLock<UpdatableParameters>>,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
@@ -48,15 +50,14 @@ pub struct BatchMaker {
 impl BatchMaker {
     /// Create a BatchMaker maker instance.
     pub fn new(
-        batch_size: usize,
-        max_batch_delay: u64,
+        parameters: Arc<RwLock<UpdatableParameters>>,
         rx_transaction: Receiver<Transaction>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) -> Self {
+        let batch_size = parameters.read().unwrap().batch_size;
         Self {
-            batch_size,
-            max_batch_delay,
+            parameters,
             rx_transaction,
             tx_message,
             workers_addresses,
@@ -83,7 +84,11 @@ impl BatchMaker {
 
     /// Main loop receiving incoming transactions and creating batches.
     async fn run(&mut self) {
-        let timer = sleep(Duration::from_millis(self.max_batch_delay));
+        let max_batch_delay = {
+            let parameters = self.parameters.read().unwrap();
+            parameters.max_batch_delay
+        };
+        let timer = sleep(Duration::from_millis(max_batch_delay));
         tokio::pin!(timer);
 
         loop {
@@ -92,9 +97,11 @@ impl BatchMaker {
                 Some(transaction) = self.rx_transaction.recv() => {
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
-                    if self.current_batch_size >= self.batch_size {
+                    let batch_size = self.parameters.read().unwrap().batch_size;
+                    if self.current_batch_size >= batch_size {
                         self.seal("full").await;
-                        timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                        let max_batch_delay = self.parameters.read().unwrap().max_batch_delay;
+                        timer.as_mut().reset(Instant::now() + Duration::from_millis(max_batch_delay));
                     }
                 },
 
@@ -103,7 +110,8 @@ impl BatchMaker {
                     if !self.current_batch.is_empty() {
                         self.seal("timeout").await;
                     }
-                    timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                    let max_batch_delay = self.parameters.read().unwrap().max_batch_delay;
+                    timer.as_mut().reset(Instant::now() + Duration::from_millis(max_batch_delay));
                 }
             }
 

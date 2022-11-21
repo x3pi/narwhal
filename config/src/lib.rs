@@ -109,6 +109,44 @@ impl Parameters {
     }
 }
 
+/// Parameters updatable on the fly (without needed for consensus).
+#[derive(Deserialize)]
+pub struct UpdatableParameters {
+    pub header_size: usize,
+    pub max_header_delay: u64,
+    pub sync_retry_delay: u64,
+    pub sync_retry_nodes: usize,
+    pub batch_size: usize,
+    pub max_batch_delay: u64,
+}
+
+impl From<Parameters> for UpdatableParameters {
+    fn from(parameters: Parameters) -> Self {
+        Self {
+            header_size: parameters.header_size,
+            max_header_delay: parameters.max_header_delay,
+            sync_retry_delay: parameters.sync_retry_delay,
+            sync_retry_nodes: parameters.sync_retry_nodes,
+            batch_size: parameters.batch_size,
+            max_batch_delay: parameters.max_batch_delay,
+        }
+    }
+}
+
+impl UpdatableParameters {
+    pub fn log(&self) {
+        info!("Header size updated to {} B", self.header_size);
+        info!("Max header delay updated to {} ms", self.max_header_delay);
+        info!("Sync retry delay updated to {} ms", self.sync_retry_delay);
+        info!(
+            "Sync retry nodes updated to {} nodes",
+            self.sync_retry_nodes
+        );
+        info!("Batch size updated to {} B", self.batch_size);
+        info!("Max batch delay updated to {} ms", self.max_batch_delay);
+    }
+}
+
 #[derive(Clone, Deserialize)]
 pub struct PrimaryAddresses {
     /// Address to receive messages from other primaries (WAN).

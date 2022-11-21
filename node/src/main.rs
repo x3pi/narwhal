@@ -1,3 +1,5 @@
+use std::sync::{Arc, RwLock};
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::metrics::start_prometheus_server;
 use anyhow::{Context, Result};
@@ -89,6 +91,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         }
         None => Parameters::default(),
     };
+    let updatable_parameters = Arc::new(RwLock::new(parameters.clone().into()));
 
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
@@ -104,7 +107,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             let socket_address = address
                 .parse()
                 .context("Invalid prometheus socket address")?;
-            let _handle = start_prometheus_server(socket_address, &registry);
+            let _handle =
+                start_prometheus_server(socket_address, &registry, updatable_parameters.clone());
 
             Some(registry)
         }
@@ -141,7 +145,15 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .unwrap()
                 .parse::<WorkerId>()
                 .context("The worker id must be a positive integer")?;
-            Worker::spawn(keypair.name, id, committee, parameters, store, registry);
+            Worker::spawn(
+                keypair.name,
+                id,
+                committee,
+                parameters,
+                updatable_parameters.clone(),
+                store,
+                registry,
+            );
         }
         _ => unreachable!(),
     }
