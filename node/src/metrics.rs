@@ -20,9 +20,9 @@ pub fn start_prometheus_server(
     parameters: Arc<RwLock<UpdatableParameters>>,
 ) -> JoinHandle<Result<(), hyper::Error>> {
     let app = Router::new()
-        .route(PARAMETERS_ROUTE, post(update_parameters))
-        .layer(Extension(registry.clone()))
         .route(METRICS_ROUTE, get(metrics))
+        .layer(Extension(registry.clone()))
+        .route(PARAMETERS_ROUTE, post(update_parameters))
         .layer(Extension(parameters));
 
     log::info!("Prometheus server booted on {address}");
