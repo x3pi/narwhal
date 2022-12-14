@@ -141,13 +141,24 @@ impl BatchMaker {
             .current_batch
             .iter()
             .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
-            .filter_map(|tx| tx[1..9].try_into().ok())
+            .map(|tx| {
+                let id = tx[1..9].try_into().unwrap();
+                let time = tx[9..17].try_into().unwrap();
+                (u64::from_be_bytes(id), u64::from_be_bytes(time))
+            })
             .collect();
 
         // Serialize the batch.
         self.current_batch_size = 0;
         let batch: Vec<_> = self.current_batch.drain(..).collect();
-        let message = WorkerMessage::Batch(batch);
+        let message = WorkerMessage::Batch {
+            batch,
+            #[cfg(feature = "benchmark")]
+            batch_benchmark_info: config::BatchBenchmarkInfo {
+                sample_txs: tx_ids.clone(),
+                size,
+            },
+        };
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         #[cfg(feature = "benchmark")]
@@ -159,13 +170,9 @@ impl BatchMaker {
                     .unwrap(),
             );
 
-            for id in tx_ids {
+            for (id, time) in &tx_ids {
                 // NOTE: This log entry is used to compute performance.
-                info!(
-                    "Batch {:?} contains sample tx {}",
-                    digest,
-                    u64::from_be_bytes(id)
-                );
+                info!("Batch {digest:?} contains sample tx {id} ({time})");
             }
 
             // NOTE: This log entry is used to compute performance.

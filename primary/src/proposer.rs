@@ -1,6 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::messages::{Certificate, Header};
-use crate::primary::Round;
+use crate::primary::{BatchDigest, Round};
+use crate::{
+    messages::{Certificate, Header},
+    WorkerPrimaryMessage,
+};
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
@@ -28,7 +31,7 @@ pub struct Proposer {
     /// Receives the parents to include in the next header (along with their round number).
     rx_core: Receiver<(Vec<Digest>, Round)>,
     /// Receives the batches' digests from our workers.
-    rx_workers: Receiver<(Digest, WorkerId)>,
+    rx_workers: Receiver<BatchDigest>,
     /// Sends newly created headers to the `Core`.
     tx_core: Sender<Header>,
 
@@ -37,7 +40,7 @@ pub struct Proposer {
     /// Holds the certificates' ids waiting to be included in the next header.
     last_parents: Vec<Digest>,
     /// Holds the batches' digests waiting to be included in the next header.
-    digests: Vec<(Digest, WorkerId)>,
+    digests: Vec<BatchDigest>,
     /// Keeps track of the size (in bytes) of batches' digests that we received so far.
     payload_size: usize,
 }
@@ -51,7 +54,7 @@ impl Proposer {
         header_size: usize,
         max_header_delay: u64,
         rx_core: Receiver<(Vec<Digest>, Round)>,
-        rx_workers: Receiver<(Digest, WorkerId)>,
+        rx_workers: Receiver<BatchDigest>,
         tx_core: Sender<Header>,
     ) {
         let genesis = Certificate::genesis(committee)
@@ -142,9 +145,9 @@ impl Proposer {
                     // Signal that we have enough parent certificates to propose a new header.
                     self.last_parents = parents;
                 }
-                Some((digest, worker_id)) = self.rx_workers.recv() => {
-                    self.payload_size += digest.size();
-                    self.digests.push((digest, worker_id));
+                Some(batch_digest) = self.rx_workers.recv() => {
+                    self.payload_size += batch_digest.digest.size();
+                    self.digests.push(batch_digest);
                 }
                 () = &mut timer => {
                     // Nothing to do.

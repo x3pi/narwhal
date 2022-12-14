@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
-use crate::processor::{Processor, SerializedBatchMessage};
+use crate::processor::Processor;
 use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
 use crate::{
@@ -36,13 +36,21 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 // TODO: Move to the primary.
 pub type Round = u64;
 
+/// Indicates a serialized `WorkerMessage::Batch` message.
+pub type SerializedBatchMessage = Vec<u8>;
+
 /// Indicates a serialized `WorkerPrimaryMessage` message.
 pub type SerializedBatchDigestMessage = Vec<u8>;
 
 /// The message exchanged between workers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Batch(Batch),
+    Batch {
+        batch: Batch,
+        /// Batch benchmark information to deduce performance
+        #[cfg(feature = "benchmark")]
+        batch_benchmark_info: config::BatchBenchmarkInfo,
+    },
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
 }
 
@@ -326,7 +334,7 @@ impl MessageHandler for WorkerReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self
+            Ok(WorkerMessage::Batch { .. }) => self
                 .tx_processor
                 .send(serialized.to_vec())
                 .await

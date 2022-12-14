@@ -307,3 +307,13 @@ impl Default for KeyPair {
         Self::new()
     }
 }
+
+/// Metadata associated with transaction batches to carry over to deduce performance.
+#[cfg(feature = "benchmark")]
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BatchBenchmarkInfo {
+    /// Id and sent time of all sample transactions of the batch.
+    pub sample_txs: Vec<(u64, u64)>,
+    /// The size of the batch (in bytes).
+    pub size: usize,
+}

@@ -30,6 +30,43 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct BatchDigest {
+    pub digest: Digest,
+    pub worker_id: WorkerId,
+    #[cfg(feature = "benchmark")]
+    pub batch_benchmark_info: config::BatchBenchmarkInfo,
+}
+
+impl From<WorkerPrimaryMessage> for BatchDigest {
+    fn from(value: WorkerPrimaryMessage) -> Self {
+        match value {
+            WorkerPrimaryMessage::OthersBatch {
+                digest,
+                worker_id,
+                #[cfg(feature = "benchmark")]
+                batch_benchmark_info,
+            } => Self {
+                digest,
+                worker_id,
+                #[cfg(feature = "benchmark")]
+                batch_benchmark_info,
+            },
+            WorkerPrimaryMessage::OurBatch {
+                digest,
+                worker_id,
+                #[cfg(feature = "benchmark")]
+                batch_benchmark_info,
+            } => Self {
+                digest,
+                worker_id,
+                #[cfg(feature = "benchmark")]
+                batch_benchmark_info,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
     Header(Header),
     Vote(Vote),
@@ -50,9 +87,21 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId),
+    OurBatch {
+        digest: Digest,
+        worker_id: WorkerId,
+        /// Batch benchmark information to deduce performance
+        #[cfg(feature = "benchmark")]
+        batch_benchmark_info: config::BatchBenchmarkInfo,
+    },
     /// The worker indicates it received a batch's digest from another authority.
-    OthersBatch(Digest, WorkerId),
+    OthersBatch {
+        digest: Digest,
+        worker_id: WorkerId,
+        /// Batch benchmark information to deduce performance
+        #[cfg(feature = "benchmark")]
+        batch_benchmark_info: config::BatchBenchmarkInfo,
+    },
 }
 
 pub struct Primary;
@@ -246,8 +295,8 @@ impl MessageHandler for PrimaryReceiverHandler {
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_our_digests: Sender<(Digest, WorkerId)>,
-    tx_others_digests: Sender<(Digest, WorkerId)>,
+    tx_our_digests: Sender<BatchDigest>,
+    tx_others_digests: Sender<BatchDigest>,
 }
 
 #[async_trait]
@@ -259,14 +308,14 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
+            message @ WorkerPrimaryMessage::OurBatch { .. } => self
                 .tx_our_digests
-                .send((digest, worker_id))
+                .send(message.into())
                 .await
                 .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
+            message @ WorkerPrimaryMessage::OthersBatch { .. } => self
                 .tx_others_digests
-                .send((digest, worker_id))
+                .send(message.into())
                 .await
                 .expect("Failed to send workers' digests"),
         }

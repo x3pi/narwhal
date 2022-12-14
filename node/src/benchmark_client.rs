@@ -8,7 +8,7 @@ use futures::future::join_all;
 use futures::sink::SinkExt as _;
 use log::{info, warn};
 use rand::Rng;
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::SystemTime};
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
@@ -86,8 +86,8 @@ impl Client {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
-        // The transaction size must be at least 16 bytes to ensure all txs are different.
-        if self.size < 9 {
+        // The transaction size must be at least 17 bytes to ensure all txs are different.
+        if self.size < 17 {
             return Err(anyhow::Error::msg(
                 "Transaction size must be at least 9 bytes",
             ));
@@ -115,12 +115,15 @@ impl Client {
             let now = Instant::now();
 
             for x in 0..burst {
-                if x == counter % burst {
+                if x == counter % burst && x % 2 == 0 {
                     // NOTE: This log entry is used to compute performance.
                     info!("Sending sample transaction {}", counter);
 
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64(counter); // This counter identifies the tx.
+
+                    let time = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH);
+                    tx.put_u64(time.unwrap().as_millis() as u64);
                 } else {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.

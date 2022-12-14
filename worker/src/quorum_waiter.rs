@@ -1,12 +1,11 @@
-use std::sync::Arc;
-
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::{metrics::WorkerMetrics, processor::SerializedBatchMessage};
+use crate::{metrics::WorkerMetrics, worker::SerializedBatchMessage};
 use config::{Committee, Stake};
 use crypto::PublicKey;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use network::CancelHandler;
+use std::sync::Arc;
 use tokio::{
     sync::mpsc::{Receiver, Sender},
     time::Instant,

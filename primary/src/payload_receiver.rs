@@ -1,6 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use config::WorkerId;
-use crypto::Digest;
+use crate::{primary::BatchDigest, WorkerPrimaryMessage};
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -10,18 +9,21 @@ pub struct PayloadReceiver {
     /// The persistent storage.
     store: Store,
     /// Receives batches' digests from the network.
-    rx_workers: Receiver<(Digest, WorkerId)>,
+    rx_workers: Receiver<BatchDigest>,
 }
 
 impl PayloadReceiver {
-    pub fn spawn(store: Store, rx_workers: Receiver<(Digest, WorkerId)>) {
+    pub fn spawn(store: Store, rx_workers: Receiver<BatchDigest>) {
         tokio::spawn(async move {
             Self { store, rx_workers }.run().await;
         });
     }
 
     async fn run(&mut self) {
-        while let Some((digest, worker_id)) = self.rx_workers.recv().await {
+        while let Some(message) = self.rx_workers.recv().await {
+            let BatchDigest {
+                digest, worker_id, ..
+            } = message;
             let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
             self.store.write(key.to_vec(), Vec::default()).await;
         }
