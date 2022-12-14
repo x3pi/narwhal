@@ -1,15 +1,10 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use crate::messages::{Certificate, Header};
 use crate::primary::{BatchDigest, Round};
-use crate::{
-    messages::{Certificate, Header},
-    WorkerPrimaryMessage,
-};
-use config::{Committee, WorkerId};
+use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::debug;
-#[cfg(feature = "benchmark")]
-use log::info;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -94,9 +89,9 @@ impl Proposer {
         debug!("Created {:?}", header);
 
         #[cfg(feature = "benchmark")]
-        for digest in header.payload.keys() {
+        for batch_digest in &header.payload {
             // NOTE: This log entry is used to compute performance.
-            info!("Created {} -> {:?}", header, digest);
+            log::info!("Created {} -> {:?}", header, batch_digest.digest);
         }
 
         // Send the new header to the `Core` that will broadcast and process it.

@@ -1,12 +1,15 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::error::{DagError, DagResult};
 use crate::primary::Round;
-use config::{Committee, WorkerId};
+use crate::{
+    error::{DagError, DagResult},
+    primary::BatchDigest,
+};
+use config::Committee;
 use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 
@@ -14,7 +17,7 @@ use std::fmt;
 pub struct Header {
     pub author: PublicKey,
     pub round: Round,
-    pub payload: BTreeMap<Digest, WorkerId>,
+    pub payload: BTreeSet<BatchDigest>,
     pub parents: BTreeSet<Digest>,
     pub id: Digest,
     pub signature: Signature,
@@ -24,7 +27,7 @@ impl Header {
     pub async fn new(
         author: PublicKey,
         round: Round,
-        payload: BTreeMap<Digest, WorkerId>,
+        payload: BTreeSet<BatchDigest>,
         parents: BTreeSet<Digest>,
         signature_service: &mut SignatureService,
     ) -> Self {
@@ -54,9 +57,9 @@ impl Header {
         ensure!(voting_rights > 0, DagError::UnknownAuthority(self.author));
 
         // Ensure all worker ids are correct.
-        for worker_id in self.payload.values() {
+        for batch_digest in &self.payload {
             committee
-                .worker(&self.author, &worker_id)
+                .worker(&self.author, &batch_digest.worker_id)
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
@@ -72,9 +75,9 @@ impl Hash for Header {
         let mut hasher = Sha512::new();
         hasher.update(&self.author);
         hasher.update(self.round.to_le_bytes());
-        for (x, y) in &self.payload {
-            hasher.update(x);
-            hasher.update(y.to_le_bytes());
+        for batch_digest in &self.payload {
+            hasher.update(&batch_digest.digest);
+            hasher.update(batch_digest.worker_id.to_le_bytes());
         }
         for x in &self.parents {
             hasher.update(x);
@@ -91,7 +94,7 @@ impl fmt::Debug for Header {
             self.id,
             self.round,
             self.author,
-            self.payload.keys().map(|x| x.size()).sum::<usize>(),
+            self.payload.iter().map(|x| x.digest.size()).sum::<usize>(),
         )
     }
 }

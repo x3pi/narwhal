@@ -29,7 +29,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 /// The round number.
 pub type Round = u64;
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, PartialEq, PartialOrd, Ord, Eq, Clone)]
 pub struct BatchDigest {
     pub digest: Digest,
     pub worker_id: WorkerId,

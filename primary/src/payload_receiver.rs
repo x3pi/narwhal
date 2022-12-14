@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::{primary::BatchDigest, WorkerPrimaryMessage};
+use crate::primary::BatchDigest;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 

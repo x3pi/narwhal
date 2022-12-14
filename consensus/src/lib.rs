@@ -183,9 +183,12 @@ impl Consensus {
                 info!("Committed {}", certificate.header);
 
                 #[cfg(feature = "benchmark")]
-                for digest in certificate.header.payload.keys() {
+                for batch_digest in &certificate.header.payload {
                     // NOTE: This log entry is used to compute performance.
-                    info!("Committed {} -> {:?}", certificate.header, digest);
+                    info!(
+                        "Committed {} -> {:?}",
+                        certificate.header, batch_digest.digest
+                    );
                 }
 
                 self.tx_primary
