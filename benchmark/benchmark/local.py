@@ -152,6 +152,7 @@ class LocalBench:
 
                 FakeAgent(
                     self.duration,
+                    self.bench_parameters,
                     self.node_parameters,
                     consensus_prometheus_addresses,
                     workers_prometheus_addresses
