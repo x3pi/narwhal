@@ -6,6 +6,8 @@ use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+#[cfg(feature = "benchmark")]
+use std::time::SystemTime;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -62,6 +64,12 @@ impl State {
     }
 }
 
+pub struct ConsensusOutput {
+    pub certificate: Certificate,
+    #[cfg(feature = "benchmark")]
+    pub commit_time: u64,
+}
+
 pub struct Consensus {
     /// The committee information.
     committee: Committee,
@@ -74,7 +82,7 @@ pub struct Consensus {
     /// Outputs the sequence of ordered certificates to the primary (for cleanup and feedback).
     tx_primary: Sender<Certificate>,
     /// Outputs the sequence of ordered certificates to the application layer.
-    tx_output: Sender<Certificate>,
+    tx_output: Sender<ConsensusOutput>,
 
     /// The genesis certificates.
     genesis: Vec<Certificate>,
@@ -86,7 +94,7 @@ impl Consensus {
         gc_depth: Round,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
-        tx_output: Sender<Certificate>,
+        tx_output: Sender<ConsensusOutput>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -178,6 +186,12 @@ impl Consensus {
             }
 
             // Output the sequence in the right order.
+            #[cfg(feature = "benchmark")]
+            let commit_time = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+
             for certificate in sequence {
                 #[cfg(not(feature = "benchmark"))]
                 info!("Committed {}", certificate.header);
@@ -196,7 +210,12 @@ impl Consensus {
                     .await
                     .expect("Failed to send certificate to primary");
 
-                if let Err(e) = self.tx_output.send(certificate).await {
+                let output = ConsensusOutput {
+                    certificate,
+                    #[cfg(feature = "benchmark")]
+                    commit_time,
+                };
+                if let Err(e) = self.tx_output.send(output).await {
                     warn!("Failed to output certificate: {}", e);
                 }
             }

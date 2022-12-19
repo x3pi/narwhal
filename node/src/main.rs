@@ -6,10 +6,10 @@ use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
-use consensus::Consensus;
+use consensus::{Consensus, ConsensusOutput};
 use env_logger::Env;
 use metrics::ConsensusMetrics;
-use primary::{Certificate, Primary};
+use primary::Primary;
 use std::sync::{Arc, RwLock};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
@@ -173,12 +173,46 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>, metrics: Option<ConsensusMetrics>) {
-    while let Some(_certificate) = rx_output.recv().await {
-        // NOTE: Here goes the application logic.
+async fn analyze(mut rx_output: Receiver<ConsensusOutput>, metrics: Option<ConsensusMetrics>) {
+    // NOTE: Here goes the application logic.
+    #[cfg(not(feature = "benchmark"))]
+    {
+        let _metrics = metrics;
+        while let Some(_output) = rx_output.recv().await {}
+    }
 
-        if let Some(metrics) = metrics.as_ref() {
-            metrics.committed_certificates_total.inc_by(3);
+    #[cfg(feature = "benchmark")]
+    {
+        let mut first_transaction_recorded = false;
+        let mut last_transaction_time = 0;
+        while let Some(output) = rx_output.recv().await {
+            if let Some(metrics) = metrics.as_ref() {
+                metrics.committed_certificates_total.inc();
+
+                let commit_time = output.commit_time;
+                let delta = commit_time - last_transaction_time;
+                metrics.last_committed_transaction.inc_by(delta);
+                last_transaction_time = commit_time;
+
+                for payload in output.certificate.header.payload {
+                    let batch_info = payload.batch_benchmark_info;
+                    metrics.committed_bytes_total.inc_by(batch_info.size as u64);
+                    metrics
+                        .committed_sample_transactions_total
+                        .inc_by(batch_info.sample_txs.len() as u64);
+
+                    for (_id, send_time) in batch_info.sample_txs {
+                        if !first_transaction_recorded {
+                            metrics.first_sent_transaction.inc_by(send_time as u64);
+                            first_transaction_recorded = true;
+                        }
+
+                        let latency = commit_time - send_time;
+                        metrics.latency_total.inc_by(latency as u64);
+                        metrics.latency_square_total.inc_by(latency.pow(2) as u64);
+                    }
+                }
+            }
         }
     }
 }
