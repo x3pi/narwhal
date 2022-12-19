@@ -1,7 +1,6 @@
-use std::sync::{Arc, RwLock};
-
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::metrics::start_prometheus_server;
+use crate::prometheus::start_prometheus_server;
+use ::prometheus::default_registry;
 use anyhow::{Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
@@ -9,13 +8,15 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
 use env_logger::Env;
+use metrics::ConsensusMetrics;
 use primary::{Certificate, Primary};
-use prometheus::default_registry;
+use std::sync::{Arc, RwLock};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::Worker;
 
 mod metrics;
+mod prometheus;
 
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -116,7 +117,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     };
 
     // Check whether to run a primary, a worker, or an entire authority.
-    match matches.subcommand() {
+    let consensus_metrics = match matches.subcommand() {
         // Spawn the primary and consensus core.
         ("primary", _) => {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
@@ -136,6 +137,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 /* tx_primary */ tx_feedback,
                 tx_output,
             );
+
+            // Consensus metrics.
+            registry.map(|x| ConsensusMetrics::new(x))
         }
 
         // Spawn a single worker.
@@ -154,20 +158,27 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 store,
                 registry,
             );
+
+            // Consensus metrics.
+            None
         }
         _ => unreachable!(),
-    }
+    };
 
     // Analyze the consensus' output.
-    analyze(rx_output).await;
+    analyze(rx_output, consensus_metrics).await;
 
     // If this expression is reached, the program ends and all other tasks terminate.
     unreachable!();
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>) {
+async fn analyze(mut rx_output: Receiver<Certificate>, metrics: Option<ConsensusMetrics>) {
     while let Some(_certificate) = rx_output.recv().await {
         // NOTE: Here goes the application logic.
+
+        if let Some(metrics) = metrics.as_ref() {
+            metrics.committed_certificates_total.inc_by(3);
+        }
     }
 }

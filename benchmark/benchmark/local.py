@@ -90,12 +90,21 @@ class LocalBench:
                     self._background_run(cmd, log_file)
 
             # Run the primaries (except the faulty ones).
-            for i, address in enumerate(committee.primary_addresses(self.faults)):
+            primary_addresses = committee.primary_addresses(self.faults)
+            for i, address in enumerate(primary_addresses):
+                if self.metrics:
+                    prometheus_address = LocalPrometheusAddress.make(
+                        address, self.PROMETHEUS_PORT_OFFSET
+                    )
+                else:
+                    prometheus_address = None
+
                 cmd = CommandMaker.run_primary(
                     PathMaker.key_file(i),
                     PathMaker.committee_file(),
                     PathMaker.db_path(i),
                     PathMaker.parameters_file(),
+                    metrics=prometheus_address,
                     debug=debug
                 )
                 log_file = PathMaker.primary_log_file(i)
@@ -128,15 +137,24 @@ class LocalBench:
             # before returning.
             Print.info(f'Running benchmark ({self.duration} sec)...')
             if self.metrics:
-                prometheus_addresses = []
+                consensus_prometheus_addresses = []
+                for address in primary_addresses:
+                    consensus_prometheus_addresses += [LocalPrometheusAddress.make(
+                        address, self.PROMETHEUS_PORT_OFFSET
+                    )]
+
+                workers_prometheus_addresses = []
                 for addresses in workers_addresses:
                     for (_id, address) in addresses:
-                        prometheus_addresses += [LocalPrometheusAddress.make(
+                        workers_prometheus_addresses += [LocalPrometheusAddress.make(
                             address, self.PROMETHEUS_PORT_OFFSET
                         )]
 
                 FakeAgent(
-                    self.duration, self.node_parameters, prometheus_addresses
+                    self.duration,
+                    self.node_parameters,
+                    consensus_prometheus_addresses,
+                    workers_prometheus_addresses
                 ).run()
             else:
                 time.sleep(self.duration)

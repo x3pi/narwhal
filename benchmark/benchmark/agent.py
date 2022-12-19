@@ -3,16 +3,19 @@ import requests
 
 
 class FakeAgent:
-    def __init__(self, duration, node_parameters, prometheus_addresses):
+    def __init__(self, duration, node_parameters, consensus_prometheus_addresses, workers_prometheus_addresses):
         self.duration = duration
         self.node_parameters = node_parameters
-        self.addresses = prometheus_addresses
+        self.consensus_addresses = consensus_prometheus_addresses
+        self.workers_addresses = workers_prometheus_addresses
 
         # Print out the addresses where the nodes expose the metrics and
         # accept new parameters.
         print()
-        for i, address in enumerate(self.addresses):
-            print(f'Metrics address of node {i}: {address}')
+        for i, address in enumerate(self.consensus_addresses):
+            print(f'Metrics address of consensus {i}: {address}')
+        for i, address in enumerate(self.workers_addresses):
+            print(f'Metrics address of worker {i}: {address}')
 
     def run(self):
 
@@ -20,7 +23,7 @@ class FakeAgent:
         time.sleep(self.duration/4)
 
         # Query the state of the node and print the state of the first node.
-        for i, address in enumerate(self.addresses):
+        for i, address in enumerate(self.workers_addresses):
             if i == 0:
                 url = f'http://{address}/metrics'
                 x = requests.get(url, ())
@@ -40,7 +43,7 @@ class FakeAgent:
 
         print(f'\nSetting new parameters to: {new_parameters}')
 
-        for i, address in enumerate(self.addresses):
+        for i, address in enumerate(self.workers_addresses):
             url = f'http://{address}/parameters'
             x = requests.post(url, json=new_parameters)
             print(f'Node {i} update status: {x.text}')
