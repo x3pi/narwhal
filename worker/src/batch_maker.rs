@@ -69,7 +69,6 @@ impl BatchMaker {
     }
 
     /// Configure prometheus metrics.
-    /// Configure prometheus metrics.
     pub fn set_metrics(mut self, metrics: Arc<WorkerMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
