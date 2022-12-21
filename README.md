@@ -3,7 +3,7 @@
 
 # Narwhal and Tusk
 
-[![build status](https://img.shields.io/github/workflow/status/asonnino/narwhal/Rust/master?style=flat-square&logo=github)](https://github.com/asonnino/narwhal/actions)
+[![build status](https://img.shields.io/github/actions/workflow/status/asonnino/narwhal/rust.yml?branch=master?style=flat-square&logo=github)](https://github.com/asonnino/narwhal/actions)
 [![rustc](https://img.shields.io/badge/rustc-1.51+-blue?style=flat-square&logo=rust)](https://www.rust-lang.org)
 [![license](https://img.shields.io/badge/license-Apache-blue.svg?style=flat-square)](LICENSE)
 
