@@ -1,16 +1,17 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
+use std::{net::SocketAddr, time::SystemTime};
+
 use anyhow::{Context, Result};
-use bytes::BufMut as _;
-use bytes::BytesMut;
+use bytes::{BufMut as _, BytesMut};
 use clap::{crate_name, crate_version, App, AppSettings};
 use env_logger::Env;
-use futures::future::join_all;
-use futures::sink::SinkExt as _;
+use futures::{future::join_all, sink::SinkExt as _};
 use log::{info, warn};
 use rand::Rng;
-use std::net::SocketAddr;
-use tokio::net::TcpStream;
-use tokio::time::{interval, sleep, Duration, Instant};
+use tokio::{
+    net::TcpStream,
+    time::{interval, sleep, Duration, Instant},
+};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[tokio::main]
@@ -113,6 +114,7 @@ impl Client {
         'main: loop {
             interval.as_mut().tick().await;
             let now = Instant::now();
+            let timestamp = Self::timestamp_as_millis();
 
             for x in 0..burst {
                 if x == counter % burst {
@@ -121,6 +123,7 @@ impl Client {
 
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u128(timestamp); // This timestamp is used by third party scripts to computer performance.
                 } else {
                     r += 1;
                     tx.put_u8(1u8); // Standard txs start with 1.
@@ -154,5 +157,12 @@ impl Client {
             })
         }))
         .await;
+    }
+
+    pub fn timestamp_as_millis() -> u128 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
     }
 }

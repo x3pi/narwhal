@@ -1,6 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::quorum_waiter::QuorumWaiterMessage;
-use crate::worker::WorkerMessage;
+#[cfg(feature = "benchmark")]
+use std::convert::TryInto as _;
+use std::net::SocketAddr;
+
 use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
@@ -10,11 +12,12 @@ use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
-#[cfg(feature = "benchmark")]
-use std::convert::TryInto as _;
-use std::net::SocketAddr;
-use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::{sleep, Duration, Instant};
+use tokio::{
+    sync::mpsc::{Receiver, Sender},
+    time::{sleep, Duration, Instant},
+};
+
+use crate::{quorum_waiter::QuorumWaiterMessage, worker::WorkerMessage};
 
 #[cfg(test)]
 #[path = "tests/batch_maker_tests.rs"]
@@ -105,11 +108,18 @@ impl BatchMaker {
 
         // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]
-        let tx_ids: Vec<_> = self
+        let ids: Vec<_> = self
             .current_batch
             .iter()
-            .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
-            .filter_map(|tx| tx[1..9].try_into().ok())
+            .filter(|tx| tx[0] == 0u8 && tx.len() > 8 + 16)
+            .filter_map(|tx| {
+                let tx_id = tx[1..9].try_into().ok();
+                let timestamp = tx[9..25].try_into().ok();
+                match (tx_id, timestamp) {
+                    (Some(id), Some(timestamp)) => Some((id, timestamp)),
+                    _ => None,
+                }
+            })
             .collect();
 
         // Serialize the batch.
@@ -127,12 +137,13 @@ impl BatchMaker {
                     .unwrap(),
             );
 
-            for id in tx_ids {
+            for (tx_id, timestamp) in ids {
                 // NOTE: This log entry is used to compute performance.
                 info!(
-                    "Batch {:?} contains sample tx {}",
+                    "Batch {:?} contains sample tx {}, created at {}",
                     digest,
-                    u64::from_be_bytes(id)
+                    u64::from_be_bytes(tx_id),
+                    u128::from_be_bytes(timestamp)
                 );
             }
 
