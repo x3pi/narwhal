@@ -261,7 +261,7 @@ impl CertificateWaiter {
                         .map(|x| (x.to_vec(), self.store.clone()))
                         .collect();
                     let fut = Self::waiter(wait_for, certificate);
-                    waiting.push(fut);
+                    waiting.push_back(fut);
                 }
                 Some(result) = waiting.next() => match result {
                     Ok(certificate) => {

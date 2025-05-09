@@ -1,17 +1,19 @@
-use crate::config::Committee;
 use crate::consensus::Round;
 use crate::messages::{Block, Timeout, Vote, QC};
 use bytes::Bytes;
-use crypto::Hash as _;
+use config::{Authority, Committee, ConsensusAddresses, PrimaryAddresses};
 use crypto::{generate_keypair, Digest, PublicKey, SecretKey, Signature};
+use crypto::Hash as _;
 use futures::sink::SinkExt as _;
 use futures::stream::StreamExt as _;
+use primary::Certificate;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 // Fixture.
 pub fn keys() -> Vec<(PublicKey, SecretKey)> {
@@ -21,26 +23,35 @@ pub fn keys() -> Vec<(PublicKey, SecretKey)> {
 
 // Fixture.
 pub fn committee() -> Committee {
-    Committee::new(
-        keys()
+    Committee{
+        authorities: keys()
             .into_iter()
             .enumerate()
-            .map(|(i, (name, _))| {
+             .map(|(i, (name, _))| {
                 let address = format!("127.0.0.1:{}", i).parse().unwrap();
-                let stake = 1;
-                (name, stake, address)
+                let authority = Authority{
+                    stake: 1,
+                    consensus: ConsensusAddresses{
+                        consensus_to_consensus: address
+                    },
+                    primary: PrimaryAddresses {
+                        primary_to_primary: "0.0.0.0:0".parse().unwrap(),
+                        worker_to_primary: "0.0.0.0:0".parse().unwrap(),
+                    },
+                    workers: HashMap::default(),
+                };
+                (name, authority)
             })
             .collect(),
-        /* epoch */ 100,
-    )
+    }
 }
 
 // Fixture.
 pub fn committee_with_base_port(base_port: u16) -> Committee {
     let mut committee = committee();
     for authority in committee.authorities.values_mut() {
-        let port = authority.address.port();
-        authority.address.set_port(base_port + port);
+        let port = authority.consensus.consensus_to_consensus.port();
+        authority.consensus.consensus_to_consensus.set_port(base_port + port);
     }
     committee
 }
@@ -50,7 +61,7 @@ impl Block {
         qc: QC,
         author: PublicKey,
         round: Round,
-        payload: Vec<Digest>,
+        payload: Vec<Certificate>,
         secret: &SecretKey,
     ) -> Self {
         let block = Block {

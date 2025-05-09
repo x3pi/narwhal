@@ -1,6 +1,6 @@
 use super::*;
 use crate::common::{committee_with_base_port, keys};
-use crate::config::Parameters;
+use config::Parameters;
 use crypto::SecretKey;
 use futures::future::try_join_all;
 use std::fs;
@@ -18,6 +18,7 @@ fn spawn_nodes(
             let committee = committee.clone();
             let parameters = Parameters {
                 timeout_delay: 100,
+                sync_retry_delay: 10_000,
                 ..Parameters::default()
             };
             let store_path = format!("{}_{}", store_path, i);
