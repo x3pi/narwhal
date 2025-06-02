@@ -79,7 +79,7 @@ async fn get_missing_parent_block() {
     );
 
     // Spawn a listener to receive our sync request.
-    let address = committee.address(&block.author).unwrap();
+    let address = committee.consensus(&block.author).unwrap().consensus_to_consensus;
     let message = ConsensusMessage::SyncRequest(parent_block.digest(), name);
     let expected = Bytes::from(bincode::serialize(&message).unwrap());
     let listener_handle = listener(address, Some(expected.clone()));

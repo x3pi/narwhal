@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use config::{Authority, PrimaryAddresses};
+use config::{Authority, ConsensusAddresses, PrimaryAddresses};
 use crypto::{generate_keypair, SecretKey};
 use primary::Header;
 use rand::rngs::StdRng;
@@ -24,6 +24,9 @@ pub fn mock_committee() -> Committee {
                     *id,
                     Authority {
                         stake: 1,
+                        consensus: ConsensusAddresses{
+                            consensus_to_consensus: "0.0.0.0:0".parse().unwrap(),
+                        },
                         primary: PrimaryAddresses {
                             primary_to_primary: "0.0.0.0:0".parse().unwrap(),
                             worker_to_primary: "0.0.0.0:0".parse().unwrap(),

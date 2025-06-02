@@ -19,13 +19,14 @@ fn core(
     let (tx_loopback, rx_loopback) = channel(1);
     let (tx_proposer, rx_proposer) = channel(1);
     let (tx_mempool, mut rx_mempool) = channel(1);
-    let (tx_commit, rx_commit) = channel(1);
+    let (tx_commit, _rx_commit) = channel(1);
+    let (tx_output, rx_block) = channel(1);
 
     let signature_service = SignatureService::new(secret);
     let _ = fs::remove_dir_all(store_path);
     let store = Store::new(store_path).unwrap();
     let leader_elector = LeaderElector::new(committee.clone());
-    let mempool_driver = MempoolDriver::new(store.clone(), tx_mempool, tx_loopback.clone());
+    let mempool_driver = MempoolDriver::new(committee.clone(), tx_mempool);
     let synchronizer = Synchronizer::new(
         name,
         committee.clone(),
@@ -53,9 +54,10 @@ fn core(
         rx_loopback,
         tx_proposer,
         tx_commit,
+        tx_output
     );
 
-    (tx_core, rx_proposer, rx_commit)
+    (tx_core, rx_proposer, rx_block)
 }
 
 fn leader_keys(round: Round) -> (PublicKey, SecretKey) {
@@ -88,7 +90,7 @@ async fn handle_proposal() {
 
     // Ensure the next leaders gets the vote.
     let (next_leader, _) = leader_keys(2);
-    let address = committee.address(&next_leader).unwrap();
+    let address = committee.consensus(&next_leader).unwrap().consensus_to_consensus;
     let handle = listener(address, Some(Bytes::from(expected)));
     assert!(handle.await.is_ok());
 }
@@ -178,9 +180,9 @@ async fn local_timeout_round() {
 
     // Ensure the node broadcasts a timeout vote.
     let handles: Vec<_> = committee
-        .broadcast_addresses(&public_key)
+        .others_consensus(&public_key)
         .into_iter()
-        .map(|address| listener(address, Some(Bytes::from(expected.clone()))))
+        .map(|(_publick_key, consensus)| listener(consensus.consensus_to_consensus, Some(Bytes::from(expected.clone()))))
         .collect();
     assert!(try_join_all(handles).await.is_ok());
 }

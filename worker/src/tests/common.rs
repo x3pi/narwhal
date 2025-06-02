@@ -2,7 +2,7 @@
 use crate::batch_maker::{Batch, Transaction};
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
-use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
+use config::{Authority, Committee, ConsensusAddresses, PrimaryAddresses, WorkerAddresses};
 use crypto::{generate_keypair, Digest, PublicKey, SecretKey};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
@@ -48,6 +48,9 @@ pub fn committee() -> Committee {
                     *id,
                     Authority {
                         stake: 1,
+                        consensus: ConsensusAddresses {  // Not used in the test
+                            consensus_to_consensus: "0.0.0.0:0".parse().unwrap(),
+                        },
                         primary,
                         workers,
                     },

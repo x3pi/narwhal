@@ -24,7 +24,7 @@ async fn sync_reply() {
     Helper::spawn(committee.clone(), store, rx_request);
 
     // Spawn a listener to receive the sync reply.
-    let address = committee.address(&requestor).unwrap();
+    let address = committee.consensus(&requestor).unwrap().consensus_to_consensus;
     let message = ConsensusMessage::Propose(block());
     let expected = Bytes::from(bincode::serialize(&message).unwrap());
     let handle = listener(address, Some(expected));
