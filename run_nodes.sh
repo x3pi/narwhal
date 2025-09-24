@@ -27,6 +27,7 @@ BASE_PORT=6000
 BENCHMARK_DIR="benchmark"
 NODE_BINARY="./target/release/node"
 CLIENT_BINARY="./target/release/benchmark_client"
+EXECUTOR_BINARY="./go/bin/exetps" # Đường dẫn mới cho binary executor
 
 # New base port for committee addresses (based on the desired committee.json structure)
 COMMITTEE_BASE_PORT=4000
@@ -43,6 +44,9 @@ PARAMETERS_FILE="$BENCHMARK_DIR/.parameters.json"
 # --- Stage 0: Build ---
 cargo clean
 cargo build --release --features benchmark
+# Biên dịch binary executor Go
+echo "INFO: Building Go executor binary..."
+(cd go/cmd/exetps && go build -o ../../bin/exetps) || { echo "LỖI: Không thể biên dịch Go executor."; exit 1; }
 
 # --- Giai đoạn 1: Dọn dẹp và Kiểm tra ---
 echo "--- Stage 1: Cleanup and Preparation ---"
@@ -51,6 +55,7 @@ tmux kill-server > /dev/null 2>&1 || true
 echo "INFO: Forcefully killing any lingering node or client processes..."
 pkill -f "$NODE_BINARY" || true
 pkill -f "$CLIENT_BINARY" || true
+pkill -f "$EXECUTOR_BINARY" || true # Thêm pkill cho executor
 sleep 1
 
 
@@ -67,9 +72,9 @@ if ! command -v tmux &> /dev/null; then
     echo "LỖI: Lệnh 'tmux' không tồn tại. Vui lòng cài đặt: sudo apt-get install tmux"
     exit 1
 fi
-for bin in "$NODE_BINARY" "$CLIENT_BINARY"; do
+for bin in "$NODE_BINARY" "$CLIENT_BINARY" "$EXECUTOR_BINARY"; do # Kiểm tra cả executor binary
     if [ ! -f "$bin" ]; then
-        echo "LỖI: Không tìm thấy file thực thi tại '$bin'. Bạn đã biên dịch code (cargo build --release) chưa?"
+        echo "LỖI: Không tìm thấy file thực thi tại '$bin'. Bạn đã biên dịch code (cargo build --release và go build) chưa?"
         exit 1
     fi
     if [ ! -x "$bin" ]; then
@@ -170,7 +175,13 @@ for i in $(seq 0 $((NODES-1))); do
     worker_cmd="$NODE_BINARY run --keys $key_file --committee $COMMITTEE_FILE --store $worker_db_path --parameters $PARAMETERS_FILE worker --id $worker_id"
     full_worker_cmd_with_log="RUST_LOG=info $worker_cmd"
     tmux new -d -s "worker-${i}-${worker_id}" "sh -c '$full_worker_cmd_with_log 2> $worker_log_file || echo \"[FATAL] Worker process exited.\" >> $worker_log_file'"
+
+    # Khởi chạy Executor
+    executor_log_file="$LOG_DIR/executor-$i.log"
+    executor_cmd="$EXECUTOR_BINARY --id $i"
+    full_executor_cmd_with_log="RUST_LOG=info $executor_cmd"
+    tmux new -d -s "executor-$i" "sh -c '$full_executor_cmd_with_log 2> $executor_log_file || echo \"[FATAL] Executor process exited.\" >> $executor_log_file'"
 done
 
 echo ""
-echo "✅ Primaries and Workers are now running. Please use 'tmux ls' to view sessions and 'tmux attach -t primary-0' or 'tmux attach -t worker-0-0' to inspect their output. To stop all nodes, run 'tmux kill-server'."
+echo "✅ Primaries, Workers, and Executors are now running. Please use 'tmux ls' to view sessions and 'tmux attach -t primary-0', 'tmux attach -t worker-0-0', or 'tmux attach -t executor-0' to inspect their output. To stop all nodes, run 'tmux kill-server'."
