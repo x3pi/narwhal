@@ -292,6 +292,8 @@ impl Core {
                 .expect("Failed to send certificate");
         }
 
+        log::info!("Sending certificate {:?} to consensus", certificate.digest());
+
         // Send it to the consensus layer.
         let id = certificate.header.id.clone();
         if let Err(e) = self.tx_consensus.send(certificate).await {

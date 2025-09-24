@@ -50,9 +50,9 @@ pub enum PrimaryWorkerMessage {
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerPrimaryMessage {
     /// The worker indicates it sealed a new batch.
-    OurBatch(Digest, WorkerId),
+    OurBatch(Digest, WorkerId, Vec<u8>),
     /// The worker indicates it received a batch's digest from another authority.
-    OthersBatch(Digest, WorkerId),
+    OthersBatch(Digest, WorkerId, Vec<u8>),
 }
 
 pub struct Primary;
@@ -66,8 +66,8 @@ impl Primary {
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
     ) {
-        let (tx_others_digests, rx_others_digests) = channel(CHANNEL_CAPACITY);
-        let (tx_our_digests, rx_our_digests) = channel(CHANNEL_CAPACITY);
+        let (tx_others_digests, rx_others_digests) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
+        let (tx_our_digests, rx_our_digests) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
         let (tx_headers, rx_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
@@ -190,6 +190,7 @@ impl Primary {
             name,
             &committee,
             signature_service,
+            store.clone(),
             parameters.header_size,
             parameters.max_header_delay,
             /* rx_core */ rx_parents,
@@ -246,8 +247,8 @@ impl MessageHandler for PrimaryReceiverHandler {
 /// Defines how the network receiver handles incoming workers messages.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_our_digests: Sender<(Digest, WorkerId)>,
-    tx_others_digests: Sender<(Digest, WorkerId)>,
+    tx_our_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
+    tx_others_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
 }
 
 #[async_trait]
@@ -259,14 +260,14 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id) => self
+            WorkerPrimaryMessage::OurBatch(digest, worker_id, batch) => self
                 .tx_our_digests
-                .send((digest, worker_id))
+                .send((digest, worker_id, batch))
                 .await
                 .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id) => self
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch) => self
                 .tx_others_digests
-                .send((digest, worker_id))
+                .send((digest, worker_id, batch))
                 .await
                 .expect("Failed to send workers' digests"),
         }

@@ -7,6 +7,7 @@ use crypto::{Digest, PublicKey, SignatureService};
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
+use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -20,6 +21,8 @@ pub struct Proposer {
     name: PublicKey,
     /// Service to sign headers.
     signature_service: SignatureService,
+    /// The persistent storage.
+    store: Store,
     /// The size of the headers' payload.
     header_size: usize,
     /// The maximum delay to wait for batches' digests.
@@ -28,7 +31,7 @@ pub struct Proposer {
     /// Receives the parents to include in the next header (along with their round number).
     rx_core: Receiver<(Vec<Digest>, Round)>,
     /// Receives the batches' digests from our workers.
-    rx_workers: Receiver<(Digest, WorkerId)>,
+    rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
     /// Sends newly created headers to the `Core`.
     tx_core: Sender<Header>,
 
@@ -48,10 +51,11 @@ impl Proposer {
         name: PublicKey,
         committee: &Committee,
         signature_service: SignatureService,
+        store: Store,
         header_size: usize,
         max_header_delay: u64,
         rx_core: Receiver<(Vec<Digest>, Round)>,
-        rx_workers: Receiver<(Digest, WorkerId)>,
+        rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
         tx_core: Sender<Header>,
     ) {
         let genesis = Certificate::genesis(committee)
@@ -63,6 +67,7 @@ impl Proposer {
             Self {
                 name,
                 signature_service,
+                store,
                 header_size,
                 max_header_delay,
                 rx_core,
@@ -142,7 +147,10 @@ impl Proposer {
                     // Signal that we have enough parent certificates to propose a new header.
                     self.last_parents = parents;
                 }
-                Some((digest, worker_id)) = self.rx_workers.recv() => {
+                Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
+                    // Store the batch in the primary's store for the `analyze` function to find.
+                    self.store.write(digest.to_vec(), batch).await;
+
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                 }

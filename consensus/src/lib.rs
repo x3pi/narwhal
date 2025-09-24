@@ -133,9 +133,18 @@ impl Consensus {
             if leader_round <= state.last_committed_round {
                 continue;
             }
+            
+            // -- BẮT ĐẦU LOGGING --
+            info!("[CONSENSUS] Checking for leader at round {}", leader_round);
             let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
-                Some(x) => x,
-                None => continue,
+                Some(x) => {
+                    info!("[CONSENSUS] Leader found for round {}: {:?}", leader_round, x.1.digest());
+                    x
+                },
+                None => {
+                    info!("[CONSENSUS] No leader found for round {}", leader_round);
+                    continue;
+                }
             };
 
             // Check if the leader has f+1 support from its children (ie. round r-1).
@@ -148,16 +157,18 @@ impl Consensus {
                 .map(|(_, x)| self.committee.stake(&x.origin()))
                 .sum();
 
-            // If it is the case, we can commit the leader. But first, we need to recursively go back to
-            // the last committed leader, and commit all preceding leaders in the right order. Committing
-            // a leader block means committing all its dependencies.
-            if stake < self.committee.validity_threshold() {
-                debug!("Leader {:?} does not have enough support", leader);
+            let required_stake = self.committee.validity_threshold();
+            info!("[CONSENSUS] Leader {:?} has {} stake, requires {}", leader.digest(), stake, required_stake);
+
+            // If it is the case, we can commit the leader.
+            if stake < required_stake {
+                info!("[CONSENSUS] Leader {:?} does not have enough support, skipping commit", leader.digest());
                 continue;
             }
+            // -- KẾT THÚC LOGGING --
 
             // Get an ordered list of past leaders that are linked to the current leader.
-            debug!("Leader {:?} has enough support", leader);
+            info!("[CONSENSUS] Leader {:?} has enough support! COMMITTING", leader.digest());
             let mut sequence = Vec::new();
             for leader in self.order_leaders(leader, &state).iter().rev() {
                 // Starting from the oldest leader, flatten the sub-dag referenced by the leader.

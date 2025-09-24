@@ -38,12 +38,12 @@ impl Processor {
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
 
                 // Store the batch.
-                store.write(digest.to_vec(), batch).await;
+                store.write(digest.to_vec(), batch.clone()).await; // SỬA ĐỔI: clone batch
 
-                // Deliver the batch's digest.
+                // SỬA ĐỔI: Gửi kèm dữ liệu batch trong message
                 let message = match own_digest {
-                    true => WorkerPrimaryMessage::OurBatch(digest, id),
-                    false => WorkerPrimaryMessage::OthersBatch(digest, id),
+                    true => WorkerPrimaryMessage::OurBatch(digest, id, batch),
+                    false => WorkerPrimaryMessage::OthersBatch(digest, id, batch),
                 };
                 let message = bincode::serialize(&message)
                     .expect("Failed to serialize our own worker-primary message");
