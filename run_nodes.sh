@@ -51,7 +51,7 @@ echo "INFO: Building Go executor binary..."
 # --- Giai đoạn 1: Dọn dẹp và Kiểm tra ---
 echo "--- Stage 1: Cleanup and Preparation ---"
 echo "INFO: Stopping tmux server..."
-tmux kill-server > /dev/null 2>&1 || true
+# tmux kill-server > /dev/null 2>&1 || true
 echo "INFO: Forcefully killing any lingering node or client processes..."
 pkill -f "$NODE_BINARY" || true
 pkill -f "$CLIENT_BINARY" || true
