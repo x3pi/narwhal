@@ -1,22 +1,16 @@
 package main
 
 import (
-	"bufio"
-	"encoding/binary"
 	"flag"
 	"fmt"
-	"io"
 	"log"
-	"net"
-	"os"
 	"sync"
 	"time"
 
-	// THAY ĐỔI: Import package protobuf được tạo ra ở Bước 2
-	// Đường dẫn này có thể cần được điều chỉnh cho phù hợp với cấu trúc dự án của bạn
-	pb "github.com/meta-node-blockchain/meta-node/pkg/proto"
+	// Giả định 'executor' là một package có thể import được trong cùng project
 
-	"google.golang.org/protobuf/proto"
+	"github.com/meta-node-blockchain/meta-node/pkg/executor"
+	pb "github.com/meta-node-blockchain/meta-node/pkg/proto"
 )
 
 const statsInterval = 30 * time.Second
@@ -44,65 +38,31 @@ func main() {
 	flag.IntVar(&socketID, "id", 0, "ID của socket executor")
 	flag.Parse()
 
-	socketPath := fmt.Sprintf("/tmp/executor%d.sock", socketID)
-
-	if err := os.RemoveAll(socketPath); err != nil {
-		log.Fatalf("Không thể xóa file socket cũ: %v", err)
+	// Sử dụng Listener từ module executor
+	listener := executor.NewListener(socketID)
+	if err := listener.Start(); err != nil {
+		log.Fatalf("Lỗi khi khởi động listener: %v", err)
 	}
+	defer listener.Stop()
 
-	listener, err := net.Listen("unix", socketPath)
-	if err != nil {
-		log.Fatalf("Lỗi khi lắng nghe trên socket: %v", err)
-	}
-	defer listener.Close()
-
-	log.Printf("Máy chủ đang lắng nghe trên socket: %s", socketPath)
+	log.Printf("Chương trình exetps đang chạy và sử dụng listener cho executor ID %d", socketID)
 
 	counter := &TransactionCounter{}
 	txChan := make(chan int)
 
+	// Chạy goroutine để xử lý thống kê
 	go processStats(txChan, counter)
+	// Chạy goroutine để xử lý dữ liệu từ listener
+	go processEpochData(listener.DataChannel(), txChan)
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			log.Printf("Lỗi khi chấp nhận kết nối: %v", err)
-			continue
-		}
-		go handleConnection(conn, txChan)
-	}
+	// Giữ cho chương trình chính chạy vô hạn
+	// Trong một ứng dụng thực tế, bạn có thể muốn xử lý tín hiệu OS để thoát một cách an toàn
+	select {}
 }
 
-// THAY ĐỔI: Cập nhật hoàn toàn để khớp với cấu trúc Protobuf của Rust
-func handleConnection(conn net.Conn, txChan chan<- int) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
-
-	for {
-		// Đọc độ dài của message (được mã hóa theo Uvarint)
-		msgLen, err := binary.ReadUvarint(reader)
-		if err != nil {
-			if err != io.EOF {
-				log.Printf("Lỗi khi đọc độ dài message: %v", err)
-			}
-			break
-		}
-
-		// Đọc đúng số byte của message vào buffer
-		buf := make([]byte, msgLen)
-		if _, err := io.ReadFull(reader, buf); err != nil {
-			log.Printf("Lỗi khi đọc message vào buffer: %v", err)
-			break
-		}
-
-		// Giải mã buffer bằng Protobuf theo cấu trúc của Rust
-		var epochData pb.CommittedEpochData
-		if err := proto.Unmarshal(buf, &epochData); err != nil {
-			log.Printf("Lỗi khi giải mã Protobuf: %v", err)
-			continue
-		}
-
-		// Logic xử lý và in log đã được cập nhật
+// Hàm mới để xử lý dữ liệu từ channel của Listener
+func processEpochData(dataChan <-chan *pb.CommittedEpochData, txChan chan<- int) {
+	for epochData := range dataChan {
 		totalTxsInEpoch := 0
 		for _, block := range epochData.Blocks {
 			txCount := len(block.Transactions)
@@ -116,7 +76,6 @@ func handleConnection(conn net.Conn, txChan chan<- int) {
 			// In chi tiết một vài giao dịch đầu tiên để kiểm tra
 			for i, tx := range block.Transactions {
 				if i < 2 { // Chỉ in 2 giao dịch đầu tiên để tránh spam log
-					// SỬA ĐỔI: Cập nhật tên trường in ra để rõ ràng hơn
 					fmt.Printf("  -> Tx %d: Data[0:8]=%x, WorkerID=%d\n", i+1, tx.Digest[:8], tx.WorkerId)
 				}
 			}

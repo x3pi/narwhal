@@ -7,7 +7,7 @@
 set -e
 
 # Cấu hình Benchmark (giống hệt trong fabfile.py)
-NODES=4
+NODES=3
 RATE=60000
 TX_SIZE=600
 DURATION=30
@@ -177,10 +177,12 @@ for i in $(seq 0 $((NODES-1))); do
     tmux new -d -s "worker-${i}-${worker_id}" "sh -c '$full_worker_cmd_with_log 2> $worker_log_file || echo \"[FATAL] Worker process exited.\" >> $worker_log_file'"
 
     # Khởi chạy Executor
-    executor_log_file="$LOG_DIR/executor-$i.log"
-    executor_cmd="$EXECUTOR_BINARY --id $i"
-    full_executor_cmd_with_log="RUST_LOG=info $executor_cmd"
-    tmux new -d -s "executor-$i" "sh -c '$full_executor_cmd_with_log 2> $executor_log_file || echo \"[FATAL] Executor process exited.\" >> $executor_log_file'"
+    if [ "$i" -ne 0 ]; then
+      executor_log_file="$LOG_DIR/executor-$i.log"
+      executor_cmd="$EXECUTOR_BINARY --id $i"
+      full_executor_cmd_with_log="RUST_LOG=info $executor_cmd"
+      tmux new -d -s "executor-$i" "sh -c '$full_executor_cmd_with_log 2> $executor_log_file || echo \"[FATAL] Executor process exited.\" >> $executor_log_file'"
+    fi
 done
 
 echo ""

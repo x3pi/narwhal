@@ -17,7 +17,7 @@ func createSampleTransaction(id uint64, size int) []byte {
 }
 
 func main() {
-	nodeAddress := "127.0.0.1:6004"
+	nodeAddress := "127.0.0.1:4003"
 	transactionSize := 128
 
 	// 1. Khởi tạo client.
