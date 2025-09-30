@@ -51,14 +51,14 @@ worker_cmd="$NODE_BINARY run --keys $KEY_FILE --committee $COMMITTEE_FILE --stor
 echo "🚀 Khởi động Worker-${NODE_ID}-${worker_id}..."
 tmux new -d -s "worker-${NODE_ID}-${worker_id}" "sh -c 'RUST_LOG=info $worker_cmd 2> $worker_log || echo \"[FATAL] Worker exited\" >> $worker_log'"
 
-# --- Executor (chỉ chạy nếu node_id > 0) ---
-if [ "$NODE_ID" -ne 0 ]; then
-    executor_log="$LOG_DIR/executor-$NODE_ID.log"
-    executor_cmd="$EXECUTOR_BINARY --id $NODE_ID"
+# --- Executor (chỉ chạy nếu node_id > 0) --- đã comment để node cũng chạy
+# if [ "$NODE_ID" -ne 0 ]; then
+executor_log="$LOG_DIR/executor-$NODE_ID.log"
+executor_cmd="$EXECUTOR_BINARY --id $NODE_ID"
 
-    echo "🚀 Khởi động Executor-$NODE_ID..."
-    tmux new -d -s "executor-$NODE_ID" "sh -c 'RUST_LOG=info $executor_cmd 2> $executor_log || echo \"[FATAL] Executor exited\" >> $executor_log'"
-fi
+echo "🚀 Khởi động Executor-$NODE_ID..."
+tmux new -d -s "executor-$NODE_ID" "sh -c 'RUST_LOG=info $executor_cmd 2> $executor_log || echo \"[FATAL] Executor exited\" >> $executor_log'"
+# fi
 
 echo ""
 echo "✅ Node $NODE_ID đã chạy!"
