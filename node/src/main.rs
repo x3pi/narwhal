@@ -27,7 +27,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let matches = App::new(crate_name!())
+    let matches = App::new(crate_name!()) //// Định nghĩa các lệnh và tham số
         .version(crate_version!())
         .about("A research implementation of Narwhal and Tusk.")
         .args_from_usage("-v... 'Sets the level of verbosity'")
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         )
         .setting(AppSettings::SubcommandRequiredElseHelp)
         .get_matches();
-
+    // ... Thiết lập logging ...
     let log_level = match matches.occurrences_of("v") {
         0 => "error",
         1 => "warn",
@@ -78,13 +78,15 @@ async fn main() -> Result<()> {
 
 // Runs either a worker or a primary.
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
+    // 1. Đọc các đường dẫn file từ tham số
     let key_file = matches.value_of("keys").unwrap();
     let committee_file = matches.value_of("committee").unwrap();
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();
-
+    // 2. Tải cấu hình từ các file JSON
     // Read the committee and node's keypair from file.
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
+    
     let committee =
         Committee::import(committee_file).context("Failed to load the committee information")?;
 
@@ -95,16 +97,22 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         }
         None => Parameters::default(),
     };
-
+    // 3. Tạo kho lưu trữ (database)
     // Make the data store.
     let store = Store::new(store_path).context("Failed to create a store")?;
 
+    // 4. Tạo kênh giao tiếp cho kết quả đồng thuận
     // Channels the sequence of certificates.
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
+    // 5. Chạy Primary hoặc Worker
     // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
         // Spawn the primary and consensus core.
+        // Nó khởi chạy cả Primary (đề xuất các khối/header) và Consensus (sắp xếp các khối/header đó).
+        // Hai thành phần này giao tiếp với nhau qua các kênh (channels).
+        // Quan trọng nhất, kết quả cuối cùng của quá trình đồng thuận (một dòng các Certificate đã được sắp xếp) được gửi qua kênh tx_output.
+        // Sau đó, nó gọi hàm analyze(rx_output, ...) để xử lý dòng Certificate này.
         ("primary", _) => {
             // Xác định ID duy nhất cho node này dựa trên vị trí public key trong committee.
             let mut primary_keys: Vec<_> = committee.authorities.keys().cloned().collect();
@@ -115,9 +123,11 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .position(|pk| pk == &keypair.name)
                 .unwrap();
             log::info!("Node {} khởi chạy với ID: {}", keypair.name, node_id);
-
+            //Đề xuât cho Người điều phối (Consensus) 
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
+            // kênh nhận phản hồi từ Người điều phối (Consensus)    
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+              // Bắt đầu công việc của Bếp trưởng
             Primary::spawn(
                 keypair,
                 committee.clone(),
@@ -126,6 +136,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 /* tx_consensus */ tx_new_certificates,
                 /* rx_consensus */ rx_feedback,
             );
+             // Bắt đầu công việc của Người điều phối
             Consensus::spawn(
                 committee,
                 parameters.gc_depth,
@@ -134,10 +145,10 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 tx_output,
             );
 
-            // Gọi analyze với node_id đã được xác định và store.
+           // Giao kết quả cuối cùng cho người phục vụ
             analyze(rx_output, node_id, store).await;
         }
-
+        //Chỉ đơn giản là khởi chạy một Worker. Worker chịu trách nhiệm nhận giao dịch từ client và tạo các batch (lô) giao dịch.
         // Spawn a single worker.
         ("worker", Some(sub_matches)) => {
             let id = sub_matches
@@ -158,8 +169,10 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     unreachable!();
 }
 
+//Cầu nối đến Lớp Thực thi (Executor)
 /// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) { // SỬA LỖI: Thêm `mut` vào đây
+async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {
+    // SỬA LỖI: Thêm `mut` vào đây
     // Helper function for varint encoding (no changes needed here)
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
@@ -171,26 +184,47 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             value >>= 7;
         }
     }
-
+    // 1. Kết nối tới Executor qua Unix Socket
     let socket_path = format!("/tmp/executor{}.sock", node_id);
-    log::info!("[ANALYZE] Node ID {} attempting to connect to {}", node_id, socket_path);
-
-    let mut stream = loop {
+    log::info!(
+        "[ANALYZE] Node ID {} attempting to connect to {}",
+        node_id,
+        socket_path
+    );
+    //// Vòng lặp kết nối lại nếu thất bại
+    let mut stream = loop { 
         match UnixStream::connect(&socket_path).await {
             Ok(stream) => {
-                log::info!("[ANALYZE] Node ID {} connected successfully to {}", node_id, socket_path);
+                log::info!(
+                    "[ANALYZE] Node ID {} connected successfully to {}",
+                    node_id,
+                    socket_path
+                );
                 break stream;
             }
             Err(e) => {
-                log::warn!("[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...", node_id, socket_path, e);
+                log::warn!(
+                    "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
+                    node_id,
+                    socket_path,
+                    e
+                );
                 tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
             }
         }
     };
 
-    log::info!("[ANALYZE] Node ID {} entering loop to wait for committed blocks.", node_id);
+    log::info!(
+        "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
+        node_id
+    );
+    // 2. Vòng lặp chính: chờ kết quả từ Consensus
     while let Some(certificate) = rx_output.recv().await {
-        log::info!("[ANALYZE] Node ID {} RECEIVED certificate for round {} from consensus.", node_id, certificate.header.round);
+        log::info!(
+            "[ANALYZE] Node ID {} RECEIVED certificate for round {} from consensus.",
+            node_id,
+            certificate.header.round
+        );
 
         let mut all_transactions = Vec::new();
 
@@ -201,7 +235,12 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
                     // Giải mã `WorkerMessage::Batch`
                     match bincode::deserialize(&serialized_batch_message) {
                         Ok(WorkerMessage::Batch(batch)) => {
-                            log::debug!("[ANALYZE] Unpacked batch {} with {} transactions for worker {}.", digest, batch.len(), worker_id);
+                            log::debug!(
+                                "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
+                                digest,
+                                batch.len(),
+                                worker_id
+                            );
                             // Chuyển đổi mỗi giao dịch trong batch sang định dạng protobuf.
                             for tx_data in batch {
                                 all_transactions.push(comm::Transaction {
@@ -212,10 +251,17 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
                             }
                         }
                         Ok(_) => {
-                            log::warn!("[ANALYZE] Digest {} did not correspond to a Batch message.", digest);
+                            log::warn!(
+                                "[ANALYZE] Digest {} did not correspond to a Batch message.",
+                                digest
+                            );
                         }
                         Err(e) => {
-                            log::error!("[ANALYZE] Failed to deserialize message for digest {}: {}", digest, e);
+                            log::error!(
+                                "[ANALYZE] Failed to deserialize message for digest {}: {}",
+                                digest,
+                                e
+                            );
                         }
                     }
                 }
@@ -223,15 +269,22 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
                     log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
                 }
                 Err(e) => {
-                    log::error!("[ANALYZE] Failed to read batch for digest {}: {}", digest, e);
+                    log::error!(
+                        "[ANALYZE] Failed to read batch for digest {}: {}",
+                        digest,
+                        e
+                    );
                 }
             }
         }
 
         // Bỏ qua việc gửi block nếu không có giao dịch nào được tìm thấy
         if all_transactions.is_empty() {
-             log::warn!("[ANALYZE] No transactions found for certificate in round {}. Skipping.", certificate.header.round);
-             continue;
+            log::warn!(
+                "[ANALYZE] No transactions found for certificate in round {}. Skipping.",
+                certificate.header.round
+            );
+            continue;
         }
 
         let committed_block = comm::CommittedBlock {
@@ -244,9 +297,15 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             blocks: vec![committed_block],
         };
 
-        log::debug!("[ANALYZE] Node ID {} serializing data for round {}", node_id, certificate.header.round);
+        log::debug!(
+            "[ANALYZE] Node ID {} serializing data for round {}",
+            node_id,
+            certificate.header.round
+        );
         let mut proto_buf = BytesMut::new();
-        epoch_data.encode(&mut proto_buf).expect("FATAL: Protobuf serialization failed!");
+        epoch_data
+            .encode(&mut proto_buf)
+            .expect("FATAL: Protobuf serialization failed!");
 
         let mut len_buf = BytesMut::new();
         put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
@@ -254,17 +313,32 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
 
         if let Err(e) = stream.write_all(&len_buf).await {
-            log::error!("[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}", node_id, e);
+            log::error!(
+                "[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}",
+                node_id,
+                e
+            );
             break;
         }
 
         if let Err(e) = stream.write_all(&proto_buf).await {
-            log::error!("[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}", node_id, e);
+            log::error!(
+                "[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}",
+                node_id,
+                e
+            );
             break;
         }
 
-        log::info!("[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.", node_id, certificate.header.round);
+        log::info!(
+            "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
+            node_id,
+            certificate.header.round
+        );
     }
 
-    log::warn!("[ANALYZE] Node ID {} exited the receive loop. No more blocks will be processed.", node_id);
+    log::warn!(
+        "[ANALYZE] Node ID {} exited the receive loop. No more blocks will be processed.",
+        node_id
+    );
 }

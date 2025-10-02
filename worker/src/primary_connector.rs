@@ -29,6 +29,7 @@ impl PrimaryConnector {
     }
 
     async fn run(&mut self) {
+        // đưa rx vào để lắng nghe
         while let Some(digest) = self.rx_digest.recv().await {
             // Send the digest through the network.
             self.network
