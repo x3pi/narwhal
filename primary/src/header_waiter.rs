@@ -142,12 +142,10 @@ impl HeaderWaiter {
                             // Add the header to the waiter pool. The waiter will return it to when all
                             // its parents are in the store.
                             let wait_for = missing
-                                .iter()
-                                .map(|(digest, worker_id)| {
-                                    let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
-                                    (key.to_vec(), self.store.clone())
-                                })
+                                .keys() // Chỉ cần lấy digest từ HashMap
+                                .map(|digest| (digest.to_vec(), self.store.clone()))
                                 .collect();
+
                             let (tx_cancel, rx_cancel) = channel(1);
                             self.pending.insert(header_id, (round, tx_cancel));
                             let fut = Self::waiter(wait_for, header, rx_cancel);

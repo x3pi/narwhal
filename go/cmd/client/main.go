@@ -11,7 +11,7 @@ import (
 // createSampleTransaction tạo ra một payload giao dịch mẫu.
 func createSampleTransaction(id uint64, size int) []byte {
 	payload := make([]byte, size)
-	payload[0] = 1 // Loại giao dịch chuẩn
+	payload[0] = 16 // Loại giao dịch chuẩn
 	binary.BigEndian.PutUint64(payload[1:9], id)
 	return payload
 }

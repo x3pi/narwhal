@@ -27,7 +27,7 @@ pub const CHANNEL_CAPACITY: usize = 1_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let matches = App::new(crate_name!()) //// Định nghĩa các lệnh và tham số
+    let matches = App::new(crate_name!())
         .version(crate_version!())
         .about("A research implementation of Narwhal and Tusk.")
         .args_from_usage("-v... 'Sets the level of verbosity'")
@@ -53,7 +53,7 @@ async fn main() -> Result<()> {
         )
         .setting(AppSettings::SubcommandRequiredElseHelp)
         .get_matches();
-    // ... Thiết lập logging ...
+
     let log_level = match matches.occurrences_of("v") {
         0 => "error",
         1 => "warn",
@@ -78,103 +78,81 @@ async fn main() -> Result<()> {
 
 // Runs either a worker or a primary.
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
-    // 1. Đọc các đường dẫn file từ tham số
     let key_file = matches.value_of("keys").unwrap();
     let committee_file = matches.value_of("committee").unwrap();
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();
-    // 2. Tải cấu hình từ các file JSON
-    // Read the committee and node's keypair from file.
+
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
-    
     let committee =
         Committee::import(committee_file).context("Failed to load the committee information")?;
 
-    // Load default parameters if none are specified.
     let parameters = match parameters_file {
         Some(filename) => {
             Parameters::import(filename).context("Failed to load the node's parameters")?
         }
         None => Parameters::default(),
     };
-    // 3. Tạo kho lưu trữ (database)
-    // Make the data store.
-    let store = Store::new(store_path).context("Failed to create a store")?;
 
-    // 4. Tạo kênh giao tiếp cho kết quả đồng thuận
-    // Channels the sequence of certificates.
+    let store = Store::new(store_path).context("Failed to create a store")?;
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
 
-    // 5. Chạy Primary hoặc Worker
-    // Check whether to run a primary, a worker, or an entire authority.
     match matches.subcommand() {
-        // Spawn the primary and consensus core.
-        // Nó khởi chạy cả Primary (đề xuất các khối/header) và Consensus (sắp xếp các khối/header đó).
-        // Hai thành phần này giao tiếp với nhau qua các kênh (channels).
-        // Quan trọng nhất, kết quả cuối cùng của quá trình đồng thuận (một dòng các Certificate đã được sắp xếp) được gửi qua kênh tx_output.
-        // Sau đó, nó gọi hàm analyze(rx_output, ...) để xử lý dòng Certificate này.
         ("primary", _) => {
-            // Xác định ID duy nhất cho node này dựa trên vị trí public key trong committee.
+            // SỬA LỖI: Quay lại cách xác định node_id đúng và an toàn cho primary.
             let mut primary_keys: Vec<_> = committee.authorities.keys().cloned().collect();
-            primary_keys.sort(); // Sắp xếp để đảm bảo thứ tự là nhất quán trên tất cả các node.
+            primary_keys.sort(); // Sắp xếp để đảm bảo thứ tự nhất quán.
 
             let node_id = primary_keys
                 .iter()
                 .position(|pk| pk == &keypair.name)
-                .unwrap();
+                .context("Public key không tìm thấy trong committee file")?;
+
             log::info!("Node {} khởi chạy với ID: {}", keypair.name, node_id);
-            //Đề xuât cho Người điều phối (Consensus) 
+            
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
-            // kênh nhận phản hồi từ Người điều phối (Consensus)    
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-              // Bắt đầu công việc của Bếp trưởng
+            
             Primary::spawn(
                 keypair,
                 committee.clone(),
                 parameters.clone(),
-                store.clone(), // Clone the store for the primary
-                /* tx_consensus */ tx_new_certificates,
-                /* rx_consensus */ rx_feedback,
+                store.clone(),
+                tx_new_certificates,
+                rx_feedback,
             );
-             // Bắt đầu công việc của Người điều phối
+            
             Consensus::spawn(
                 committee,
                 parameters.gc_depth,
                 store.clone(),
-                /* rx_primary */ rx_new_certificates,
-                /* tx_primary */ tx_feedback,
+                rx_new_certificates,
+                tx_feedback,
                 tx_output,
             );
 
-           // Giao kết quả cuối cùng cho người phục vụ
             analyze(rx_output, node_id, store).await;
         }
-        //Chỉ đơn giản là khởi chạy một Worker. Worker chịu trách nhiệm nhận giao dịch từ client và tạo các batch (lô) giao dịch.
-        // Spawn a single worker.
         ("worker", Some(sub_matches)) => {
-            let id = sub_matches
-                .value_of("id")
-                .unwrap()
+            // SỬA LỖI: Xử lý lỗi ParseIntError một cách an toàn, không dùng unwrap().
+            let id_str = sub_matches.value_of("id").unwrap();
+            let id = id_str
                 .parse::<WorkerId>()
-                .context("The worker id must be a positive integer")?;
+                .with_context(|| format!("Giá trị '{}' không phải là một số nguyên hợp lệ cho tham số --id", id_str))?;
+            
             Worker::spawn(keypair.name, id, committee, parameters, store);
         }
         _ => unreachable!(),
     }
 
-    // Giữ cho chương trình chính không bị thoát, cho phép các task con (primary/worker) tiếp tục chạy.
-    // Chúng ta tạo một kênh mới và chờ mãi mãi ở đầu nhận.
     let (_tx, mut rx) = channel::<()>(1);
     let _ = rx.recv().await;
 
     unreachable!();
 }
 
-//Cầu nối đến Lớp Thực thi (Executor)
 /// Receives an ordered list of certificates and apply any application-specific logic.
 async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {
-    // SỬA LỖI: Thêm `mut` vào đây
-    // Helper function for varint encoding (no changes needed here)
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
             if value < 0x80 {
@@ -185,14 +163,14 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             value >>= 7;
         }
     }
-    // 1. Kết nối tới Executor qua Unix Socket
+    
     let socket_path = format!("/tmp/executor{}.sock", node_id);
     log::info!(
         "[ANALYZE] Node ID {} attempting to connect to {}",
         node_id,
         socket_path
     );
-    //// Vòng lặp kết nối lại nếu thất bại
+    
     let mut stream = loop { 
         match UnixStream::connect(&socket_path).await {
             Ok(stream) => {
@@ -219,7 +197,7 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
         node_id
     );
-    // 2. Vòng lặp chính: chờ kết quả từ Consensus
+
     while let Some(certificate) = rx_output.recv().await {
         log::info!(
             "[ANALYZE] Node ID {} RECEIVED certificate for round {} from consensus.",
@@ -230,10 +208,8 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         let mut all_transactions = Vec::new();
 
         for (digest, worker_id) in certificate.header.payload {
-            // Đọc batch từ store bằng digest.
             match store.read(digest.to_vec()).await {
                 Ok(Some(serialized_batch_message)) => {
-                    // Giải mã `WorkerMessage::Batch`
                     match bincode::deserialize(&serialized_batch_message) {
                         Ok(WorkerMessage::Batch(batch)) => {
                             log::debug!(
@@ -242,10 +218,8 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
                                 batch.len(),
                                 worker_id
                             );
-                            // Chuyển đổi mỗi giao dịch trong batch sang định dạng protobuf.
                             for tx_data in batch {
                                 all_transactions.push(comm::Transaction {
-                                    // Trường 'digest' trong protobuf giờ sẽ chứa toàn bộ dữ liệu giao dịch.
                                     digest: tx_data,
                                     worker_id: worker_id as u32,
                                 });
@@ -279,19 +253,10 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             }
         }
 
-        // Bỏ qua việc gửi block nếu không có giao dịch nào được tìm thấy
-        if all_transactions.is_empty() {
-            log::warn!(
-                "[ANALYZE] No transactions found for certificate in round {}. Skipping.",
-                certificate.header.round
-            );
-            continue;
-        }
-
         let committed_block = comm::CommittedBlock {
             epoch: certificate.header.round,
             height: certificate.header.round,
-            transactions: all_transactions, // Sử dụng danh sách đầy đủ các giao dịch
+            transactions: all_transactions,
         };
 
         let epoch_data = comm::CommittedEpochData {
@@ -310,6 +275,10 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
 
         let mut len_buf = BytesMut::new();
         put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
+        if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
+             log::info!("[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.", node_id, certificate.header.round);
+        }
 
         log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
 

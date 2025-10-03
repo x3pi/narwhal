@@ -5,9 +5,9 @@ use crypto::{Digest, PublicKey};
 use log::{debug, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use serde::{Deserialize, Serialize};
-use store::Store;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
+use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -155,14 +155,18 @@ impl Consensus {
             if leader_round <= state.last_committed_round {
                 continue;
             }
-            
+
             // -- BẮT ĐẦU LOGGING --
             info!("[CONSENSUS] Checking for leader at round {}", leader_round);
             let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
                 Some(x) => {
-                    info!("[CONSENSUS] Leader found for round {}: {:?}", leader_round, x.1.digest());
+                    info!(
+                        "[CONSENSUS] Leader found for round {}: {:?}",
+                        leader_round,
+                        x.1.digest()
+                    );
                     x.clone() // Clone to avoid borrowing issues
-                },
+                }
                 None => {
                     info!("[CONSENSUS] No leader found for round {}", leader_round);
                     continue;
@@ -180,17 +184,28 @@ impl Consensus {
                 .sum();
 
             let required_stake = self.committee.validity_threshold();
-            info!("[CONSENSUS] Leader {:?} has {} stake, requires {}", leader.digest(), stake, required_stake);
+            info!(
+                "[CONSENSUS] Leader {:?} has {} stake, requires {}",
+                leader.digest(),
+                stake,
+                required_stake
+            );
 
             // If it is the case, we can commit the leader.
             if stake < required_stake {
-                info!("[CONSENSUS] Leader {:?} does not have enough support, skipping commit", leader.digest());
+                info!(
+                    "[CONSENSUS] Leader {:?} does not have enough support, skipping commit",
+                    leader.digest()
+                );
                 continue;
             }
             // -- KẾT THÚC LOGGING --
 
             // Get an ordered list of past leaders that are linked to the current leader.
-            info!("[CONSENSUS] Leader {:?} has enough support! COMMITTING", leader.digest());
+            info!(
+                "[CONSENSUS] Leader {:?} has enough support! COMMITTING",
+                leader.digest()
+            );
             let mut sequence = Vec::new();
             let mut committed_something = false;
             for leader_cert in self.order_leaders(&leader, &state).iter().rev() {
@@ -204,10 +219,11 @@ impl Consensus {
                     committed_something = true;
                 }
             }
-            
+
             // If we committed anything, persist the new state.
             if committed_something {
-                let serialized_state = bincode::serialize(&state).expect("Failed to serialize state");
+                let serialized_state =
+                    bincode::serialize(&state).expect("Failed to serialize state");
                 self.store.write(STATE_KEY.to_vec(), serialized_state).await;
             }
 
@@ -288,9 +304,26 @@ impl Consensus {
     fn linked(&self, leader: &Certificate, prev_leader: &Certificate, dag: &Dag) -> bool {
         let mut parents = vec![leader];
         for r in (prev_leader.round()..leader.round()).rev() {
-            parents = dag
-                .get(&(r))
-                .expect("We should have the whole history by now")
+            // Lấy các certificate của round 'r'.
+            // Thay thế .expect() bằng một khối match để xử lý an toàn trường hợp round bị thiếu.
+            let round_certificates = match dag.get(&r) {
+                Some(certs) => certs,
+                None => {
+                    // Nếu một round trung gian hoàn toàn thiếu trong DAG (thường xảy ra khi node đang đồng bộ hóa),
+                    // chúng ta không thể xác định được đường dẫn.
+                    // Ghi lại cảnh báo và trả về 'false' thay vì làm sập chương trình.
+                    warn!(
+                    "[CONSENSUS] Missing entire round {} in DAG during path check between leaders at round {} and {}.",
+                    r,
+                    leader.round(),
+                    prev_leader.round()
+                );
+                    return false;
+                }
+            };
+
+            // Tiếp tục logic tìm kiếm parent như cũ.
+            parents = round_certificates
                 .values()
                 .filter(|(digest, _)| parents.iter().any(|x| x.header.parents.contains(digest)))
                 .map(|(_, certificate)| certificate)

@@ -19,9 +19,11 @@ use network::{MessageHandler, Receiver as NetworkReceiver, Writer};
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::sync::atomic::AtomicU64;
+use dashmap::DashMap;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 
 /// The default channel capacity for each channel of the primary.
 pub const CHANNEL_CAPACITY: usize = 1_000;
@@ -93,6 +95,7 @@ impl Primary {
         // Kênh chính nhận message từ các primary khác (NetworkReceiver -> Core).
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
+        let payload_cache = Arc::new(DashMap::new());
 
         // Write the parameters to the logs.
         parameters.log();
@@ -151,9 +154,11 @@ impl Primary {
             name,
             &committee,
             store.clone(),
+            payload_cache.clone(), // <--- TRUYỀN CACHE VÀO ĐÂY
             /* tx_header_waiter */ tx_sync_headers,
             /* tx_certificate_waiter */ tx_sync_certificates,
         );
+
 
         // Dịch vụ ký, sử dụng khóa bí mật để tạo chữ ký cho các Header và Vote.
         // The `SignatureService` is used to require signatures on specific digests.
@@ -186,8 +191,11 @@ impl Primary {
         // Khởi chạy 'bộ phận kho tạm' cho payload từ node khác.
         // Chỉ đơn giản là nhận batch digest (qua rx_others_digests) và lưu vào Store để xác thực sau này.
         // Receives batch digests from other workers. They are only used to validate headers.
-        PayloadReceiver::spawn(store.clone(), /* rx_workers */ rx_others_digests);
-
+        PayloadReceiver::spawn(
+            store.clone(), 
+            payload_cache.clone(), // <--- TRUYỀN CACHE VÀO ĐÂY
+            /* rx_workers */ rx_others_digests
+        );
 
          // Khởi chạy 'bộ phận chờ hàng' cho Header.
         // Khi Core bị thiếu dữ liệu (parent hoặc batch), nó sẽ nhận yêu cầu từ Synchronizer,

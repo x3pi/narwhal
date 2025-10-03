@@ -8,7 +8,7 @@ use crypto::{Digest, PublicKey};
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::Sender;
-
+use crate::primary::PayloadCache;
 /// The `Synchronizer` checks if we have all batches and parents referenced by a header. If we don't, it sends
 /// a command to the `Waiter` to request the missing data.
 pub struct Synchronizer {
@@ -22,6 +22,9 @@ pub struct Synchronizer {
     tx_certificate_waiter: Sender<Certificate>,
     /// The genesis and its digests.
     genesis: Vec<(Digest, Certificate)>,
+
+    cache: PayloadCache, // <--- THÊM TRƯỜNG CACHE
+
 }
 
 impl Synchronizer {
@@ -29,12 +32,14 @@ impl Synchronizer {
         name: PublicKey,
         committee: &Committee,
         store: Store,
+        cache: PayloadCache, // <--- NHẬN CACHE
         tx_header_waiter: Sender<WaiterMessage>,
         tx_certificate_waiter: Sender<Certificate>,
     ) -> Self {
         Self {
             name,
             store,
+            cache,
             tx_header_waiter,
             tx_certificate_waiter,
             genesis: Certificate::genesis(committee)
@@ -48,26 +53,19 @@ impl Synchronizer {
     /// synchronize with other nodes (through our workers), and re-schedule processing of the
     /// header for when we will have its complete payload.
     pub async fn missing_payload(&mut self, header: &Header) -> DagResult<bool> {
-        // We don't store the payload of our own workers.
         if header.author == self.name {
             return Ok(false);
         }
 
         let mut missing = HashMap::new();
         for (digest, worker_id) in header.payload.iter() {
-            // Check whether we have the batch. If one of our worker has the batch, the primary stores the pair
-            // (digest, worker_id) in its own storage. It is important to verify that we received the batch
-            // from the correct worker id to prevent the following attack:
-            //      1. A Bad node sends a batch X to 2f good nodes through their worker #0.
-            //      2. The bad node proposes a malformed block containing the batch X and claiming it comes
-            //         from worker #1.
-            //      3. The 2f good nodes do not need to sync and thus don't notice that the header is malformed.
-            //         The bad node together with the 2f good nodes thus certify a block containing the batch X.
-            //      4. The last good node will never be able to sync as it will keep sending its sync requests
-            //         to workers #1 (rather than workers #0). Also, clients will never be able to retrieve batch
-            //         X as they will be querying worker #1.
-            let key = [digest.as_ref(), &worker_id.to_le_bytes()].concat();
-            if self.store.read(key).await?.is_none() {
+            // KIỂM TRA CACHE TRƯỚC
+            if self.cache.contains_key(digest) {
+                continue; // Tìm thấy trong RAM, không cần làm gì thêm
+            }
+
+            // Nếu không có trong cache, kiểm tra store (phương án dự phòng)
+            if self.store.read(digest.to_vec()).await?.is_none() {
                 missing.insert(digest.clone(), *worker_id);
             }
         }
@@ -82,7 +80,6 @@ impl Synchronizer {
             .expect("Failed to send sync batch request");
         Ok(true)
     }
-
     /// Returns the parents of a header if we have them all. If at least one parent is missing,
     /// we return an empty vector, synchronize with other nodes, and re-schedule processing
     /// of the header for when we will have all the parents.
