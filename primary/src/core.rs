@@ -9,7 +9,7 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -292,6 +292,22 @@ impl Core {
                 .expect("Failed to send certificate");
         }
 
+        // Quick check: Đọc consensus state để tránh gửi certificate đã commit
+        let consensus_state_key = b"consensus_state".to_vec();
+      if let Ok(Some(bytes)) = self.store.read(consensus_state_key.clone()).await {
+          #[derive(serde::Deserialize)]
+          struct ConsensusState {
+              last_committed_round: Round,
+          }
+          if let Ok(state) = bincode::deserialize::<ConsensusState>(&bytes) {
+              if certificate.round() <= state.last_committed_round {
+                  debug!("Certificate {} already committed (round {} <= {}), skipping consensus", 
+                         certificate.digest(), certificate.round(), state.last_committed_round);
+                  return Ok(());
+              }
+          }
+      }
+
         log::info!("Sending certificate {:?} to consensus", certificate.digest());
 
         // Send it to the consensus layer.
@@ -368,25 +384,9 @@ impl Core {
                             }
                         },
                         PrimaryMessage::Certificate(certificate) => {
-                            // SỬA ĐỔI: Thêm logic kiểm tra store trước khi xử lý
-                            let digest = certificate.digest();
-                            match self.store.read(digest.to_vec()).await {
-                                Ok(Some(_)) => {
-                                    // Certificate đã có trong store. Bỏ qua để tránh xử lý lại.
-                                    info!("Certificate {} already in store, skipping.", digest);
-                                    Ok(())
-                                }
-                                Ok(None) => {
-                                    // Certificate chưa có trong store, xử lý như bình thường.
-                                    match self.sanitize_certificate(&certificate) {
-                                        Ok(()) =>  self.process_certificate(certificate).await,
-                                        error => error
-                                    }
-                                }
-                                Err(e) => {
-                                    // Lỗi khi đọc store, trả về lỗi.
-                                    Err(DagError::StoreError(e))
-                                }
+                            match self.sanitize_certificate(&certificate) {
+                                Ok(()) => self.process_certificate(certificate).await,
+                                error => error
                             }
                         },
                         _ => panic!("Unexpected core message")
@@ -400,7 +400,17 @@ impl Core {
                 // We receive here loopback certificates from the `CertificateWaiter`. Those are certificates for which
                 // we interrupted execution (we were missing some of their ancestors) and we are now ready to resume
                 // processing.
-                Some(certificate) = self.rx_certificate_waiter.recv() => self.process_certificate(certificate).await,
+                Some(certificate) = self.rx_certificate_waiter.recv() => {
+                    // Kiểm tra store để tránh duplicate processing từ certificate waiter loopback
+                    let digest = certificate.digest();
+                    match self.store.read(digest.to_vec()).await {
+                        Ok(Some(_)) => {
+                            debug!("Certificate {} from waiter already processed, skipping.", digest);
+                            Ok(())
+                        }
+                        _ => self.process_certificate(certificate).await
+                    }
+                },
 
                 // We also receive here our new headers created by the `Proposer`.
                 Some(header) = self.rx_proposer.recv() => self.process_own_header(header).await,
