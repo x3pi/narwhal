@@ -35,8 +35,8 @@ pub type SerializedBatchDigestMessage = Vec<u8>;
 /// The message exchanged between workers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Batch(Batch),
-    BatchRequest(Vec<Digest>, /* origin */ PublicKey),
+    Batch(Batch), // Một batch hoàn chỉnh.
+    BatchRequest(Vec<Digest>, /* origin */ PublicKey), // Yêu cầu xin các batch bị thiếu.
 }
 
 pub struct Worker {
@@ -71,10 +71,13 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
-        worker.handle_primary_messages();
-        worker.handle_clients_transactions(tx_primary.clone());
-        worker.handle_workers_messages(tx_primary);
+        worker.handle_primary_messages(); // Dây chuyền nhận lệnh từ Primary.
+        worker.handle_clients_transactions(tx_primary.clone()); // Dây chuyền sản xuất chính, từ giao dịch của client.
+        worker.handle_workers_messages(tx_primary); // Dây chuyền xử lý tin nhắn từ các Worker khác.
 
+
+         // Khởi chạy 'người giao liên' chuyên gửi tin nhắn LÊN cho Primary.
+        // Nó nhận tin nhắn từ `rx_primary` và gửi chúng qua mạng.
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
             worker
@@ -82,7 +85,7 @@ impl Worker {
                 .primary(&worker.name)
                 .expect("Our public key is not in the committee")
                 .worker_to_primary,
-            rx_primary,
+            rx_primary, // rx để nhận tin nhắn từ các bộ phận khác của worker - sau đó gửi cho primary.
         );
 
         // NOTE: This log entry is used to compute performance.
@@ -98,10 +101,12 @@ impl Worker {
         );
     }
 
+    /// Thiết lập và khởi chạy dây chuyền xử lý các mệnh lệnh từ Primary.
     /// Spawn all tasks responsible to handle messages from our primary.
     fn handle_primary_messages(&self) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
+         // Mở cổng mạng để lắng nghe các chỉ thị từ Primary của chính node này.
         // Receive incoming messages from our primary.
         let mut address = self
             .committee
@@ -109,14 +114,16 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .primary_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
+        // worker nhận tin nhắn từ primary
         Receiver::spawn(
             address,
             /* handler */
             PrimaryReceiverHandler { tx_synchronizer },
         );
 
-        // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
-        // it receives from the primary (which are mainly notifications that we are out of sync).
+        // Khởi chạy 'bộ phận đồng bộ hóa'.
+        // Chịu trách nhiệm thực hiện các lệnh từ Primary, chủ yếu là đi tìm các batch bị thiếu
+        // hoặc dọn dẹp dữ liệu cũ.
         Synchronizer::spawn(
             self.name,
             self.id,
@@ -134,6 +141,7 @@ impl Worker {
         );
     }
 
+    /// Thiết lập và khởi chạy dây chuyền sản xuất chính: xử lý giao dịch từ client.
     /// Spawn all tasks responsible to handle clients transactions.
     fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
@@ -147,11 +155,15 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
+        // nhan tu client
         Receiver::spawn(
             address,
             /* handler */ TxReceiverHandler { tx_batch_maker },
         );
 
+
+        // 2. Khởi chạy 'máy đóng gói'.
+        // Nó nhận giao dịch, gom chúng thành batch, sau đó phát sóng batch này đến các worker khác.
         // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
         // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
         // gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
@@ -160,7 +172,7 @@ impl Worker {
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
             /* tx_message */ tx_quorum_waiter,
-            /* workers_addresses */
+            // Danh sách địa chỉ của các worker khác để phát sóng.
             self.committee
                 .others_workers(&self.name, &self.id)
                 .iter()
@@ -168,6 +180,8 @@ impl Worker {
                 .collect(),
         );
 
+         // 3. Khởi chạy 'bộ phận chờ xác nhận'.
+        // Nó chờ cho đến khi đủ số lượng worker khác xác nhận đã nhận được batch.
         // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
         // the batch to the `Processor`.
         QuorumWaiter::spawn(
@@ -177,6 +191,8 @@ impl Worker {
             /* tx_batch */ tx_processor,
         );
 
+         // 4. Khởi chạy 'bộ phận lưu kho và dán nhãn'.
+        // Nó băm batch, lưu vào kho, và gửi báo cáo (digest) lên cho Primary.
         // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the `PrimaryConnector`
         // that will send it to our primary machine.
         Processor::spawn(
@@ -198,6 +214,7 @@ impl Worker {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
+          // 1. Mở 'cổng giao tiếp' để nhận tin nhắn từ các worker ngang hàng.
         // Receive incoming messages from other workers.
         let mut address = self
             .committee
@@ -205,15 +222,18 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .worker_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
+        // worker nhận tin nhắn từ các worker khác
         Receiver::spawn(
             address,
+            // Tùy vào loại tin nhắn, handler sẽ chuyển đến bộ phận phù hợp.
             /* handler */
             WorkerReceiverHandler {
-                tx_helper,
-                tx_processor,
+                tx_helper,    // Nếu là yêu cầu xin batch -> Helper.
+                tx_processor, // Nếu là batch hoàn chỉnh -> Processor.
             },
         );
-
+                // 2. Khởi chạy 'bộ phận hỗ trợ'.
+        // Chuyên trả lời các yêu cầu xin batch từ các worker khác.
         // The `Helper` is dedicated to reply to batch requests from other workers.
         Helper::spawn(
             self.id,
@@ -222,6 +242,8 @@ impl Worker {
             /* rx_request */ rx_helper,
         );
 
+         // 3. Khởi chạy 'bộ phận nhập kho'.
+        // Xử lý các batch nhận được từ worker khác: băm, lưu, và báo cáo lên Primary.
         // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
         // batch's digest to the `PrimaryConnector` that will send it to our primary.
         Processor::spawn(
@@ -239,6 +261,7 @@ impl Worker {
     }
 }
 
+/// Bộ xử lý logic cho cổng mạng nhận giao dịch từ client.
 /// Defines how the network receiver handles incoming transactions.
 #[derive(Clone)]
 struct TxReceiverHandler {
@@ -254,6 +277,7 @@ impl MessageHandler for TxReceiverHandler {
             .await
             .expect("Failed to send transaction");
 
+        // Nhường quyền thực thi cho các task khác, tránh block luồng.
         // Give the change to schedule other tasks.
         tokio::task::yield_now().await;
         Ok(())
@@ -271,15 +295,18 @@ struct WorkerReceiverHandler {
 impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         // Reply with an ACK.
+          // Gửi lại một tin "Ack" để xác nhận đã nhận.
         let _ = writer.send(Bytes::from("Ack")).await;
-
+        // Giải mã tin nhắn và phân loại.
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
+            // Nếu là một batch hoàn chỉnh, gửi đến Processor để xử lý.
             Ok(WorkerMessage::Batch(..)) => self
                 .tx_processor
                 .send(serialized.to_vec())
                 .await
                 .expect("Failed to send batch"),
+                // Nếu là yêu cầu xin batch, gửi đến Helper để trả lời.
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper
                 .send((missing, requestor))
@@ -305,6 +332,7 @@ impl MessageHandler for PrimaryReceiverHandler {
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         // Deserialize the message and send it to the synchronizer.
+         // Giải mã lệnh và gửi nó đến Synchronizer.
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
             Ok(message) => self

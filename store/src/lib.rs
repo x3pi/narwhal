@@ -27,11 +27,15 @@ pub struct Store {
 impl Store {
     pub fn new(path: &str) -> StoreResult<Self> {
         let db = rocksdb::DB::open_default(path)?;
+        //HashMap này sẽ được dùng để theo dõi các yêu cầu NotifyRead đang chờ dữ liệu. Hashmap lưu nhiều quue[oneshoot]
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
         let (tx, mut rx) = channel(100);
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
                 match command {
+                    //Ghi cặp (key, value) vào RocksDB.
+                    // Kiểm tra xem có yêu cầu NotifyRead nào đang chờ key này trong obligations không.
+                    // Nếu có, nó sẽ gửi value vừa được ghi cho tất cả những người đang chờ thông qua các kênh oneshot của họ và xóa key khỏi obligations.
                     StoreCommand::Write(key, value) => {
                         let _ = db.put(&key, &value);
                         if let Some(mut senders) = obligations.remove(&key) {
@@ -44,6 +48,10 @@ impl Store {
                         let response = db.get(&key);
                         let _ = sender.send(response);
                     }
+                    // Cố gắng đọc key từ RocksDB.
+                    // Nếu key đã tồn tại, nó sẽ gửi ngay giá trị tìm được cho người yêu cầu.
+                    // Nếu key chưa tồn tại (Ok(None)), thay vì trả về None, nó sẽ lưu sender (kênh oneshot) vào obligations dưới key đó.
+                    // Khi key này được ghi vào (thông qua lệnh Write), tác vụ nền sẽ tìm thấy sender này và gửi giá trị mới qua nó.
                     StoreCommand::NotifyRead(key, sender) => {
                         let response = db.get(&key);
                         match response {

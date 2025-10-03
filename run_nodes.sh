@@ -55,11 +55,11 @@ for i in $(seq 0 $((NODES-1))); do
     tmux new -d -s "worker-${i}-${worker_id}" "sh -c 'RUST_LOG=info $worker_cmd 2> $worker_log || echo \"[FATAL] Worker exited\" >> $worker_log'"
 
     # Executor (i > 0)
-    if [ "$i" -ne 0 ]; then
-        executor_log="$LOG_DIR/executor-$i.log"
-        executor_cmd="$EXECUTOR_BINARY --id $i"
-        tmux new -d -s "executor-$i" "sh -c 'RUST_LOG=info $executor_cmd 2> $executor_log || echo \"[FATAL] Executor exited\" >> $executor_log'"
-    fi
+    # if [ "$i" -ne 0 ]; then
+    executor_log="$LOG_DIR/executor-$i.log"
+    executor_cmd="$EXECUTOR_BINARY --id $i"
+    tmux new -d -s "executor-$i" "sh -c 'RUST_LOG=info $executor_cmd 2> $executor_log || echo \"[FATAL] Executor exited\" >> $executor_log'"
+    # fi
 done
 
 echo ""

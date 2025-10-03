@@ -14,9 +14,11 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[path = "tests/receiver_tests.rs"]
 pub mod receiver_tests;
 
-/// Convenient alias for the writer end of the TCP channel.
+// Convenient alias for the writer end of the TCP channel.
+// Cung cấp một cách để gửi phản hồi lại cho người gửi. Đây là một kênh hai chiều!
 pub type Writer = SplitSink<Framed<TcpStream, LengthDelimitedCodec>, Bytes>;
 
+//MessageHandler Trait: "Bản hợp đồng cho Bộ xử lý"
 #[async_trait]
 pub trait MessageHandler: Clone + Send + Sync + 'static {
     /// Defines how to handle an incoming message. A typical usage is to define a `MessageHandler` with a
@@ -25,9 +27,11 @@ pub trait MessageHandler: Clone + Send + Sync + 'static {
     /// responses or acknowledgements to the sender machine (see unit tests for examples).
     async fn dispatch(&self, writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>>;
 }
-
-/// For each incoming request, we spawn a new runner responsible to receive messages and forward them
-/// through the provided deliver channel.
+// Lắng nghe trên một địa chỉ IP và cổng (port) cụ thể.
+// Chấp nhận các kết nối đến từ các máy khác (peers).
+// Đối với mỗi kết nối, nó sẽ tạo một "nhân viên" riêng để xử lý.
+// "Nhân viên" này sẽ liên tục nhận các gói tin (message) từ kết nối đó.
+// Với mỗi gói tin nhận được, nó sẽ chuyển cho một bộ xử lý chuyên dụng (Handler) để quyết định phải làm gì tiếp theo.
 pub struct Receiver<Handler: MessageHandler> {
     /// Address to listen to.
     address: SocketAddr,
