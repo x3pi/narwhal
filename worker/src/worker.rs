@@ -114,6 +114,7 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .primary_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
+        // worker nhận tin nhắn từ primary
         Receiver::spawn(
             address,
             /* handler */
@@ -154,6 +155,7 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
+        // nhan tu client
         Receiver::spawn(
             address,
             /* handler */ TxReceiverHandler { tx_batch_maker },
@@ -220,6 +222,7 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .worker_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
+        // worker nhận tin nhắn từ các worker khác
         Receiver::spawn(
             address,
             // Tùy vào loại tin nhắn, handler sẽ chuyển đến bộ phận phù hợp.
@@ -294,7 +297,6 @@ impl MessageHandler for WorkerReceiverHandler {
         // Reply with an ACK.
           // Gửi lại một tin "Ack" để xác nhận đã nhận.
         let _ = writer.send(Bytes::from("Ack")).await;
-
         // Giải mã tin nhắn và phân loại.
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
