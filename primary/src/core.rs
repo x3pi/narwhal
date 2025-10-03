@@ -9,7 +9,7 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -368,9 +368,25 @@ impl Core {
                             }
                         },
                         PrimaryMessage::Certificate(certificate) => {
-                            match self.sanitize_certificate(&certificate) {
-                                Ok(()) =>  self.process_certificate(certificate).await,
-                                error => error
+                            // SỬA ĐỔI: Thêm logic kiểm tra store trước khi xử lý
+                            let digest = certificate.digest();
+                            match self.store.read(digest.to_vec()).await {
+                                Ok(Some(_)) => {
+                                    // Certificate đã có trong store. Bỏ qua để tránh xử lý lại.
+                                    info!("Certificate {} already in store, skipping.", digest);
+                                    Ok(())
+                                }
+                                Ok(None) => {
+                                    // Certificate chưa có trong store, xử lý như bình thường.
+                                    match self.sanitize_certificate(&certificate) {
+                                        Ok(()) =>  self.process_certificate(certificate).await,
+                                        error => error
+                                    }
+                                }
+                                Err(e) => {
+                                    // Lỗi khi đọc store, trả về lỗi.
+                                    Err(DagError::StoreError(e))
+                                }
                             }
                         },
                         _ => panic!("Unexpected core message")
