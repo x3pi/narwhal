@@ -10,6 +10,7 @@ use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::{Worker, WorkerMessage};
+use consensus::{ConsensusProtocol, Tusk, Bullshark};
 
 // Thêm các use statements cần thiết
 use bytes::{BufMut, BytesMut};
@@ -122,6 +123,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 rx_feedback,
             );
             
+            let committee_clone: Committee = committee.clone();
+
             Consensus::spawn(
                 committee,
                 parameters.gc_depth,
@@ -129,7 +132,13 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 rx_new_certificates,
                 tx_feedback,
                 tx_output,
+ConsensusProtocol::Bullshark(Bullshark {
+                    committee: committee_clone,
+                    gc_depth: parameters.gc_depth,
+                }),
             );
+
+            
 
             analyze(rx_output, node_id, store).await;
         }

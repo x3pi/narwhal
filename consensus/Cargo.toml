@@ -7,6 +7,8 @@ edition = "2018"
 [dependencies]
 tokio = { version = "1.5.0", features = ["sync"] }
 log = "0.4.14"
+tracing = "0.1.36"
+
 
 # Thêm các dòng sau
 serde = { version = "1.0", features = ["derive"] }
