@@ -3,8 +3,10 @@ use super::*;
 use crate::common::{
     certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
 };
+use dashmap::DashMap; // Thêm import cho DashMap
 use futures::future::try_join_all;
 use std::fs;
+use std::sync::Arc; // Thêm import cho Arc
 use tokio::sync::mpsc::channel;
 
 #[tokio::test]
@@ -41,10 +43,12 @@ async fn process_header() {
     let handle = listener(address);
 
     // Make a synchronizer for the core.
+    let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
         &committee,
         store.clone(),
+        payload_cache, // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -108,10 +112,12 @@ async fn process_header_missing_parent() {
     let mut store = Store::new(path).unwrap();
 
     // Make a synchronizer for the core.
+    let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
         &committee(),
         store.clone(),
+        payload_cache, // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -168,10 +174,12 @@ async fn process_header_missing_payload() {
     let mut store = Store::new(path).unwrap();
 
     // Make a synchronizer for the core.
+    let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
         &committee(),
         store.clone(),
+        payload_cache, // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -230,10 +238,12 @@ async fn process_votes() {
     let store = Store::new(path).unwrap();
 
     // Make a synchronizer for the core.
+    let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
         &committee,
         store.clone(),
+        payload_cache, // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -302,10 +312,12 @@ async fn process_certificates() {
     let mut store = Store::new(path).unwrap();
 
     // Make a synchronizer for the core.
+    let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
         &committee(),
         store.clone(),
+        payload_cache, // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );

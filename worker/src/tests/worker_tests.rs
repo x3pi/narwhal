@@ -1,6 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use crate::common::{batch_digest, committee_with_base_port, keys, listener, transaction};
+use crate::common::{
+    batch, batch_digest, committee_with_base_port, keys, listener, serialized_batch, transaction,
+}; // Thêm import
+use bytes::Bytes; // Thêm import
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
 use std::fs;
@@ -25,8 +28,13 @@ async fn handle_clients_transactions() {
 
     // Spawn a network listener to receive our batch's digest.
     let primary_address = committee.primary(&name).unwrap().worker_to_primary;
-    let expected = bincode::serialize(&WorkerPrimaryMessage::OurBatch(batch_digest(), id)).unwrap();
-    let handle = listener(primary_address, Some(Bytes::from(expected)));
+
+    // Listener bây giờ sẽ mong đợi nhận được message có cả nội dung batch.
+    let batch_content = serialized_batch();
+    let expected_message =
+        WorkerPrimaryMessage::OurBatch(batch_digest(), id, batch_content.clone());
+    let expected_serialized = bincode::serialize(&expected_message).unwrap();
+    let handle = listener(primary_address, Some(Bytes::from(expected_serialized)));
 
     // Spawn enough workers' listeners to acknowledge our batches.
     for (_, addresses) in committee.others_workers(&name, &id) {
