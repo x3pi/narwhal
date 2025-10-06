@@ -6,6 +6,7 @@ use primary::Header;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 use std::collections::{BTreeSet, VecDeque};
+use store::Store; // Thêm import cho Store
 use tokio::sync::mpsc::channel;
 
 // Fixture
@@ -99,9 +100,16 @@ async fn commit_one() {
     let (tx_waiter, rx_waiter) = channel(1);
     let (tx_primary, mut rx_primary) = channel(1);
     let (tx_output, mut rx_output) = channel(1);
+
+    // Create a new test store.
+    let path = ".db_test_commit_one";
+    let _ = std::fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+
     Consensus::spawn(
         mock_committee(),
         /* gc_depth */ 50,
+        store,
         rx_waiter,
         tx_primary,
         tx_output,
@@ -144,9 +152,16 @@ async fn dead_node() {
     let (tx_waiter, rx_waiter) = channel(1);
     let (tx_primary, mut rx_primary) = channel(1);
     let (tx_output, mut rx_output) = channel(1);
+
+    // Create a new test store.
+    let path = ".db_test_dead_node";
+    let _ = std::fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+
     Consensus::spawn(
         mock_committee(),
         /* gc_depth */ 50,
+        store,
         rx_waiter,
         tx_primary,
         tx_output,
@@ -232,9 +247,16 @@ async fn not_enough_support() {
     let (tx_waiter, rx_waiter) = channel(1);
     let (tx_primary, mut rx_primary) = channel(1);
     let (tx_output, mut rx_output) = channel(1);
+
+    // Create a new test store.
+    let path = ".db_test_not_enough_support";
+    let _ = std::fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+
     Consensus::spawn(
         mock_committee(),
         /* gc_depth */ 50,
+        store,
         rx_waiter,
         tx_primary,
         tx_output,
@@ -295,9 +317,16 @@ async fn missing_leader() {
     let (tx_waiter, rx_waiter) = channel(1);
     let (tx_primary, mut rx_primary) = channel(1);
     let (tx_output, mut rx_output) = channel(1);
+
+    // Create a new test store.
+    let path = ".db_test_missing_leader";
+    let _ = std::fs::remove_dir_all(path);
+    let store = Store::new(path).unwrap();
+
     Consensus::spawn(
         mock_committee(),
         /* gc_depth */ 50,
+        store,
         rx_waiter,
         tx_primary,
         tx_output,
