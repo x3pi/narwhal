@@ -25,6 +25,7 @@ crypto = { path = "../crypto" }
 primary = { path = "../primary" }
 worker = { path = "../worker" }
 consensus = { path = "../consensus" }
+network = { path = "../network" }
 
 [features]
 benchmark = ["worker/benchmark", "primary/benchmark", "consensus/benchmark"]
