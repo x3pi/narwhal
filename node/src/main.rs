@@ -100,9 +100,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     match matches.subcommand() {
         ("primary", _) => {
-            // SỬA LỖI: Quay lại cách xác định node_id đúng và an toàn cho primary.
             let mut primary_keys: Vec<_> = committee.authorities.keys().cloned().collect();
-            primary_keys.sort(); // Sắp xếp để đảm bảo thứ tự nhất quán.
+            primary_keys.sort();
 
             let node_id = primary_keys
                 .iter()
@@ -114,14 +113,15 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
             
-            Primary::spawn(
+            // SỬA LỖI: Dùng tokio::spawn để chạy Primary::spawn như một tác vụ nền.
+            tokio::spawn(Primary::spawn(
                 keypair,
                 committee.clone(),
                 parameters.clone(),
                 store.clone(),
                 tx_new_certificates,
                 rx_feedback,
-            );
+            ));
             
             let committee_clone: Committee = committee.clone();
 
@@ -132,33 +132,33 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 rx_new_certificates,
                 tx_feedback,
                 tx_output,
-ConsensusProtocol::Bullshark(Bullshark {
+                ConsensusProtocol::Bullshark(Bullshark {
                     committee: committee_clone,
                     gc_depth: parameters.gc_depth,
                 }),
             );
 
-            
-
             analyze(rx_output, node_id, store).await;
         }
         ("worker", Some(sub_matches)) => {
-            // SỬA LỖI: Xử lý lỗi ParseIntError một cách an toàn, không dùng unwrap().
             let id_str = sub_matches.value_of("id").unwrap();
             let id = id_str
                 .parse::<WorkerId>()
                 .with_context(|| format!("Giá trị '{}' không phải là một số nguyên hợp lệ cho tham số --id", id_str))?;
             
-            Worker::spawn(keypair.name, id, committee, parameters, store);
+            // SỬA LỖI: Dùng tokio::spawn để chạy Worker::spawn như một tác vụ nền.
+            tokio::spawn(Worker::spawn(keypair.name, id, committee, parameters, store));
         }
         _ => unreachable!(),
     }
 
-    let (_tx, mut rx) = channel::<()>(1);
-    let _ = rx.recv().await;
+    // Giữ cho tiến trình chính sống mãi mãi.
+    let (tx, mut rx) = channel::<()>(1);
+    rx.recv().await;
 
     unreachable!();
 }
+
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
 async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {

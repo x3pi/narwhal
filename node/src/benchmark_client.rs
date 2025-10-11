@@ -11,6 +11,7 @@ use rand::Rng;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
+// SỬA LỖI: Thêm use statement cho Framed và LengthDelimitedCodec
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[tokio::main]
@@ -53,11 +54,7 @@ async fn main() -> Result<()> {
         .context("Invalid socket address format")?;
 
     info!("Node address: {}", target);
-
-    // NOTE: This log entry is used to compute performance.
     info!("Transactions size: {} B", size);
-
-    // NOTE: This log entry is used to compute performance.
     info!("Transactions rate: {} tx/s", rate);
 
     let client = Client {
@@ -67,10 +64,7 @@ async fn main() -> Result<()> {
         nodes,
     };
 
-    // Wait for all nodes to be online and synchronized.
     client.wait().await;
-
-    // Start the benchmark.
     client.send().await.context("Failed to submit transactions")
 }
 
@@ -83,31 +77,29 @@ struct Client {
 
 impl Client {
     pub async fn send(&self) -> Result<()> {
-        const PRECISION: u64 = 20; // Sample precision.
+        const PRECISION: u64 = 20;
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
-        // The transaction size must be at least 16 bytes to ensure all txs are different.
         if self.size < 9 {
             return Err(anyhow::Error::msg(
                 "Transaction size must be at least 9 bytes",
             ));
         }
 
-        // Connect to the mempool.
         let stream = TcpStream::connect(self.target)
             .await
             .context(format!("failed to connect to {}", self.target))?;
 
-        // Submit all transactions.
+        // SỬA LỖI: Bọc stream trong Framed để đảm bảo client và server nói cùng một "ngôn ngữ".
+        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
         let mut r = rand::thread_rng().gen();
-        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
         let interval = interval(Duration::from_millis(BURST_DURATION));
         tokio::pin!(interval);
 
-        // NOTE: This log entry is used to compute performance.
         info!("Start sending transactions");
 
         'main: loop {
@@ -116,15 +108,13 @@ impl Client {
 
             for x in 0..burst {
                 if x == counter % burst {
-                    // NOTE: This log entry is used to compute performance.
                     info!("Sending sample transaction {}", counter);
-
-                    tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u8(0u8);
+                    tx.put_u64(counter);
                 } else {
                     r += 1;
-                    tx.put_u8(1u8); // Standard txs start with 1.
-                    tx.put_u64(r); // Ensures all clients send different txs.
+                    tx.put_u8(1u8);
+                    tx.put_u64(r);
                 };
 
                 tx.resize(self.size, 0u8);
@@ -135,7 +125,6 @@ impl Client {
                 }
             }
             if now.elapsed().as_millis() > BURST_DURATION as u128 {
-                // NOTE: This log entry is used to compute performance.
                 warn!("Transaction rate too high for this client");
             }
             counter += 1;
@@ -144,7 +133,6 @@ impl Client {
     }
 
     pub async fn wait(&self) {
-        // Wait for all nodes to be online.
         info!("Waiting for all nodes to be online...");
         join_all(self.nodes.iter().cloned().map(|address| {
             tokio::spawn(async move {
