@@ -45,7 +45,8 @@ impl Listener for TcpListenerAdapter {
 }
 
 // --- Triển khai chính cho giao vận TCP ---
-#[derive(Default)]
+// SỬA LỖI: Thêm `Clone` vào derive macro.
+#[derive(Default, Clone)]
 pub struct TcpTransport;
 
 impl TcpTransport {

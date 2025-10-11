@@ -11,8 +11,9 @@ pub enum NetworkError {
     #[error("Failed to accept connection: {0}")]
     FailedToListen(std::io::Error),
 
+    // SỬA LỖI: Thay đổi kiểu lỗi từ `std::io::Error` thành `String` để linh hoạt hơn.
     #[error("Failed to send message to {0}: {1}")]
-    FailedToSendMessage(SocketAddr, std::io::Error),
+    FailedToSendMessage(SocketAddr, String),
 
     #[error("Failed to receive message from {0}: {1}")]
     FailedToReceiveMessage(SocketAddr, std::io::Error),

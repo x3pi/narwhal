@@ -206,7 +206,7 @@ impl Connection {
                     Err(e) => {
                         // We failed to send the message, we put it back into the buffer.
                         self.buffer.push_front((data, handler));
-                        break 'connection NetworkError::FailedToSendMessage(self.address, e);
+                        break 'connection NetworkError::FailedToSendMessage(self.address, e.to_string());
                     }
                 }
             }
