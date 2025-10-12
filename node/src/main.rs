@@ -173,34 +173,34 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         }
     }
     
-    let socket_path = format!("/tmp/executor{}.sock", node_id);
-    log::info!(
-        "[ANALYZE] Node ID {} attempting to connect to {}",
-        node_id,
-        socket_path
-    );
+    // let socket_path = format!("/tmp/executor{}.sock", node_id);
+    // log::info!(
+    //     "[ANALYZE] Node ID {} attempting to connect to {}",
+    //     node_id,
+    //     socket_path
+    // );
     
-    let mut stream = loop { 
-        match UnixStream::connect(&socket_path).await {
-            Ok(stream) => {
-                log::info!(
-                    "[ANALYZE] Node ID {} connected successfully to {}",
-                    node_id,
-                    socket_path
-                );
-                break stream;
-            }
-            Err(e) => {
-                log::warn!(
-                    "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
-                    node_id,
-                    socket_path,
-                    e
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            }
-        }
-    };
+    // let mut stream = loop { 
+    //     match UnixStream::connect(&socket_path).await {
+    //         Ok(stream) => {
+    //             log::info!(
+    //                 "[ANALYZE] Node ID {} connected successfully to {}",
+    //                 node_id,
+    //                 socket_path
+    //             );
+    //             break stream;
+    //         }
+    //         Err(e) => {
+    //             log::warn!(
+    //                 "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
+    //                 node_id,
+    //                 socket_path,
+    //                 e
+    //             );
+    //             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    //         }
+    //     }
+    // };
 
     log::info!(
         "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
@@ -291,23 +291,23 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
 
         log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
 
-        if let Err(e) = stream.write_all(&len_buf).await {
-            log::error!(
-                "[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}",
-                node_id,
-                e
-            );
-            break;
-        }
+        // if let Err(e) = stream.write_all(&len_buf).await {
+        //     log::error!(
+        //         "[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}",
+        //         node_id,
+        //         e
+        //     );
+        //     break;
+        // }
 
-        if let Err(e) = stream.write_all(&proto_buf).await {
-            log::error!(
-                "[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}",
-                node_id,
-                e
-            );
-            break;
-        }
+        // if let Err(e) = stream.write_all(&proto_buf).await {
+        //     log::error!(
+        //         "[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}",
+        //         node_id,
+        //         e
+        //     );
+        //     break;
+        // }
 
         log::info!(
             "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",

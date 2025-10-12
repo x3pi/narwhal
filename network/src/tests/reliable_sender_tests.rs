@@ -5,14 +5,17 @@ use futures::future::try_join_all;
 
 #[tokio::test]
 async fn send() {
-    // Run a TCP server.
+    // Run a server.
     let address = "127.0.0.1:5000".parse::<SocketAddr>().unwrap();
     let message = "Hello, world!";
     let handle = listener(address, message.to_string());
 
     // Make the network sender and send the message.
     let mut sender = ReliableSender::new();
-    let cancel_handler = sender.send(address, Bytes::from(message)).await;
+
+    // SỬA ĐỔI: Serialize tin nhắn bằng bincode trước khi gửi.
+    let bytes = Bytes::from(bincode::serialize(message).unwrap());
+    let cancel_handler = sender.send(address, bytes).await;
 
     // Ensure we get back an acknowledgement.
     assert!(cancel_handler.await.is_ok());
@@ -23,7 +26,7 @@ async fn send() {
 
 #[tokio::test]
 async fn broadcast() {
-    // Run 3 TCP servers.
+    // Run 3 servers.
     let message = "Hello, world!";
     let (handles, addresses): (Vec<_>, Vec<_>) = (0..3)
         .map(|x| {
@@ -38,7 +41,10 @@ async fn broadcast() {
 
     // Make the network sender and send the message.
     let mut sender = ReliableSender::new();
-    let cancel_handlers = sender.broadcast(addresses, Bytes::from(message)).await;
+    
+    // SỬA ĐỔI: Serialize tin nhắn bằng bincode trước khi gửi.
+    let bytes = Bytes::from(bincode::serialize(message).unwrap());
+    let cancel_handlers = sender.broadcast(addresses, bytes).await;
 
     // Ensure we get back an acknowledgement for each message.
     assert!(try_join_all(cancel_handlers).await.is_ok());
@@ -49,13 +55,16 @@ async fn broadcast() {
 
 #[tokio::test]
 async fn retry() {
-    // Make the network sender and send the message  (no listeners are running).
+    // Make the network sender and send the message (no listeners are running).
     let address = "127.0.0.1:5300".parse::<SocketAddr>().unwrap();
     let message = "Hello, world!";
     let mut sender = ReliableSender::new();
-    let cancel_handler = sender.send(address, Bytes::from(message)).await;
 
-    // Run a TCP server.
+    // SỬA ĐỔI: Serialize tin nhắn bằng bincode trước khi gửi.
+    let bytes = Bytes::from(bincode::serialize(message).unwrap());
+    let cancel_handler = sender.send(address, bytes).await;
+
+    // Run a server after a small delay.
     sleep(Duration::from_millis(50)).await;
     let handle = listener(address, message.to_string());
 

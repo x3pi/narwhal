@@ -4,14 +4,14 @@ use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
 use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
-use futures::sink::SinkExt as _;
-use futures::stream::StreamExt as _;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 use std::net::SocketAddr;
-use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+// SỬA ĐỔI: Import các thành phần QUIC.
+use network::quic::QuicTransport;
+use network::transport::Transport;
 
 impl PartialEq for Header {
     fn eq(&self, other: &Self) -> bool {
@@ -166,16 +166,17 @@ pub fn certificate(header: &Header) -> Certificate {
 }
 
 // Fixture
+// SỬA ĐỔI: Listener này bây giờ sử dụng QUIC và trả về Bytes.
 pub fn listener(address: SocketAddr) -> JoinHandle<Bytes> {
     tokio::spawn(async move {
-        let listener = TcpListener::bind(&address).await.unwrap();
-        let (socket, _) = listener.accept().await.unwrap();
-        let transport = Framed::new(socket, LengthDelimitedCodec::new());
-        let (mut writer, mut reader) = transport.split();
-        match reader.next().await {
-            Some(Ok(received)) => {
-                writer.send(Bytes::from("Ack")).await.unwrap();
-                received.freeze()
+        let transport = QuicTransport::new();
+        let mut listener = transport.listen(address).await.unwrap();
+        let (mut connection, _) = listener.accept().await.unwrap();
+
+        match connection.recv().await {
+            Ok(Some(received)) => {
+                connection.send(Bytes::from("Ack")).await.unwrap();
+                received
             }
             _ => panic!("Failed to receive network message"),
         }

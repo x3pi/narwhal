@@ -18,7 +18,6 @@ pub struct QuicConnection {
 impl Connection for QuicConnection {
     async fn send(&mut self, data: Bytes) -> TransportResult<()> {
         let mut send_stream = self.connection.open_uni().await?;
-        // Sử dụng write_all_chunks để gửi hiệu quả hơn
         send_stream.write_all(&data).await?;
         send_stream.finish().await?;
         Ok(())
@@ -99,7 +98,6 @@ impl Transport for QuicTransport {
 }
 
 // --- Certificate Generation & Performance Tuning ---
-// SỬA LỖI: Sửa kiểu trả về thành (ServerConfig, ClientConfig)
 fn configure_certificates() -> (ServerConfig, ClientConfig) {
     let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
     let cert_der = cert.serialize_der().unwrap();
@@ -107,7 +105,6 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     let priv_key = rustls::PrivateKey(priv_key);
     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
 
-    // --- Cấu hình chung cho Transport ---
     let mut transport_config = TransportConfig::default();
     transport_config.max_concurrent_uni_streams(20_000_u32.into());
     transport_config.stream_receive_window((2 * 1024 * 1024_u32).into());
@@ -116,19 +113,15 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
     let transport = Arc::new(transport_config);
 
-    // --- Cấu hình cho Server ---
     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key).unwrap();
     server_config.transport = transport.clone();
 
-
-    // --- Cấu hình cho Client ---
     let client_crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
     let mut client_config = ClientConfig::new(Arc::new(client_crypto));
     client_config.transport_config(transport);
-
 
     (server_config, client_config)
 }

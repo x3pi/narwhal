@@ -11,9 +11,9 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use log::{error, info, warn};
-// SỬA ĐỔI: Import các thành phần transport mới
+// SỬA ĐỔI: Import QuicTransport thay vì TcpTransport
 use network::{
-    tcp::TcpTransport,
+    quic::QuicTransport, // <--- THAY ĐỔI
     transport::Transport,
     MessageHandler, Receiver, Writer,
 };
@@ -46,7 +46,6 @@ pub struct Worker {
 }
 
 impl Worker {
-    // SỬA ĐỔI: Hàm spawn bây giờ là `async`.
     pub async fn spawn(
         name: PublicKey,
         id: WorkerId,
@@ -62,12 +61,12 @@ impl Worker {
             store,
         };
 
-        // SỬA ĐỔI: Tạo một đối tượng transport.
-        let transport = TcpTransport::new();
+        // SỬA ĐỔI: Tạo một đối tượng transport QUIC.
+        let transport = QuicTransport::new(); // <--- THAY ĐỔI
 
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
 
-        // SỬA ĐỔI: Khởi chạy các handler với transport trừu tượng.
+        // Khởi chạy các handler với transport mới.
         worker.handle_primary_messages(&transport).await;
         worker.handle_clients_transactions(&transport, tx_primary.clone()).await;
         worker.handle_workers_messages(&transport, tx_primary).await;
@@ -93,8 +92,8 @@ impl Worker {
         );
     }
 
-    // SỬA ĐỔI: Hàm nhận vào transport và là `async`.
-    async fn handle_primary_messages(&self, transport: &TcpTransport) {
+    // SỬA ĐỔI: Hàm nhận vào QuicTransport.
+    async fn handle_primary_messages(&self, transport: &QuicTransport) { // <--- THAY ĐỔI
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         let mut address = self
@@ -104,7 +103,6 @@ impl Worker {
             .primary_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
 
-        // SỬA ĐỔI: Tạo listener từ transport.
         let listener = transport
             .listen(address)
             .await
@@ -132,10 +130,10 @@ impl Worker {
         );
     }
 
-    // SỬA ĐỔI: Hàm nhận vào transport và là `async`.
+    // SỬA ĐỔI: Hàm nhận vào QuicTransport.
     async fn handle_clients_transactions(
         &self,
-        transport: &TcpTransport,
+        transport: &QuicTransport, // <--- THAY ĐỔI
         tx_primary: Sender<SerializedBatchDigestMessage>,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
@@ -149,7 +147,6 @@ impl Worker {
             .transactions;
         address.set_ip("0.0.0.0".parse().unwrap());
 
-        // SỬA ĐỔI: Tạo listener từ transport.
         let listener = transport
             .listen(address)
             .await
@@ -192,10 +189,10 @@ impl Worker {
         );
     }
 
-    // SỬA ĐỔI: Hàm nhận vào transport và là `async`.
+    // SỬA ĐỔI: Hàm nhận vào QuicTransport.
     async fn handle_workers_messages(
         &self,
-        transport: &TcpTransport,
+        transport: &QuicTransport, // <--- THAY ĐỔI
         tx_primary: Sender<SerializedBatchDigestMessage>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
@@ -208,7 +205,6 @@ impl Worker {
             .worker_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
         
-        // SỬA ĐỔI: Tạo listener từ transport.
         let listener = transport
             .listen(address)
             .await
@@ -243,7 +239,7 @@ impl Worker {
     }
 }
 
-// --- Các struct Handler (không thay đổi logic, chỉ thay đổi kiểu của Writer) ---
+// --- Các struct Handler (không thay đổi) ---
 
 #[derive(Clone)]
 struct TxReceiverHandler {

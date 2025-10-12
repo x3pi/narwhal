@@ -5,14 +5,14 @@ use bytes::BytesMut;
 use clap::{crate_name, crate_version, App, AppSettings};
 use env_logger::Env;
 use futures::future::join_all;
-use futures::sink::SinkExt as _;
 use log::{info, warn};
 use rand::Rng;
 use std::net::SocketAddr;
-use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
-// SỬA LỖI: Thêm use statement cho Framed và LengthDelimitedCodec
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+// Import các thành phần cần thiết cho QUIC.
+use network::quic::QuicTransport;
+use network::transport::{Connection, Transport};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -62,6 +62,7 @@ async fn main() -> Result<()> {
         size,
         rate,
         nodes,
+        transport: QuicTransport::new(),
     };
 
     client.wait().await;
@@ -73,6 +74,7 @@ struct Client {
     size: usize,
     rate: u64,
     nodes: Vec<SocketAddr>,
+    transport: QuicTransport,
 }
 
 impl Client {
@@ -86,12 +88,9 @@ impl Client {
             ));
         }
 
-        let stream = TcpStream::connect(self.target)
+        let mut connection = self.transport.connect(self.target)
             .await
             .context(format!("failed to connect to {}", self.target))?;
-
-        // SỬA LỖI: Bọc stream trong Framed để đảm bảo client và server nói cùng một "ngôn ngữ".
-        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
 
         let burst = self.rate / PRECISION;
         let mut tx = BytesMut::with_capacity(self.size);
@@ -119,7 +118,8 @@ impl Client {
 
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
-                if let Err(e) = transport.send(bytes).await {
+
+                if let Err(e) = connection.send(bytes).await {
                     warn!("Failed to send transaction: {}", e);
                     break 'main;
                 }
@@ -134,9 +134,11 @@ impl Client {
 
     pub async fn wait(&self) {
         info!("Waiting for all nodes to be online...");
+        let transport = self.transport.clone();
         join_all(self.nodes.iter().cloned().map(|address| {
+            let transport = transport.clone();
             tokio::spawn(async move {
-                while TcpStream::connect(address).await.is_err() {
+                while transport.connect(address).await.is_err() {
                     sleep(Duration::from_millis(10)).await;
                 }
             })

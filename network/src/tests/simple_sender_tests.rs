@@ -5,14 +5,17 @@ use futures::future::try_join_all;
 
 #[tokio::test]
 async fn simple_send() {
-    // Run a TCP server.
+    // Run a server.
     let address = "127.0.0.1:6100".parse::<SocketAddr>().unwrap();
     let message = "Hello, world!";
     let handle = listener(address, message.to_string());
 
     // Make the network sender and send the message.
     let mut sender = SimpleSender::new();
-    sender.send(address, Bytes::from(message)).await;
+    
+    // SỬA ĐỔI: Serialize tin nhắn bằng bincode trước khi gửi.
+    let bytes = Bytes::from(bincode::serialize(message).unwrap());
+    sender.send(address, bytes).await;
 
     // Ensure the server received the message (ie. it did not panic).
     assert!(handle.await.is_ok());
@@ -20,7 +23,7 @@ async fn simple_send() {
 
 #[tokio::test]
 async fn broadcast() {
-    // Run 3 TCP servers.
+    // Run 3 servers.
     let message = "Hello, world!";
     let (handles, addresses): (Vec<_>, Vec<_>) = (0..3)
         .map(|x| {
@@ -35,7 +38,10 @@ async fn broadcast() {
 
     // Make the network sender and send the message.
     let mut sender = SimpleSender::new();
-    sender.broadcast(addresses, Bytes::from(message)).await;
+
+    // SỬA ĐỔI: Serialize tin nhắn bằng bincode trước khi gửi.
+    let bytes = Bytes::from(bincode::serialize(message).unwrap());
+    sender.broadcast(addresses, bytes).await;
 
     // Ensure all servers received the broadcast.
     assert!(try_join_all(handles).await.is_ok());

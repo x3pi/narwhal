@@ -6,12 +6,11 @@ use thiserror::Error;
 #[derive(Error, Debug)]
 pub enum NetworkError {
     #[error("Failed to connect to {0} (retry {1}): {2}")]
-    FailedToConnect(SocketAddr, u16, std::io::Error),
+    FailedToConnect(SocketAddr, u16, String),
 
     #[error("Failed to accept connection: {0}")]
     FailedToListen(std::io::Error),
 
-    // SỬA LỖI: Thay đổi kiểu lỗi từ `std::io::Error` thành `String` để linh hoạt hơn.
     #[error("Failed to send message to {0}: {1}")]
     FailedToSendMessage(SocketAddr, String),
 

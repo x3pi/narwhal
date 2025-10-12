@@ -1,9 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use futures::sink::SinkExt as _;
 use tokio::sync::mpsc::channel;
 use tokio::sync::mpsc::Sender;
 use tokio::time::{sleep, Duration};
+
+// SỬA ĐỔI: Import các thành phần cần thiết từ lớp giao vận mới.
+use crate::quic::QuicTransport;
+use crate::transport::Transport;
 
 #[derive(Clone)]
 struct TestHandler {
@@ -27,20 +30,29 @@ impl MessageHandler for TestHandler {
 
 #[tokio::test]
 async fn receive() {
-    // Make the network receiver.
+    // Địa chỉ để listener lắng nghe.
     let address = "127.0.0.1:4000".parse::<SocketAddr>().unwrap();
     let (tx, mut rx) = channel(1);
-    Receiver::spawn(address, TestHandler { deliver: tx });
+
+    // SỬA ĐỔI: Khởi tạo QuicTransport và tạo một listener.
+    let transport = QuicTransport::new();
+    let listener = transport.listen(address).await.unwrap();
+
+    // Spawn một Receiver để xử lý các kết nối đến.
+    Receiver::spawn(listener, TestHandler { deliver: tx });
     sleep(Duration::from_millis(50)).await;
 
-    // Send a message.
+    // SỬA ĐỔI: Sử dụng QuicTransport để kết nối và gửi tin nhắn.
     let sent = "Hello, world!";
     let bytes = Bytes::from(bincode::serialize(sent).unwrap());
-    let stream = TcpStream::connect(address).await.unwrap();
-    let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
-    transport.send(bytes.clone()).await.unwrap();
+    
+    // Tạo một client kết nối đến receiver.
+    let mut client_connection = transport.connect(address).await.unwrap();
+    
+    // Gửi tin nhắn.
+    client_connection.send(bytes.clone()).await.unwrap();
 
-    // Ensure the message gets passed to the channel.
+    // Đảm bảo tin nhắn được chuyển đến channel.
     let message = rx.recv().await;
     assert!(message.is_some());
     let received = message.unwrap();

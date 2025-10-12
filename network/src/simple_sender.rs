@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
-use crate::tcp::TcpTransport;
+use crate::quic::QuicTransport;
 use crate::transport::{Connection as _, Transport};
 use bytes::Bytes;
 use log::{info, warn};
@@ -18,7 +18,7 @@ pub mod simple_sender_tests;
 
 pub struct SimpleSender {
     connections: HashMap<SocketAddr, Sender<Bytes>>,
-    transport: TcpTransport,
+    transport: QuicTransport,
     rng: SmallRng,
 }
 
@@ -32,13 +32,13 @@ impl SimpleSender {
     pub fn new() -> Self {
         Self {
             connections: HashMap::new(),
-            transport: TcpTransport::new(),
+            transport: QuicTransport::new(),
             rng: SmallRng::from_entropy(),
         }
     }
 
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
-        let spawn_new_manager = |transport: &TcpTransport, addr: SocketAddr| {
+        let spawn_new_manager = |transport: &QuicTransport, addr: SocketAddr| {
             let (tx, rx) = channel(1_000);
             ConnectionManager::spawn(transport.clone(), addr, rx);
             tx
@@ -77,13 +77,13 @@ impl SimpleSender {
 }
 
 struct ConnectionManager {
-    transport: TcpTransport,
+    transport: QuicTransport,
     address: SocketAddr,
     receiver: Receiver<Bytes>,
 }
 
 impl ConnectionManager {
-    fn spawn(transport: TcpTransport, address: SocketAddr, receiver: Receiver<Bytes>) {
+    fn spawn(transport: QuicTransport, address: SocketAddr, receiver: Receiver<Bytes>) {
         tokio::spawn(async move {
             Self {
                 transport,
@@ -106,7 +106,6 @@ impl ConnectionManager {
 
                     while let Some(data) = self.receiver.recv().await {
                         if let Err(e) = connection.send(data).await {
-                            // SỬA LỖI: Chuyển đổi lỗi `Box<dyn Error>` thành String.
                             warn!(
                                 "{}",
                                 NetworkError::FailedToSendMessage(self.address, e.to_string())

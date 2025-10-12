@@ -17,7 +17,7 @@ use dashmap::DashMap;
 use futures::sink::SinkExt as _;
 use log::info;
 use network::{
-    tcp::TcpTransport,
+    quic::QuicTransport, // <--- THAY ĐỔI
     transport::Transport,
     MessageHandler, Receiver as NetworkReceiver, Writer,
 };
@@ -68,11 +68,7 @@ impl Primary {
         let (tx_our_digests, rx_our_digests) =
             channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
-        
-        // SỬA LỖI: Tạo lại kênh cho proposer.
-        // Kênh này gửi header mới tạo (Proposer -> Core).
         let (tx_headers, rx_proposer) = channel(CHANNEL_CAPACITY);
-
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_certificates, rx_sync_certificates) = channel(CHANNEL_CAPACITY);
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
@@ -86,7 +82,8 @@ impl Primary {
         let secret = keypair.secret;
         let consensus_round = Arc::new(AtomicU64::new(0));
         
-        let transport = TcpTransport::new();
+        // SỬA ĐỔI: Sử dụng QuicTransport.
+        let transport = QuicTransport::new(); // <--- THAY ĐỔI
 
         let mut primary_address = committee.primary(&name).expect("Our public key is not in the committee").primary_to_primary;
         primary_address.set_ip("0.0.0.0".parse().unwrap());
@@ -136,7 +133,7 @@ impl Primary {
             rx_primary_messages,
             rx_headers_loopback,
             rx_certificates_loopback,
-            rx_proposer, // SỬA LỖI: Truyền đúng receiver vào Core.
+            rx_proposer,
             tx_consensus,
             tx_parents,
         );
@@ -168,7 +165,7 @@ impl Primary {
             parameters.max_header_delay,
             rx_parents,
             rx_our_digests,
-            tx_headers, // Proposer vẫn dùng tx_headers để gửi.
+            tx_headers,
         );
 
         Helper::spawn(committee.clone(), store, rx_cert_requests);
@@ -180,6 +177,8 @@ impl Primary {
         );
     }
 }
+
+// --- Các struct Handler (không thay đổi) ---
 
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
