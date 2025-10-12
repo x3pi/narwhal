@@ -9,7 +9,7 @@ use crypto::PublicKey;
 use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
-use network::ReliableSender;
+use network::{CancelHandler, ReliableSender, SimpleSender}; // THÊM CancelHandler
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -41,6 +41,8 @@ pub struct BatchMaker {
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
+    /// A simple network sender.
+    simple_network: SimpleSender,
 }
 
 impl BatchMaker {
@@ -61,6 +63,7 @@ impl BatchMaker {
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
+                simple_network: SimpleSender::new(),
             }
             .run()
             .await;
@@ -92,9 +95,6 @@ impl BatchMaker {
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                 }
             }
-
-            // Give the change to schedule other tasks.
-            tokio::task::yield_now().await;
         }
     }
 
@@ -143,7 +143,15 @@ impl BatchMaker {
         // Broadcast the batch through the network.
         let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
         let bytes = Bytes::from(serialized.clone());
-        let handlers = self.network.broadcast(addresses, bytes).await;
+        self.simple_network.broadcast(addresses, bytes).await;
+
+        // SỬA LỖI: Cung cấp kiểu dữ liệu tường minh cho channel và collection.
+        // Tạo các dummy handler vì QuorumWaiter vẫn cần chúng.
+        let handlers: Vec<CancelHandler> = names
+            .iter()
+            .map(|_| tokio::sync::oneshot::channel::<Bytes>().1)
+            .collect();
+
 
         // Send the batch through the deliver channel for further processing.
         self.tx_message

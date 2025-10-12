@@ -6,6 +6,7 @@ use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::{generate_keypair, Digest, PublicKey, SecretKey};
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
+use log::warn;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 use std::convert::TryInto as _;
@@ -109,34 +110,41 @@ pub fn batch_digest() -> Digest {
 }
 
 // Fixture
-// SỬA ĐỔI: Listener này bây giờ sử dụng QUIC.
+// SỬA LỖI: Listener này bây giờ có thể xử lý nhiều kết nối (ví dụ: khi sender kết nối lại).
 pub fn listener(address: SocketAddr, expected: Option<Bytes>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let transport = QuicTransport::new();
         let mut listener = transport.listen(address).await.unwrap();
-        let (mut connection, _) = listener.accept().await.unwrap();
 
-        // Chạy trong một vòng lặp để giữ kết nối mở.
+        // Vòng lặp bên ngoài để chấp nhận nhiều kết nối.
         loop {
-            match connection.recv().await {
-                Ok(Some(received)) => {
-                    // Gửi lại ACK cho mỗi tin nhắn nhận được.
-                    connection.send(Bytes::from("Ack")).await.unwrap();
-                    
-                    // Chỉ kiểm tra tin nhắn mong đợi một lần duy nhất.
-                    if let Some(expected_bytes) = expected.clone() {
-                        if received == expected_bytes {
-                            // Nếu đã nhận được tin nhắn mong đợi, có thể kết thúc.
-                            break;
+            let (mut connection, peer) = match listener.accept().await {
+                Ok(conn) => conn,
+                Err(e) => {
+                    warn!("Listener failed to accept connection: {}", e);
+                    continue; // Chờ kết nối tiếp theo.
+                }
+            };
+
+            // Vòng lặp bên trong để xử lý tin nhắn trên kết nối hiện tại.
+            loop {
+                match connection.recv().await {
+                    Ok(Some(received)) => {
+                        connection.send(Bytes::from("Ack")).await.unwrap();
+                        
+                        // Nếu có tin nhắn mong đợi và khớp, task listener hoàn thành.
+                        if let Some(ref expected_bytes) = expected {
+                            if received == *expected_bytes {
+                                return;
+                            }
                         }
                     }
-                }
-                // Nếu client đóng kết nối, chúng ta cũng thoát.
-                Ok(None) => break,
-                Err(e) => {
-                    // Bỏ qua lỗi kết nối và thoát để tránh test panic không cần thiết.
-                    eprintln!("Listener error: {}", e);
-                    break;
+                    // Client đóng kết nối, thoát vòng lặp trong để chờ kết nối mới.
+                    Ok(None) => break,
+                    Err(e) => {
+                        warn!("Listener ({}) connection error: {}. Ready for new connection.", peer, e);
+                        break;
+                    }
                 }
             }
         }

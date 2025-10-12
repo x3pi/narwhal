@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow}; // Thêm `anyhow` vào use statement
 use bytes::BufMut as _;
 use bytes::BytesMut;
 use clap::{crate_name, crate_version, App, AppSettings};
@@ -12,7 +12,8 @@ use tokio::time::{interval, sleep, Duration, Instant};
 
 // Import các thành phần cần thiết cho QUIC.
 use network::quic::QuicTransport;
-use network::transport::{Connection, Transport};
+// Sửa lỗi: Loại bỏ `Connection` không sử dụng.
+use network::transport::Transport;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -88,8 +89,9 @@ impl Client {
             ));
         }
 
-        let mut connection = self.transport.connect(self.target)
-            .await
+        // SỬA LỖI: Sử dụng macro `anyhow!` để bọc lỗi lại một cách tường minh.
+        let mut connection = self.transport.connect(self.target).await
+            .map_err(|e| anyhow!(e))
             .context(format!("failed to connect to {}", self.target))?;
 
         let burst = self.rate / PRECISION;
@@ -118,7 +120,7 @@ impl Client {
 
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
-
+                
                 if let Err(e) = connection.send(bytes).await {
                     warn!("Failed to send transaction: {}", e);
                     break 'main;

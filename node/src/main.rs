@@ -12,11 +12,14 @@ use tokio::sync::mpsc::{channel, Receiver};
 use worker::{Worker, WorkerMessage};
 use consensus::{ConsensusProtocol, Tusk, Bullshark};
 
+use std::io::Write;
+
 // Thêm các use statements cần thiết
 use bytes::{BufMut, BytesMut};
 use prost::Message;
 use tokio::io::AsyncWriteExt;
-use tokio::net::UnixStream;
+// SỬA LỖI: Loại bỏ `use` không cần thiết.
+// use tokio::net::UnixStream;
 
 // Thêm module để import các struct được tạo bởi prost
 pub mod comm {
@@ -113,7 +116,6 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
             
-            // SỬA LỖI: Dùng tokio::spawn để chạy Primary::spawn như một tác vụ nền.
             tokio::spawn(Primary::spawn(
                 keypair,
                 committee.clone(),
@@ -146,14 +148,14 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .parse::<WorkerId>()
                 .with_context(|| format!("Giá trị '{}' không phải là một số nguyên hợp lệ cho tham số --id", id_str))?;
             
-            // SỬA LỖI: Dùng tokio::spawn để chạy Worker::spawn như một tác vụ nền.
             tokio::spawn(Worker::spawn(keypair.name, id, committee, parameters, store));
         }
         _ => unreachable!(),
     }
 
     // Giữ cho tiến trình chính sống mãi mãi.
-    let (tx, mut rx) = channel::<()>(1);
+    // SỬA LỖI: Đổi tên biến không sử dụng thành `_tx`.
+    let (_tx, mut rx) = channel::<()>(1);
     rx.recv().await;
 
     unreachable!();
@@ -162,16 +164,16 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
 async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {
-    fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
-        loop {
-            if value < 0x80 {
-                buf.put_u8(value as u8);
-                break;
-            }
-            buf.put_u8(((value & 0x7F) | 0x80) as u8);
-            value >>= 7;
-        }
-    }
+    // fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
+    //     loop {
+    //         if value < 0x80 {
+    //             buf.put_u8(value as u8);
+    //             break;
+    //         }
+    //         buf.put_u8(((value & 0x7F) | 0x80) as u8);
+    //         value >>= 7;
+    //     }
+    // }
     
     // let socket_path = format!("/tmp/executor{}.sock", node_id);
     // log::info!(
@@ -201,7 +203,6 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
     //         }
     //     }
     // };
-
     log::info!(
         "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
         node_id
@@ -214,82 +215,82 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             certificate.header.round
         );
 
-        let mut all_transactions = Vec::new();
+        // let mut all_transactions = Vec::new();
 
-        for (digest, worker_id) in certificate.header.payload {
-            match store.read(digest.to_vec()).await {
-                Ok(Some(serialized_batch_message)) => {
-                    match bincode::deserialize(&serialized_batch_message) {
-                        Ok(WorkerMessage::Batch(batch)) => {
-                            log::debug!(
-                                "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
-                                digest,
-                                batch.len(),
-                                worker_id
-                            );
-                            for tx_data in batch {
-                                all_transactions.push(comm::Transaction {
-                                    digest: tx_data,
-                                    worker_id: worker_id as u32,
-                                });
-                            }
-                        }
-                        Ok(_) => {
-                            log::warn!(
-                                "[ANALYZE] Digest {} did not correspond to a Batch message.",
-                                digest
-                            );
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "[ANALYZE] Failed to deserialize message for digest {}: {}",
-                                digest,
-                                e
-                            );
-                        }
-                    }
-                }
-                Ok(None) => {
-                    log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
-                }
-                Err(e) => {
-                    log::error!(
-                        "[ANALYZE] Failed to read batch for digest {}: {}",
-                        digest,
-                        e
-                    );
-                }
-            }
-        }
+        // for (digest, worker_id) in certificate.header.payload {
+        //     match store.read(digest.to_vec()).await {
+        //         Ok(Some(serialized_batch_message)) => {
+        //             match bincode::deserialize(&serialized_batch_message) {
+        //                 Ok(WorkerMessage::Batch(batch)) => {
+        //                     log::debug!(
+        //                         "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
+        //                         digest,
+        //                         batch.len(),
+        //                         worker_id
+        //                     );
+        //                     for tx_data in batch {
+        //                         all_transactions.push(comm::Transaction {
+        //                             digest: tx_data,
+        //                             worker_id: worker_id as u32,
+        //                         });
+        //                     }
+        //                 }
+        //                 Ok(_) => {
+        //                     log::warn!(
+        //                         "[ANALYZE] Digest {} did not correspond to a Batch message.",
+        //                         digest
+        //                     );
+        //                 }
+        //                 Err(e) => {
+        //                     log::error!(
+        //                         "[ANALYZE] Failed to deserialize message for digest {}: {}",
+        //                         digest,
+        //                         e
+        //                     );
+        //                 }
+        //             }
+        //         }
+        //         Ok(None) => {
+        //             log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
+        //         }
+        //         Err(e) => {
+        //             log::error!(
+        //                 "[ANALYZE] Failed to read batch for digest {}: {}",
+        //                 digest,
+        //                 e
+        //             );
+        //         }
+        //     }
+        // }
 
-        let committed_block = comm::CommittedBlock {
-            epoch: certificate.header.round,
-            height: certificate.header.round,
-            transactions: all_transactions,
-        };
+        // let committed_block = comm::CommittedBlock {
+        //     epoch: certificate.header.round,
+        //     height: certificate.header.round,
+        //     transactions: all_transactions,
+        // };
 
-        let epoch_data = comm::CommittedEpochData {
-            blocks: vec![committed_block],
-        };
+        // let epoch_data = comm::CommittedEpochData {
+        //     blocks: vec![committed_block],
+        // };
 
-        log::debug!(
-            "[ANALYZE] Node ID {} serializing data for round {}",
-            node_id,
-            certificate.header.round
-        );
-        let mut proto_buf = BytesMut::new();
-        epoch_data
-            .encode(&mut proto_buf)
-            .expect("FATAL: Protobuf serialization failed!");
+        // log::debug!(
+        //     "[ANALYZE] Node ID {} serializing data for round {}",
+        //     node_id,
+        //     certificate.header.round
+        // );
+        // let mut proto_buf = BytesMut::new();
+        // epoch_data
+        //     .encode(&mut proto_buf)
+        //     .expect("FATAL: Protobuf serialization failed!");
 
-        let mut len_buf = BytesMut::new();
-        put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+        // let mut len_buf = BytesMut::new();
+        // put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
 
-        if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
-             log::info!("[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.", node_id, certificate.header.round);
-        }
+        // if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
+        //      log::info!("[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.", node_id, certificate.header.round);
+        // }
 
-        log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
+        // log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
 
         // if let Err(e) = stream.write_all(&len_buf).await {
         //     log::error!(
@@ -309,11 +310,11 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         //     break;
         // }
 
-        log::info!(
-            "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
-            node_id,
-            certificate.header.round
-        );
+        // log::info!(
+        //     "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
+        //     node_id,
+        //     certificate.header.round
+        // );
     }
 
     log::warn!(

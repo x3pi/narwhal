@@ -1,13 +1,17 @@
+// In worker/src/processor.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::worker::SerializedBatchDigestMessage;
+use bytes::Bytes;
 use config::WorkerId;
 use crypto::Digest;
 use ed25519_dalek::Digest as _;
 use ed25519_dalek::Sha512;
+use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;
+use std::net::SocketAddr;
 use store::Store;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::Receiver;
 
 #[cfg(test)]
 #[path = "tests/processor_tests.rs"]
@@ -27,8 +31,9 @@ impl Processor {
         mut store: Store,
         // Input channel to receive batches.
         mut rx_batch: Receiver<SerializedBatchMessage>,
-        // Output channel to send out batches' digests.
-        tx_digest: Sender<SerializedBatchDigestMessage>,
+        // SỬA ĐỔI: Thay thế channel bằng network sender và địa chỉ primary.
+        mut network: SimpleSender,
+        primary_address: SocketAddr,
         // Whether we are processing our own batches or the batches of other nodes.
         own_digest: bool,
     ) {
@@ -38,19 +43,20 @@ impl Processor {
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
 
                 // Store the batch.
-                store.write(digest.to_vec(), batch.clone()).await; // SỬA ĐỔI: clone batch
+                store.write(digest.to_vec(), batch.clone()).await;
 
-                // SỬA ĐỔI: Gửi kèm dữ liệu batch trong message
+                // Create the message for the primary.
                 let message = match own_digest {
                     true => WorkerPrimaryMessage::OurBatch(digest, id, batch),
                     false => WorkerPrimaryMessage::OthersBatch(digest, id, batch),
                 };
-                let message = bincode::serialize(&message)
+                let serialized_message = bincode::serialize(&message)
                     .expect("Failed to serialize our own worker-primary message");
-                tx_digest
-                    .send(message)
-                    .await
-                    .expect("Failed to send digest");
+                log::info!("Processor: Sending batch to primary at {:?}", primary_address);
+                // SỬA ĐỔI: Gửi trực tiếp đến primary qua mạng.
+                network
+                    .send(primary_address, Bytes::from(serialized_message))
+                    .await;
             }
         });
     }

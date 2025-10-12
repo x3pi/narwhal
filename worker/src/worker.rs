@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::helper::Helper;
-use crate::primary_connector::PrimaryConnector;
+// use crate::primary_connector::PrimaryConnector; // <--- XÓA DÒNG NÀY
 use crate::processor::{Processor, SerializedBatchMessage};
 use crate::quorum_waiter::QuorumWaiter;
 use crate::synchronizer::Synchronizer;
@@ -11,11 +11,11 @@ use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::sink::SinkExt as _;
 use log::{error, info, warn};
-// SỬA ĐỔI: Import QuicTransport thay vì TcpTransport
 use network::{
-    quic::QuicTransport, // <--- THAY ĐỔI
+    quic::QuicTransport,
     transport::Transport,
-    MessageHandler, Receiver, Writer,
+    MessageHandler, Receiver, SimpleSender, // Thêm SimpleSender vào import
+    Writer,
 };
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
@@ -61,24 +61,27 @@ impl Worker {
             store,
         };
 
-        // SỬA ĐỔI: Tạo một đối tượng transport QUIC.
-        let transport = QuicTransport::new(); // <--- THAY ĐỔI
+        let transport = QuicTransport::new();
 
-        let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
+        // SỬA ĐỔI: Không cần channel đi đến PrimaryConnector nữa.
+        // let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
 
-        // Khởi chạy các handler với transport mới.
         worker.handle_primary_messages(&transport).await;
-        worker.handle_clients_transactions(&transport, tx_primary.clone()).await;
-        worker.handle_workers_messages(&transport, tx_primary).await;
+        // worker.handle_clients_transactions(&transport, tx_primary.clone()).await;
+        // worker.handle_workers_messages(&transport, tx_primary).await;
+        worker.handle_clients_transactions(&transport).await;
+        worker.handle_workers_messages(&transport).await;
 
-        PrimaryConnector::spawn(
-            worker
-                .committee
-                .primary(&worker.name)
-                .expect("Our public key is not in the committee")
-                .worker_to_primary,
-            rx_primary,
-        );
+
+        // SỬA ĐỔI: Xóa bỏ PrimaryConnector.
+        // PrimaryConnector::spawn(
+        //     worker
+        //         .committee
+        //         .primary(&worker.name)
+        //         .expect("Our public key is not in the committee")
+        //         .worker_to_primary,
+        //     rx_primary,
+        // );
 
         info!(
             "Worker {} successfully booted on {}",
@@ -92,8 +95,7 @@ impl Worker {
         );
     }
 
-    // SỬA ĐỔI: Hàm nhận vào QuicTransport.
-    async fn handle_primary_messages(&self, transport: &QuicTransport) { // <--- THAY ĐỔI
+    async fn handle_primary_messages(&self, transport: &QuicTransport) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         let mut address = self
@@ -108,10 +110,7 @@ impl Worker {
             .await
             .expect("Failed to create primary message listener");
 
-        Receiver::spawn(
-            listener,
-            PrimaryReceiverHandler { tx_synchronizer },
-        );
+        Receiver::spawn(listener, PrimaryReceiverHandler { tx_synchronizer });
 
         Synchronizer::spawn(
             self.name,
@@ -130,12 +129,14 @@ impl Worker {
         );
     }
 
-    // SỬA ĐỔI: Hàm nhận vào QuicTransport.
     async fn handle_clients_transactions(
+        
         &self,
-        transport: &QuicTransport, // <--- THAY ĐỔI
-        tx_primary: Sender<SerializedBatchDigestMessage>,
+        transport: &QuicTransport,
+        // tx_primary: Sender<SerializedBatchDigestMessage>, // <--- XÓA PARAMETER NÀY
     ) {
+        log::info!("Worker: Processor will send to primary_address: {:?}", 222); 
+
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -151,10 +152,7 @@ impl Worker {
             .listen(address)
             .await
             .expect("Failed to create transaction listener");
-        Receiver::spawn(
-            listener,
-            TxReceiverHandler { tx_batch_maker },
-        );
+        Receiver::spawn(listener, TxReceiverHandler { tx_batch_maker });
 
         BatchMaker::spawn(
             self.parameters.batch_size,
@@ -174,12 +172,19 @@ impl Worker {
             rx_quorum_waiter,
             tx_processor,
         );
-
+        // SỬA ĐỔI: Khởi tạo Processor với SimpleSender.
+        let primary_address = self
+            .committee
+            .primary(&self.name)
+            .expect("Our public key is not in the committee")
+            .worker_to_primary;
+        log::info!("Worker: Processor will send to primary_address: {:?}", primary_address); 
         Processor::spawn(
             self.id,
             self.store.clone(),
             rx_processor,
-            tx_primary,
+            SimpleSender::new(),
+            primary_address,
             true,
         );
 
@@ -189,11 +194,10 @@ impl Worker {
         );
     }
 
-    // SỬA ĐỔI: Hàm nhận vào QuicTransport.
     async fn handle_workers_messages(
         &self,
-        transport: &QuicTransport, // <--- THAY ĐỔI
-        tx_primary: Sender<SerializedBatchDigestMessage>,
+        transport: &QuicTransport,
+        // tx_primary: Sender<SerializedBatchDigestMessage>, // <--- XÓA PARAMETER NÀY
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -204,7 +208,7 @@ impl Worker {
             .expect("Our public key or worker id is not in the committee")
             .worker_to_worker;
         address.set_ip("0.0.0.0".parse().unwrap());
-        
+
         let listener = transport
             .listen(address)
             .await
@@ -216,7 +220,7 @@ impl Worker {
                 tx_processor,
             },
         );
-        
+
         Helper::spawn(
             self.id,
             self.committee.clone(),
@@ -224,11 +228,18 @@ impl Worker {
             rx_helper,
         );
 
+        // SỬA ĐỔI: Khởi tạo Processor với SimpleSender.
+        let primary_address = self
+            .committee
+            .primary(&self.name)
+            .expect("Our public key is not in the committee")
+            .worker_to_primary;
         Processor::spawn(
             self.id,
             self.store.clone(),
             rx_processor,
-            tx_primary,
+            SimpleSender::new(),
+            primary_address,
             false,
         );
 
@@ -253,7 +264,6 @@ impl MessageHandler for TxReceiverHandler {
             .send(message.to_vec())
             .await
             .expect("Failed to send transaction");
-        tokio::task::yield_now().await;
         Ok(())
     }
 }
