@@ -3,7 +3,7 @@
 use super::transport::{Connection, Listener, Transport, TransportResult};
 use async_trait::async_trait;
 use bytes::Bytes;
-use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -29,12 +29,9 @@ impl Connection for QuicConnection {
                 let buffer = recv_stream.read_to_end(128 * 1024 * 1024).await?;
                 Ok(Some(Bytes::from(buffer)))
             }
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => {
-                Ok(None)
-            }
-            Err(e) => {
-                Err(Box::new(e))
-            }
+            Err(quinn::ConnectionError::ApplicationClosed(_)) => Ok(None),
+            Err(quinn::ConnectionError::LocallyClosed) => Ok(None),
+            Err(e) => Err(Box::new(e)),
         }
     }
 }
@@ -47,7 +44,11 @@ pub struct QuicListener {
 #[async_trait]
 impl Listener for QuicListener {
     async fn accept(&mut self) -> TransportResult<(Box<dyn Connection>, SocketAddr)> {
-        let connecting = self.endpoint.accept().await.unwrap();
+        let connecting = match self.endpoint.accept().await {
+            Some(conn) => conn,
+            None => return Err("Endpoint closed".into()),
+        };
+        
         let connection = connecting.await?;
         let addr = connection.remote_address();
         let conn = Box::new(QuicConnection { connection });
@@ -78,16 +79,13 @@ impl Default for QuicTransport {
     }
 }
 
-
 #[async_trait]
 impl Transport for QuicTransport {
     async fn connect(&self, address: SocketAddr) -> TransportResult<Box<dyn Connection>> {
         let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
         endpoint.set_default_client_config(self.client_config.clone());
 
-        let connection = endpoint
-            .connect(address, "localhost")?
-            .await?;
+        let connection = endpoint.connect(address, "localhost")?.await?;
         Ok(Box::new(QuicConnection { connection }))
     }
 
@@ -106,27 +104,44 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
 
     let mut transport_config = TransportConfig::default();
-    transport_config.max_concurrent_uni_streams(20_000_u32.into());
-    transport_config.stream_receive_window((2 * 1024 * 1024_u32).into());
-    transport_config.send_window(20 * 1024 * 1024);
+
+    // === CẤU HÌNH CÂN BẰNG - HIỆU NĂNG TỐT MÀ KHÔNG QUÁ TẢI ===
+    
+    // Stream limits hợp lý
+    transport_config.max_concurrent_uni_streams(VarInt::from_u32(10_000));
+    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1_000));
+    
+    // Buffer sizes vừa phải
+    transport_config.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB
+    transport_config.receive_window(VarInt::from_u32(4 * 1024 * 1024)); // 4MB
+    transport_config.send_window(8 * 1024 * 1024); // 8MB
+    
+    // Timeout hợp lý
     transport_config.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
     transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
+    
+    // Initial RTT conservative
+    transport_config.initial_rtt(Duration::from_millis(100));
+    
     let transport = Arc::new(transport_config);
 
+    // === SERVER CONFIG ===
     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key).unwrap();
     server_config.transport = transport.clone();
 
+    // === CLIENT CONFIG ===
     let client_crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
+    
     let mut client_config = ClientConfig::new(Arc::new(client_crypto));
     client_config.transport_config(transport);
 
     (server_config, client_config)
 }
 
-// Helper struct to skip server certificate verification during tests.
+// Helper struct to skip server certificate verification
 struct SkipServerVerification;
 
 impl rustls::client::ServerCertVerifier for SkipServerVerification {
