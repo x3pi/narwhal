@@ -250,6 +250,7 @@ impl Committee {
 pub struct KeyPair {
     /// The node's public key (and identifier).
     pub name: PublicKey,
+    
     /// The node's secret key.
     pub secret: SecretKey,
 }
