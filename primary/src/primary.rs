@@ -80,6 +80,8 @@ impl Primary {
         parameters.log();
         let name = keypair.name;
         let secret = keypair.secret;
+        let consensus_secret = keypair.consensus_secret;
+
         let consensus_round = Arc::new(AtomicU64::new(0));
         
         // SỬA ĐỔI: Sử dụng QuicTransport.
@@ -120,7 +122,7 @@ impl Primary {
             tx_sync_certificates,
         );
 
-        let signature_service = SignatureService::new(secret);
+        let signature_service = SignatureService::new(consensus_secret);
 
         Core::spawn(
             name,

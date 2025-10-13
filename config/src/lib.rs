@@ -1,5 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crypto::{generate_production_keypair, PublicKey, SecretKey};
+use crypto::{
+    generate_consensus_keypair, generate_production_keypair, ConsensusPublicKey, ConsensusSecretKey,
+    PublicKey, SecretKey,
+};
 use log::info;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -9,6 +12,7 @@ use std::io::BufWriter;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use thiserror::Error;
+use rand::SeedableRng;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -60,24 +64,12 @@ pub type WorkerId = u32;
 
 #[derive(Deserialize, Clone)]
 pub struct Parameters {
-    /// The preferred header size. The primary creates a new header when it has enough parents and
-    /// enough batches' digests to reach `header_size`. Denominated in bytes.
     pub header_size: usize,
-    /// The maximum delay that the primary waits between generating two headers, even if the header
-    /// did not reach `max_header_size`. Denominated in ms.
     pub max_header_delay: u64,
-    /// The depth of the garbage collection (Denominated in number of rounds).
     pub gc_depth: u64,
-    /// The delay after which the synchronizer retries to send sync requests. Denominated in ms.
     pub sync_retry_delay: u64,
-    /// Determine with how many nodes to sync when re-trying to send sync-request. These nodes
-    /// are picked at random from the committee.
     pub sync_retry_nodes: usize,
-    /// The preferred batch size. The workers seal a batch of transactions when it reaches this size.
-    /// Denominated in bytes.
     pub batch_size: usize,
-    /// The delay after which the workers seal a batch of transactions, even if `max_batch_size`
-    /// is not reached. Denominated in ms.
     pub max_batch_delay: u64,
 }
 
@@ -111,29 +103,22 @@ impl Parameters {
 
 #[derive(Clone, Deserialize)]
 pub struct PrimaryAddresses {
-    /// Address to receive messages from other primaries (WAN).
     pub primary_to_primary: SocketAddr,
-    /// Address to receive messages from our workers (LAN).
     pub worker_to_primary: SocketAddr,
 }
 
 #[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
 pub struct WorkerAddresses {
-    /// Address to receive client transactions (WAN).
     pub transactions: SocketAddr,
-    /// Address to receive messages from other workers (WAN).
     pub worker_to_worker: SocketAddr,
-    /// Address to receive messages from our primary (LAN).
     pub primary_to_worker: SocketAddr,
 }
 
 #[derive(Clone, Deserialize)]
 pub struct Authority {
-    /// The voting power of this authority.
     pub stake: Stake,
-    /// The network addresses of the primary.
+    pub consensus_key: ConsensusPublicKey,
     pub primary: PrimaryAddresses,
-    /// Map of workers' id and their network addresses.
     pub workers: HashMap<WorkerId, WorkerAddresses>,
 }
 
@@ -145,17 +130,18 @@ pub struct Committee {
 impl Import for Committee {}
 
 impl Committee {
-    /// Returns the number of authorities.
     pub fn size(&self) -> usize {
         self.authorities.len()
     }
 
-    /// Return the stake of a specific authority.
     pub fn stake(&self, name: &PublicKey) -> Stake {
-        self.authorities.get(&name).map_or_else(|| 0, |x| x.stake)
+        self.authorities.get(name).map_or_else(|| 0, |x| x.stake)
     }
 
-    /// Returns the stake of all authorities except `myself`.
+    pub fn consensus_key(&self, name: &PublicKey) -> Option<ConsensusPublicKey> {
+        self.authorities.get(name).map(|x| x.consensus_key.clone())
+    }
+
     pub fn others_stake(&self, myself: &PublicKey) -> Vec<(PublicKey, Stake)> {
         self.authorities
             .iter()
@@ -164,23 +150,16 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the stake required to reach a quorum (2f+1).
     pub fn quorum_threshold(&self) -> Stake {
-        // If N = 3f + 1 + k (0 <= k < 3)
-        // then (2 N + 3) / 3 = 2f + 1 + (2k + 2)/3 = 2f + 1 + k = N - f
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         2 * total_votes / 3 + 1
     }
 
-    /// Returns the stake required to reach availability (f+1).
     pub fn validity_threshold(&self) -> Stake {
-        // If N = 3f + 1 + k (0 <= k < 3)
-        // then (N + 2) / 3 = f + 1 + k/3 = f + 1
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         (total_votes + 2) / 3
     }
 
-    /// Returns the primary addresses of the target primary.
     pub fn primary(&self, to: &PublicKey) -> Result<PrimaryAddresses, ConfigError> {
         self.authorities
             .get(to)
@@ -188,7 +167,6 @@ impl Committee {
             .ok_or_else(|| ConfigError::NotInCommittee(*to))
     }
 
-    /// Returns the addresses of all primaries except `myself`.
     pub fn others_primaries(&self, myself: &PublicKey) -> Vec<(PublicKey, PrimaryAddresses)> {
         self.authorities
             .iter()
@@ -197,7 +175,6 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the addresses of a specific worker (`id`) of a specific authority (`to`).
     pub fn worker(&self, to: &PublicKey, id: &WorkerId) -> Result<WorkerAddresses, ConfigError> {
         self.authorities
             .iter()
@@ -211,7 +188,6 @@ impl Committee {
             .ok_or_else(|| ConfigError::NotInCommittee(*to))
     }
 
-    /// Returns the addresses of all our workers.
     pub fn our_workers(&self, myself: &PublicKey) -> Result<Vec<WorkerAddresses>, ConfigError> {
         self.authorities
             .iter()
@@ -225,8 +201,6 @@ impl Committee {
             .collect()
     }
 
-    /// Returns the addresses of all workers with a specific id except the ones of the authority
-    /// specified by `myself`.
     pub fn others_workers(
         &self,
         myself: &PublicKey,
@@ -248,11 +222,10 @@ impl Committee {
 
 #[derive(Serialize, Deserialize)]
 pub struct KeyPair {
-    /// The node's public key (and identifier).
     pub name: PublicKey,
-    
-    /// The node's secret key.
     pub secret: SecretKey,
+    pub consensus_key: ConsensusPublicKey,
+    pub consensus_secret: ConsensusSecretKey,
 }
 
 impl Import for KeyPair {}
@@ -261,7 +234,14 @@ impl Export for KeyPair {}
 impl KeyPair {
     pub fn new() -> Self {
         let (name, secret) = generate_production_keypair();
-        Self { name, secret }
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let (consensus_key, consensus_secret) = generate_consensus_keypair(&mut rng);
+        Self {
+            name,
+            secret,
+            consensus_key,
+            consensus_secret,
+        }
     }
 }
 
@@ -270,3 +250,4 @@ impl Default for KeyPair {
         Self::new()
     }
 }
+

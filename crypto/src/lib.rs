@@ -1,14 +1,25 @@
+// crypto/src/lib.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 
-// --- ĐÃ CẬP NHẬT TOÀN BỘ IMPORT ---
 use fastcrypto::secp256k1::{
     Secp256k1KeyPair, Secp256k1PublicKey, Secp256k1PrivateKey, Secp256k1Signature,
 };
-// Bỏ import "Signer" không sử dụng
+use k256::{PublicKey as K256PublicKey};
+use k256::elliptic_curve::sec1::ToEncodedPoint;
+
+// --- PHẦN IMPORT MỚI CHO BLS12-381 (ĐỒNG THUẬN) ---
+use fastcrypto::bls12381::min_pk::{
+    BLS12381AggregateSignature, BLS12381KeyPair, BLS12381PublicKey, BLS12381PrivateKey,
+    BLS12381Signature,
+};
+use fastcrypto::traits::{AggregateAuthenticator, Signer};
+use fastcrypto::error::FastCryptoError;
+
+use serde::Serialize;
+// --- CÁC IMPORT CHUNG ---
 use fastcrypto::traits::{KeyPair, RecoverableSigner, ToFromBytes, VerifyingKey, AllowedRng};
 use fastcrypto::encoding::{Base64, Encoding};
-use fastcrypto::error::FastCryptoError;
-use rand::SeedableRng;
 use rand::{CryptoRng, RngCore};
 use serde::{de, ser, Deserializer, Serializer, Deserialize};
 use std::array::TryFromSliceError;
@@ -16,14 +27,15 @@ use std::convert::{TryFrom, TryInto};
 use std::fmt;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
-use sha3::Digest as Sha3Digest;
+use sha3::{Digest as Sha3Digest, Keccak256};
+use hex;
+use rand::SeedableRng;
 
-// --- PHẦN BỔ SUNG ---
-// Import thêm AffinePoint và UncompressedPointSize
-use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
-use k256::{AffinePoint, PublicKey as K256PublicKey};
-use sha3::Keccak256;
 
+pub fn generate_production_keypair() -> (PublicKey, SecretKey) {
+    let mut rng = rand::rngs::StdRng::from_entropy();
+    generate_keypair(&mut rng)
+}
 
 #[cfg(test)]
 #[path = "tests/crypto_tests.rs"]
@@ -31,10 +43,10 @@ pub mod crypto_tests;
 
 pub type CryptoError = FastCryptoError;
 
-/// Represents a Keccak-256 hash digest (32 bytes).
+// Digest và Hash trait giữ nguyên
 #[derive(Hash, PartialEq, Default, Eq, Clone, serde::Serialize, serde::Deserialize, Ord, PartialOrd)]
 pub struct Digest(pub [u8; 32]);
-
+/* ... implementation của Digest giữ nguyên ... */
 impl Digest {
     pub fn to_vec(&self) -> Vec<u8> { self.0.to_vec() }
     pub fn size(&self) -> usize { self.0.len() }
@@ -52,15 +64,19 @@ impl TryFrom<&[u8]> for Digest {
     type Error = TryFromSliceError;
     fn try_from(item: &[u8]) -> Result<Self, Self::Error> { Ok(Digest(item.try_into()?)) }
 }
-
 pub trait Hash {
     fn digest(&self) -> Digest;
 }
 
-/// Represents a public key (in bytes).
+
+// #################################################################
+// ### PHẦN 1: ĐỊNH DANH NETWORK (SECP256K1) - GIỮ NGUYÊN       ###
+// #################################################################
+
+/// Represents a public key (in bytes) used for network identity.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd)]
 pub struct PublicKey(pub [u8; 33]);
-
+/* ... implementation của PublicKey giữ nguyên ... */
 impl Default for PublicKey {
     fn default() -> Self { PublicKey([0u8; 33]) }
 }
@@ -78,22 +94,11 @@ impl PublicKey {
         Ok(Self(array))
     }
     
-    // --- PHẦN BỔ SUNG ĐÃ SỬA LỖI ---
-    /// Chuyển đổi PublicKey sang địa chỉ Ethereum.
     pub fn to_eth_address(&self) -> String {
-        // Parse public key từ bytes
         let k256_public_key = K256PublicKey::from_sec1_bytes(&self.0).expect("Invalid public key bytes");
-
-        // Lấy uncompressed bytes
         let uncompressed_bytes = k256_public_key.to_encoded_point(false);
-
-        // Băm public key đã giải nén (bỏ qua byte đầu tiên 0x04) bằng Keccak-256
         let hash = Keccak256::digest(&uncompressed_bytes.as_bytes()[1..]);
-        
-        // Lấy 20 bytes cuối của hash
         let address_bytes = &hash[12..];
-
-        // Trả về địa chỉ dưới dạng hex string
         format!("0x{}", hex::encode(address_bytes))
     }
 }
@@ -112,11 +117,10 @@ impl AsRef<[u8]> for PublicKey {
     fn as_ref(&self) -> &[u8] { &self.0 }
 }
 
-/// Represents a secret key.
-/// 
-pub struct SecretKey(Secp256k1PrivateKey);
 
-// --- SỬA LỖI TRAIT: Triển khai Clone thủ công cho SecretKey ---
+/// Represents a secret key used for network identity.
+pub struct SecretKey(Secp256k1PrivateKey);
+/* ... implementation của SecretKey giữ nguyên ... */
 impl Clone for SecretKey {
     fn clone(&self) -> Self {
         let bytes = self.0.as_ref();
@@ -133,10 +137,7 @@ impl SecretKey {
         Ok(Self(private_key))
     }
     
-    // --- PHẦN BỔ SUNG ĐÃ SỬA LỖI ---
-    /// Lấy PublicKey tương ứng từ SecretKey.
     pub fn to_public_key(&self) -> PublicKey {
-        // Sửa lỗi clone: Tạo lại keypair từ private key bytes
         let private_key_bytes = self.0.as_ref();
         let sk = Secp256k1PrivateKey::from_bytes(private_key_bytes).unwrap();
         let keypair = Secp256k1KeyPair::from(sk);
@@ -145,7 +146,6 @@ impl SecretKey {
         PublicKey(public_bytes)
     }
     
-    /// Chuyển đổi SecretKey sang địa chỉ Ethereum.
     pub fn to_eth_address(&self) -> String {
         self.to_public_key().to_eth_address()
     }
@@ -162,11 +162,8 @@ impl<'de> de::Deserialize<'de> for SecretKey {
     }
 }
 
-pub fn generate_production_keypair() -> (PublicKey, SecretKey) {
-    let mut rng = rand::rngs::StdRng::from_entropy();
-    generate_keypair(&mut rng)
-}
 
+/// Generates a keypair for network identity (secp256k1).
 pub fn generate_keypair<R>(csprng: &mut R) -> (PublicKey, SecretKey) where R: CryptoRng + RngCore + AllowedRng {
     let keypair = Secp256k1KeyPair::generate(csprng);
     let public_bytes: [u8; 33] = keypair.public().as_ref().try_into().unwrap();
@@ -175,60 +172,113 @@ pub fn generate_keypair<R>(csprng: &mut R) -> (PublicKey, SecretKey) where R: Cr
     (public, secret)
 }
 
-/// Represents a recoverable secp256k1 signature held as a byte array.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Signature(pub [u8; 65]);
 
-impl Default for Signature {
-    fn default() -> Self { Signature([0u8; 65]) }
-}
-impl ser::Serialize for Signature {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: Serializer {
-        serializer.serialize_bytes(&self.0)
+// ##################################################################
+// ### PHẦN 2: ĐỒNG THUẬN (BLS12-381) - THAY ĐỔI VÀ BỔ SUNG      ###
+// ##################################################################
+
+// --- CẶP KHÓA BLS CHO ĐỒNG THUẬN ---
+
+/// Represents a BLS public key used for consensus.
+
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Deserialize, Serialize)] // <-- THÊM Serialize
+pub struct ConsensusPublicKey(BLS12381PublicKey);
+
+impl fmt::Display for ConsensusPublicKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
-impl<'de> Deserialize<'de> for Signature {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'de> {
-        struct ByteArrayVisitor;
-        impl<'de> de::Visitor<'de> for ByteArrayVisitor {
-            type Value = [u8; 65];
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a byte array of length 65")
-            }
-            fn visit_bytes<E>(self, v: &[u8]) -> Result<Self::Value, E> where E: de::Error {
-                v.try_into().map_err(|_| E::invalid_length(v.len(), &self))
-            }
-        }
-        let array = deserializer.deserialize_bytes(ByteArrayVisitor)?;
-        Ok(Signature(array))
+
+pub struct ConsensusSecretKey(BLS12381PrivateKey);
+
+// Implement Clone manually by reconstructing the key from its bytes.
+impl Clone for ConsensusSecretKey {
+    fn clone(&self) -> Self {
+        let bytes = self.0.as_ref();
+        let private_key = BLS12381PrivateKey::from_bytes(bytes)
+            .expect("Cloning a private key should not fail");
+        Self(private_key)
     }
 }
+
+// Manual implementation of Serialize and Deserialize for ConsensusSecretKey
+impl ser::Serialize for ConsensusSecretKey {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: ser::Serializer,
+    {
+        serializer.serialize_str(&Base64::encode(self.0.as_ref()))
+    }
+}
+
+impl<'de> de::Deserialize<'de> for ConsensusSecretKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: de::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        let bytes = Base64::decode(&s).map_err(|e| de::Error::custom(e.to_string()))?;
+        let private_key = BLS12381PrivateKey::from_bytes(&bytes)
+            .map_err(|e| de::Error::custom(e.to_string()))?;
+        Ok(Self(private_key))
+    }
+}
+
+/// Generates a keypair for consensus (BLS).
+pub fn generate_consensus_keypair<R>(csprng: &mut R) -> (ConsensusPublicKey, ConsensusSecretKey) 
+where R: CryptoRng + RngCore + AllowedRng 
+{
+    let keypair = BLS12381KeyPair::generate(csprng);
+    let public = ConsensusPublicKey(keypair.public().clone());
+    let secret = ConsensusSecretKey(keypair.private());
+    (public, secret)
+}
+
+
+// --- CHỮ KÝ BLS CHO ĐỒNG THUẬN ---
+
+/// Represents a BLS signature.
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Default, Serialize)]
+pub struct Signature(BLS12381Signature);
 
 impl Signature {
-    pub fn new(digest: &Digest, secret: &SecretKey) -> Self {
-        let keypair = Secp256k1KeyPair::from(secret.clone().0);
-        let signature_internal = keypair.sign_recoverable(digest.as_ref());
-        let mut sig_bytes = [0u8; 65];
-        sig_bytes.copy_from_slice(signature_internal.as_ref());
-        Self(sig_bytes)
+    /// Create a new BLS signature.
+    pub fn new(digest: &Digest, secret: &ConsensusSecretKey) -> Self {
+        let signature = secret.0.sign(digest.as_ref());
+        Self(signature)
     }
 
-    pub fn verify(&self, digest: &Digest, public_key: &PublicKey) -> Result<(), CryptoError> {
-        let non_recoverable_sig_bytes: &[u8; 64] = self.0[..64].try_into().unwrap();
-        let non_recoverable_signature = Secp256k1Signature::from_bytes(non_recoverable_sig_bytes)
-            .map_err(|_| FastCryptoError::InvalidInput)?;
-        let fc_public_key = Secp256k1PublicKey::from_bytes(&public_key.0)
-            .map_err(|_| FastCryptoError::InvalidInput)?;
-        fc_public_key.verify(digest.as_ref(), &non_recoverable_signature)
+    /// Verify a single BLS signature.
+    pub fn verify(&self, digest: &Digest, public_key: &ConsensusPublicKey) -> Result<(), CryptoError> {
+        public_key.0.verify(digest.as_ref(), &self.0)
     }
 
-    pub fn verify_batch<'a, I>(digest: &Digest, votes: I) -> Result<(), CryptoError> where I: IntoIterator<Item = &'a (PublicKey, Signature)> {
-        for (key, sig) in votes.into_iter() {
-            sig.verify(digest, key)?;
+    /// Aggregate multiple signatures and verify them as a single batch.
+    pub fn verify_batch<'a, I>(digest: &Digest, votes: I) -> Result<(), CryptoError>
+    where I: IntoIterator<Item = &'a (ConsensusPublicKey, Signature)>
+    {
+        let (pks, sigs): (Vec<_>, Vec<_>) = votes
+        .into_iter()
+        .map(|(pk, sig)| (pk.0.clone(), &sig.0)) // Clone the public key here
+        .unzip();
+    
+        if pks.is_empty() {
+            return Ok(());
         }
-        Ok(())
+    
+        // THAY ĐỔI Ở ĐÂY: Sử dụng BLS12381AggregateSignature để tổng hợp
+        let aggregated_signature = BLS12381AggregateSignature::aggregate(sigs)?;
+    
+        // Xác minh chữ ký đã tổng hợp
+        aggregated_signature.verify(pks.as_slice(), digest.as_ref())
     }
+
 }
+
+
+// --- DỊCH VỤ KÝ (SIGNATURE SERVICE) DÙNG BLS ---
 
 #[derive(Clone)]
 pub struct SignatureService {
@@ -236,10 +286,11 @@ pub struct SignatureService {
 }
 
 impl SignatureService {
-    pub fn new(secret: SecretKey) -> Self {
+    pub fn new(secret: ConsensusSecretKey) -> Self {
         let (tx, mut rx): (Sender<(_, oneshot::Sender<_>)>, _) = channel(100);
         tokio::spawn(async move {
             while let Some((digest, sender)) = rx.recv().await {
+                // Secret key is cloned for each signature request inside this task.
                 let signature = Signature::new(&digest, &secret);
                 let _ = sender.send(signature);
             }

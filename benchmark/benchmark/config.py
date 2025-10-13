@@ -8,16 +8,23 @@ class ConfigError(Exception):
 
 
 class Key:
-    def __init__(self, name, secret):
+    def __init__(self, name, secret, consensus_key, consensus_secret):
         self.name = name
         self.secret = secret
+        self.consensus_key = consensus_key
+        self.consensus_secret = consensus_secret
 
     @classmethod
     def from_file(cls, filename):
         assert isinstance(filename, str)
         with open(filename, 'r') as f:
             data = load(f)
-        return cls(data['name'], data['secret'])
+        return cls(
+            data['name'],
+            data['secret'],
+            data['consensus_key'],
+            data['consensus_secret']
+        )
 
 
 class Committee:
@@ -25,6 +32,7 @@ class Committee:
         "authorities: {
             "name": {
                 "stake": 1,
+                "consensus_key": "...",
                 "primary: {
                     "primary_to_primary": x.x.x.x:x,
                     "worker_to_primary": x.x.x.x:x,
@@ -42,9 +50,9 @@ class Committee:
         }
     '''
 
-    def __init__(self, addresses, base_port):
+    def __init__(self, addresses, base_port, key_map):
         ''' The `addresses` field looks as follows:
-            { 
+            {
                 "name": ["host", "host", ...],
                 ...
             }
@@ -78,9 +86,11 @@ class Committee:
                     'worker_to_worker': f'{host}:{port + 2}',
                 }
                 port += 3
-
+            
+            consensus_key = key_map[name]
             self.json['authorities'][name] = {
                 'stake': 1,
+                'consensus_key': consensus_key,
                 'primary': primary_addr,
                 'workers': workers_addr
             }
@@ -152,13 +162,13 @@ class Committee:
 
 
 class LocalCommittee(Committee):
-    def __init__(self, names, port, workers):
+    def __init__(self, names, port, workers, key_map):
         assert isinstance(names, list)
         assert all(isinstance(x, str) for x in names)
         assert isinstance(port, int)
         assert isinstance(workers, int) and workers > 0
         addresses = OrderedDict((x, ['127.0.0.1']*(1+workers)) for x in names)
-        super().__init__(addresses, port)
+        super().__init__(addresses, port, key_map)
 
 
 class NodeParameters:

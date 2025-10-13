@@ -74,7 +74,10 @@ class LocalBench:
                 keys += [Key.from_file(filename)]
 
             names = [x.name for x in keys]
-            committee = LocalCommittee(names, self.BASE_PORT, self.workers)
+            key_map = {x.name: x.consensus_key for x in keys}
+            committee = LocalCommittee(
+                names, self.BASE_PORT, self.workers, key_map
+            )
             committee.print(PathMaker.committee_file())
 
             self.node_parameters.print(PathMaker.parameters_file())

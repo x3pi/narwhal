@@ -2,14 +2,13 @@
 use crate::error::{DagError, DagResult};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
-use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
-use sha2::{Digest as Sha2DigestTrait, Sha512};
+use crypto::{ConsensusPublicKey, Digest, Hash, PublicKey, Signature, SignatureService};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as Sha2DigestTrait, Sha512};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 
-// XÓA Default khỏi derive
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Header {
     pub author: PublicKey,
@@ -23,7 +22,7 @@ pub struct Header {
 impl Default for Header {
     fn default() -> Self {
         Self {
-            author: PublicKey::default(), // Sử dụng PublicKey::default() mới
+            author: PublicKey::default(),
             round: 0,
             payload: BTreeMap::new(),
             parents: BTreeSet::new(),
@@ -64,7 +63,10 @@ impl Header {
 
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
-        ensure!(voting_rights > 0, DagError::UnknownAuthority(self.author.clone()));
+        ensure!(
+            voting_rights > 0,
+            DagError::UnknownAuthority(self.author.clone())
+        );
 
         // Ensure all worker ids are correct.
         for worker_id in self.payload.values() {
@@ -73,9 +75,12 @@ impl Header {
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
-        // Check the signature.
+        // Check the signature using the consensus public key.
+        let consensus_pk = committee
+            .consensus_key(&self.author)
+            .ok_or_else(|| DagError::UnknownAuthority(self.author.clone()))?;
         self.signature
-            .verify(&self.id, &self.author)
+            .verify(&self.id, &consensus_pk)
             .map_err(DagError::from)
     }
 }
@@ -134,7 +139,7 @@ impl Vote {
             id: header.id.clone(),
             round: header.round,
             origin: header.author.clone(),
-            author: author.clone(), // SỬA LỖI: Sử dụng clone()
+            author: author.clone(),
             signature: Signature::default(),
         };
         let signature = signature_service.request_signature(vote.digest()).await;
@@ -148,9 +153,12 @@ impl Vote {
             DagError::UnknownAuthority(self.author.clone())
         );
 
-        // Check the signature.
+        // Check the signature using the consensus public key.
+        let consensus_pk = committee
+            .consensus_key(&self.author)
+            .ok_or_else(|| DagError::UnknownAuthority(self.author.clone()))?;
         self.signature
-            .verify(&self.digest(), &self.author)
+            .verify(&self.digest(), &consensus_pk)
             .map_err(DagError::from)
     }
 }
@@ -191,7 +199,7 @@ impl Certificate {
             .keys()
             .map(|name| Self {
                 header: Header {
-                    author: name.clone(), // Sử dụng clone()
+                    author: name.clone(),
                     ..Header::default()
                 },
                 ..Self::default()
@@ -224,7 +232,18 @@ impl Certificate {
         );
 
         // Check the signatures.
-        Signature::verify_batch(&self.digest(), &self.votes).map_err(DagError::from)
+        let votes_to_verify: DagResult<Vec<(ConsensusPublicKey, Signature)>> = self
+            .votes
+            .iter()
+            .map(|(pk, sig)| {
+                let consensus_pk = committee
+                    .consensus_key(pk)
+                    .ok_or_else(|| DagError::UnknownAuthority(pk.clone()))?;
+                Ok((consensus_pk, sig.clone()))
+            })
+            .collect();
+
+        Signature::verify_batch(&self.digest(), &votes_to_verify?).map_err(DagError::from)
     }
 
     pub fn round(&self) -> Round {
@@ -232,7 +251,7 @@ impl Certificate {
     }
 
     pub fn origin(&self) -> PublicKey {
-        self.header.author.clone() // Sử dụng clone()
+        self.header.author.clone()
     }
 }
 
