@@ -112,7 +112,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .context("Public key không tìm thấy trong committee file")?;
 
             log::info!("Node {} khởi chạy với ID: {}", keypair.name, node_id);
-            
+            log::info!("Node's eth secret: {}", keypair.secret.encode_base64());
+            log::info!("Node's eth address: {:?}", keypair.name.to_eth_address());
+
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
             

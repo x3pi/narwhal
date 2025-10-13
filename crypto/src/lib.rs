@@ -4,7 +4,8 @@
 use fastcrypto::secp256k1::{
     Secp256k1KeyPair, Secp256k1PublicKey, Secp256k1PrivateKey, Secp256k1Signature,
 };
-use fastcrypto::traits::{KeyPair, RecoverableSigner, Signer, ToFromBytes, VerifyingKey, AllowedRng};
+// Bỏ import "Signer" không sử dụng
+use fastcrypto::traits::{KeyPair, RecoverableSigner, ToFromBytes, VerifyingKey, AllowedRng};
 use fastcrypto::encoding::{Base64, Encoding};
 use fastcrypto::error::FastCryptoError;
 use rand::SeedableRng;
@@ -16,6 +17,13 @@ use std::fmt;
 use tokio::sync::mpsc::{channel, Sender};
 use tokio::sync::oneshot;
 use sha3::Digest as Sha3Digest;
+
+// --- PHẦN BỔ SUNG ---
+// Import thêm AffinePoint và UncompressedPointSize
+use k256::elliptic_curve::sec1::{FromEncodedPoint, ToEncodedPoint};
+use k256::{AffinePoint, PublicKey as K256PublicKey};
+use sha3::Keccak256;
+
 
 #[cfg(test)]
 #[path = "tests/crypto_tests.rs"]
@@ -69,6 +77,25 @@ impl PublicKey {
         let array = bytes[..33].try_into().map_err(|_| FastCryptoError::InvalidInput)?;
         Ok(Self(array))
     }
+    
+    // --- PHẦN BỔ SUNG ĐÃ SỬA LỖI ---
+    /// Chuyển đổi PublicKey sang địa chỉ Ethereum.
+    pub fn to_eth_address(&self) -> String {
+        // Parse public key từ bytes
+        let k256_public_key = K256PublicKey::from_sec1_bytes(&self.0).expect("Invalid public key bytes");
+
+        // Lấy uncompressed bytes
+        let uncompressed_bytes = k256_public_key.to_encoded_point(false);
+
+        // Băm public key đã giải nén (bỏ qua byte đầu tiên 0x04) bằng Keccak-256
+        let hash = Keccak256::digest(&uncompressed_bytes.as_bytes()[1..]);
+        
+        // Lấy 20 bytes cuối của hash
+        let address_bytes = &hash[12..];
+
+        // Trả về địa chỉ dưới dạng hex string
+        format!("0x{}", hex::encode(address_bytes))
+    }
 }
 impl ser::Serialize for PublicKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error> where S: ser::Serializer {
@@ -86,6 +113,7 @@ impl AsRef<[u8]> for PublicKey {
 }
 
 /// Represents a secret key.
+/// 
 pub struct SecretKey(Secp256k1PrivateKey);
 
 // --- SỬA LỖI TRAIT: Triển khai Clone thủ công cho SecretKey ---
@@ -103,6 +131,23 @@ impl SecretKey {
         let bytes = Base64::decode(s)?;
         let private_key = Secp256k1PrivateKey::from_bytes(&bytes).map_err(|_| FastCryptoError::InvalidInput)?;
         Ok(Self(private_key))
+    }
+    
+    // --- PHẦN BỔ SUNG ĐÃ SỬA LỖI ---
+    /// Lấy PublicKey tương ứng từ SecretKey.
+    pub fn to_public_key(&self) -> PublicKey {
+        // Sửa lỗi clone: Tạo lại keypair từ private key bytes
+        let private_key_bytes = self.0.as_ref();
+        let sk = Secp256k1PrivateKey::from_bytes(private_key_bytes).unwrap();
+        let keypair = Secp256k1KeyPair::from(sk);
+
+        let public_bytes: [u8; 33] = keypair.public().as_ref().try_into().unwrap();
+        PublicKey(public_bytes)
+    }
+    
+    /// Chuyển đổi SecretKey sang địa chỉ Ethereum.
+    pub fn to_eth_address(&self) -> String {
+        self.to_public_key().to_eth_address()
     }
 }
 impl ser::Serialize for SecretKey {
@@ -144,7 +189,6 @@ impl ser::Serialize for Signature {
 }
 impl<'de> Deserialize<'de> for Signature {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error> where D: Deserializer<'de> {
-        // Sử dụng một visitor để deserialize mảng byte một cách an toàn
         struct ByteArrayVisitor;
         impl<'de> de::Visitor<'de> for ByteArrayVisitor {
             type Value = [u8; 65];
@@ -162,7 +206,6 @@ impl<'de> Deserialize<'de> for Signature {
 
 impl Signature {
     pub fn new(digest: &Digest, secret: &SecretKey) -> Self {
-        // Clone toàn bộ SecretKey, sau đó lấy Secp256k1PrivateKey bên trong
         let keypair = Secp256k1KeyPair::from(secret.clone().0);
         let signature_internal = keypair.sign_recoverable(digest.as_ref());
         let mut sig_bytes = [0u8; 65];
