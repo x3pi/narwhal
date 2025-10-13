@@ -5,7 +5,7 @@ use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
 use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
 use rand::rngs::StdRng;
-use rand::SeedableRng as _;
+use rand::SeedableRng;
 use std::net::SocketAddr;
 use tokio::task::JoinHandle;
 

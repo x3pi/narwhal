@@ -6,7 +6,7 @@ use bytes::Bytes;
 use crypto::Digest;
 use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
-use ed25519_dalek::{Digest as _, Sha512};
+use sha2::{Digest as Sha2DigestTrait, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::{CancelHandler, ReliableSender, SimpleSender}; // THÊM CancelHandler

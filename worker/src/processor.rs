@@ -4,8 +4,7 @@
 use bytes::Bytes;
 use config::WorkerId;
 use crypto::Digest;
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
+use sha2::{Digest as Sha2DigestTrait, Sha512};
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;

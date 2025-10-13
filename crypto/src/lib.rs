@@ -1,8 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use ed25519_dalek as dalek;
-use ed25519_dalek::ed25519;
-use ed25519_dalek::Signer as _;
-use rand::rngs::OsRng;
+use fastcrypto::ed25519::{Ed25519KeyPair, Ed25519PublicKey, Ed25519PrivateKey, Ed25519Signature};
+use fastcrypto::encoding::{Base64, Encoding};
+use fastcrypto::traits::{KeyPair, Signer, ToFromBytes, VerifyingKey, AllowedRng};
+use fastcrypto::error::FastCryptoError;
+use rand::SeedableRng;
 use rand::{CryptoRng, RngCore};
 use serde::{de, ser, Deserialize, Serialize};
 use std::array::TryFromSliceError;
@@ -15,7 +16,7 @@ use tokio::sync::oneshot;
 #[path = "tests/crypto_tests.rs"]
 pub mod crypto_tests;
 
-pub type CryptoError = ed25519::Error;
+pub type CryptoError = FastCryptoError;
 
 /// Represents a hash digest (32 bytes).
 #[derive(Hash, PartialEq, Default, Eq, Clone, Deserialize, Serialize, Ord, PartialOrd)]
@@ -33,13 +34,13 @@ impl Digest {
 
 impl fmt::Debug for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", base64::encode(&self.0))
+        write!(f, "{}", Base64::encode(&self.0))
     }
 }
 
 impl fmt::Display for Digest {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", base64::encode(&self.0).get(0..16).unwrap())
+        write!(f, "{}", Base64::encode(&self.0).get(0..16).unwrap_or(""))
     }
 }
 
@@ -62,19 +63,20 @@ pub trait Hash {
 }
 
 /// Represents a public key (in bytes).
+// KHẮC PHỤC: Derive Copy để tương thích ngược với config/src/lib.rs.
 #[derive(Copy, Clone, Eq, PartialEq, Hash, Ord, PartialOrd, Default)]
 pub struct PublicKey(pub [u8; 32]);
 
 impl PublicKey {
     pub fn encode_base64(&self) -> String {
-        base64::encode(&self.0[..])
+        Base64::encode(&self.0[..])
     }
 
-    pub fn decode_base64(s: &str) -> Result<Self, base64::DecodeError> {
-        let bytes = base64::decode(s)?;
+    pub fn decode_base64(s: &str) -> Result<Self, FastCryptoError> {
+        let bytes = Base64::decode(s)?;
         let array = bytes[..32]
             .try_into()
-            .map_err(|_| base64::DecodeError::InvalidLength)?;
+            .map_err(|_| FastCryptoError::InvalidInput)?;
         Ok(Self(array))
     }
 }
@@ -87,7 +89,7 @@ impl fmt::Debug for PublicKey {
 
 impl fmt::Display for PublicKey {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.encode_base64().get(0..16).unwrap())
+        write!(f, "{}", self.encode_base64().get(0..16).unwrap_or(""))
     }
 }
 
@@ -118,19 +120,18 @@ impl AsRef<[u8]> for PublicKey {
 }
 
 /// Represents a secret key (in bytes).
-pub struct SecretKey([u8; 64]);
+pub struct SecretKey(Ed25519PrivateKey);
 
 impl SecretKey {
     pub fn encode_base64(&self) -> String {
-        base64::encode(&self.0[..])
+        Base64::encode(self.0.as_ref())
     }
 
-    pub fn decode_base64(s: &str) -> Result<Self, base64::DecodeError> {
-        let bytes = base64::decode(s)?;
-        let array = bytes[..64]
-            .try_into()
-            .map_err(|_| base64::DecodeError::InvalidLength)?;
-        Ok(Self(array))
+    pub fn decode_base64(s: &str) -> Result<Self, FastCryptoError> {
+        let bytes = Base64::decode(s)?;
+        let key = Ed25519PrivateKey::from_bytes(&bytes)
+            .map_err(|_| FastCryptoError::InvalidInput)?;
+        Ok(Self(key))
     }
 }
 
@@ -154,68 +155,65 @@ impl<'de> Deserialize<'de> for SecretKey {
     }
 }
 
-impl Drop for SecretKey {
-    fn drop(&mut self) {
-        self.0.iter_mut().for_each(|x| *x = 0);
-    }
-}
-
 pub fn generate_production_keypair() -> (PublicKey, SecretKey) {
-    generate_keypair(&mut OsRng)
+    let mut rng = rand::rngs::StdRng::from_entropy();
+    generate_keypair(&mut rng)
 }
 
 pub fn generate_keypair<R>(csprng: &mut R) -> (PublicKey, SecretKey)
 where
-    R: CryptoRng + RngCore,
+    R: CryptoRng + RngCore + AllowedRng,
 {
-    let keypair = dalek::Keypair::generate(csprng);
-    let public = PublicKey(keypair.public.to_bytes());
-    let secret = SecretKey(keypair.to_bytes());
+    let keypair = Ed25519KeyPair::generate(csprng);
+    
+    // KHẮC PHỤC: Chuyển đổi Ed25519PublicKey sang [u8; 32] để tạo PublicKey (Copy).
+    let public_bytes: [u8; 32] = keypair.public().as_ref().try_into().unwrap();
+    let public = PublicKey(public_bytes);
+
+    // Tạo SecretKey
+    let private_key = keypair.private();
+    let private_key_bytes = private_key.as_bytes();
+    
+    let secret_key = Ed25519PrivateKey::from_bytes(private_key_bytes).unwrap();
+    let secret = SecretKey(secret_key);
+    
     (public, secret)
 }
 
 /// Represents an ed25519 signature.
 #[derive(Serialize, Deserialize, Clone, Default, Debug)]
-pub struct Signature {
-    part1: [u8; 32],
-    part2: [u8; 32],
-}
+pub struct Signature(pub Ed25519Signature);
 
 impl Signature {
     pub fn new(digest: &Digest, secret: &SecretKey) -> Self {
-        let keypair = dalek::Keypair::from_bytes(&secret.0).expect("Unable to load secret key");
-        let sig = keypair.sign(&digest.0).to_bytes();
-        let part1 = sig[..32].try_into().expect("Unexpected signature length");
-        let part2 = sig[32..64].try_into().expect("Unexpected signature length");
-        Signature { part1, part2 }
-    }
-
-    fn flatten(&self) -> [u8; 64] {
-        [self.part1, self.part2]
-            .concat()
-            .try_into()
-            .expect("Unexpected signature length")
+        let keypair = Ed25519KeyPair::from_bytes(secret.0.as_bytes()).unwrap();
+        let signature = keypair.sign(digest.as_ref());
+        Self(signature)
     }
 
     pub fn verify(&self, digest: &Digest, public_key: &PublicKey) -> Result<(), CryptoError> {
-        let signature = ed25519::signature::Signature::from_bytes(&self.flatten())?;
-        let key = dalek::PublicKey::from_bytes(&public_key.0)?;
-        key.verify_strict(&digest.0, &signature)
+        // KHẮC PHỤC: Chuyển đổi PublicKey (byte array) thành Ed25519PublicKey để verify.
+        let fc_public_key = Ed25519PublicKey::from_bytes(&public_key.0)
+            .map_err(|_| FastCryptoError::InvalidInput)?;
+        fc_public_key.verify(digest.as_ref(), &self.0)
+            .map_err(CryptoError::from)
     }
 
     pub fn verify_batch<'a, I>(digest: &Digest, votes: I) -> Result<(), CryptoError>
     where
         I: IntoIterator<Item = &'a (PublicKey, Signature)>,
     {
-        let mut messages: Vec<&[u8]> = Vec::new();
-        let mut signatures: Vec<dalek::Signature> = Vec::new();
-        let mut keys: Vec<dalek::PublicKey> = Vec::new();
+        let mut verifications = Vec::new();
         for (key, sig) in votes.into_iter() {
-            messages.push(&digest.0[..]);
-            signatures.push(ed25519::signature::Signature::from_bytes(&sig.flatten())?);
-            keys.push(dalek::PublicKey::from_bytes(&key.0)?);
+            // KHẮC PHỤC: Chuyển đổi PublicKey (byte array) thành Ed25519PublicKey để verify.
+            let fc_key = Ed25519PublicKey::from_bytes(&key.0)
+                .map_err(|_| FastCryptoError::InvalidInput)?;
+            verifications.push(fc_key.verify(digest.as_ref(), &sig.0));
         }
-        dalek::verify_batch(&messages[..], &signatures[..], &keys[..])
+
+        verifications.into_iter().collect::<Result<Vec<_>, _>>()
+            .map_err(CryptoError::from)?;
+        Ok(())
     }
 }
 

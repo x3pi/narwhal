@@ -3,14 +3,14 @@ use crate::error::{DagError, DagResult};
 use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::{Digest, Hash, PublicKey, Signature, SignatureService};
-use ed25519_dalek::Digest as _;
-use ed25519_dalek::Sha512;
+use sha2::{Digest as Sha2DigestTrait, Sha512};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::TryInto;
 use std::fmt;
 
-#[derive(Clone, Serialize, Deserialize, Default)]
+// XÓA Default khỏi derive
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Header {
     pub author: PublicKey,
     pub round: Round,
@@ -18,6 +18,19 @@ pub struct Header {
     pub parents: BTreeSet<Digest>,
     pub id: Digest,
     pub signature: Signature,
+}
+
+impl Default for Header {
+    fn default() -> Self {
+        Self {
+            author: PublicKey::default(), // Sử dụng PublicKey::default() mới
+            round: 0,
+            payload: BTreeMap::new(),
+            parents: BTreeSet::new(),
+            id: Digest::default(),
+            signature: Signature::default(),
+        }
+    }
 }
 
 impl Header {
@@ -51,7 +64,7 @@ impl Header {
 
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
-        ensure!(voting_rights > 0, DagError::UnknownAuthority(self.author));
+        ensure!(voting_rights > 0, DagError::UnknownAuthority(self.author.clone()));
 
         // Ensure all worker ids are correct.
         for worker_id in self.payload.values() {
@@ -70,14 +83,14 @@ impl Header {
 impl Hash for Header {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(&self.author);
+        hasher.update(self.author.as_ref());
         hasher.update(self.round.to_le_bytes());
         for (x, y) in &self.payload {
-            hasher.update(x);
+            hasher.update(x.as_ref());
             hasher.update(y.to_le_bytes());
         }
         for x in &self.parents {
-            hasher.update(x);
+            hasher.update(x.as_ref());
         }
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
@@ -120,8 +133,8 @@ impl Vote {
         let vote = Self {
             id: header.id.clone(),
             round: header.round,
-            origin: header.author,
-            author: *author,
+            origin: header.author.clone(),
+            author: author.clone(), // SỬA LỖI: Sử dụng clone()
             signature: Signature::default(),
         };
         let signature = signature_service.request_signature(vote.digest()).await;
@@ -132,7 +145,7 @@ impl Vote {
         // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
-            DagError::UnknownAuthority(self.author)
+            DagError::UnknownAuthority(self.author.clone())
         );
 
         // Check the signature.
@@ -145,9 +158,9 @@ impl Vote {
 impl Hash for Vote {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(&self.id);
+        hasher.update(self.id.as_ref());
         hasher.update(self.round.to_le_bytes());
-        hasher.update(&self.origin);
+        hasher.update(self.origin.as_ref());
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 }
@@ -178,7 +191,7 @@ impl Certificate {
             .keys()
             .map(|name| Self {
                 header: Header {
-                    author: *name,
+                    author: name.clone(), // Sử dụng clone()
                     ..Header::default()
                 },
                 ..Self::default()
@@ -199,10 +212,10 @@ impl Certificate {
         let mut weight = 0;
         let mut used = HashSet::new();
         for (name, _) in self.votes.iter() {
-            ensure!(!used.contains(name), DagError::AuthorityReuse(*name));
+            ensure!(!used.contains(name), DagError::AuthorityReuse(name.clone()));
             let voting_rights = committee.stake(name);
-            ensure!(voting_rights > 0, DagError::UnknownAuthority(*name));
-            used.insert(*name);
+            ensure!(voting_rights > 0, DagError::UnknownAuthority(name.clone()));
+            used.insert(name.clone());
             weight += voting_rights;
         }
         ensure!(
@@ -219,16 +232,16 @@ impl Certificate {
     }
 
     pub fn origin(&self) -> PublicKey {
-        self.header.author
+        self.header.author.clone() // Sử dụng clone()
     }
 }
 
 impl Hash for Certificate {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
-        hasher.update(&self.header.id);
+        hasher.update(self.header.id.as_ref());
         hasher.update(self.round().to_le_bytes());
-        hasher.update(&self.origin());
+        hasher.update(self.origin().as_ref());
         Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
     }
 }
