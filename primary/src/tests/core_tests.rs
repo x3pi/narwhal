@@ -13,8 +13,8 @@ use tokio::sync::mpsc::channel;
 async fn process_header() {
     let mut keys = keys();
     let _ = keys.pop().unwrap(); // Skip the header' author.
-    let (name, secret) = keys.pop().unwrap();
-    let mut signature_service = SignatureService::new(secret);
+    let (name, _,_,consensus_secret) = keys.pop().unwrap();
+    let mut signature_service = SignatureService::new(consensus_secret);
 
     let committee = committee_with_base_port(13_000);
 
@@ -94,8 +94,8 @@ async fn process_header() {
 
 #[tokio::test]
 async fn process_header_missing_parent() {
-    let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let (name, _,__,consensus_secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(consensus_secret);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
@@ -156,8 +156,8 @@ async fn process_header_missing_parent() {
 
 #[tokio::test]
 async fn process_header_missing_payload() {
-    let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let (name, _,__,consensus_secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(consensus_secret);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
@@ -218,8 +218,8 @@ async fn process_header_missing_payload() {
 
 #[tokio::test]
 async fn process_votes() {
-    let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let (name, _,__,consensus_secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(consensus_secret);
 
     let committee = committee_with_base_port(13_100);
 
@@ -294,8 +294,8 @@ async fn process_votes() {
 
 #[tokio::test]
 async fn process_certificates() {
-    let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    let (name, _,__,consensus_secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(consensus_secret);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);

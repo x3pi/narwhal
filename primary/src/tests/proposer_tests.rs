@@ -7,8 +7,9 @@ use tokio::sync::mpsc::channel;
 
 #[tokio::test]
 async fn propose_empty() {
-    let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    // Lấy đúng khóa đồng thuận (consensus_secret) để khởi tạo SignatureService.
+    let (name, _, _, consensus_secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(consensus_secret);
 
     let (_tx_parents, rx_parents) = channel(1);
     let (_tx_our_digests, rx_our_digests) = channel(1);
@@ -41,8 +42,9 @@ async fn propose_empty() {
 
 #[tokio::test]
 async fn propose_payload() {
-    let (name, secret) = keys().pop().unwrap();
-    let signature_service = SignatureService::new(secret);
+    // Lấy đúng khóa đồng thuận (consensus_secret) để khởi tạo SignatureService.
+    let (name, _, _, consensus_secret) = keys().pop().unwrap();
+    let signature_service = SignatureService::new(consensus_secret);
 
     let (_tx_parents, rx_parents) = channel(1);
     let (tx_our_digests, rx_our_digests) = channel(1);
@@ -67,7 +69,8 @@ async fn propose_payload() {
     );
 
     // Send enough digests for the header payload.
-    let digest = Digest(name.0);
+    // Sửa lỗi: Tạo một digest hợp lệ thay vì sử dụng sai kiểu dữ liệu.
+    let digest = Digest::default();
     let worker_id = 0;
     let batch = Vec::new(); // Proposer giờ cần cả batch
     tx_our_digests

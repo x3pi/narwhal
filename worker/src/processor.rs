@@ -4,7 +4,8 @@
 use bytes::Bytes;
 use config::WorkerId;
 use crypto::Digest;
-use sha2::{Digest as Sha2DigestTrait, Sha512};
+use sha3::{Digest as Sha3Digest};
+use sha3::Sha3_512 as Sha512;
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
 use std::convert::TryInto;

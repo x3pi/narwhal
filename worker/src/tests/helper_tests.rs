@@ -7,7 +7,7 @@ use tokio::sync::mpsc::channel;
 #[tokio::test]
 async fn batch_reply() {
     let (tx_request, rx_request) = channel(1);
-    let (requestor, _) = keys().pop().unwrap();
+    let (requestor, _, _) = keys().pop().unwrap();
     let id = 0;
     let committee = committee_with_base_port(8_000);
 

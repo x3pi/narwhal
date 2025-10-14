@@ -3,32 +3,38 @@ use crate::batch_maker::{Batch, Transaction};
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
-use crypto::{generate_keypair, Digest, PublicKey, SecretKey};
-use sha2::{Digest as Sha2DigestTrait, Sha512};
+use crypto::{
+    generate_consensus_keypair, generate_keypair, Digest, PublicKey, SecretKey, ConsensusPublicKey
+};
 use log::warn;
+use network::quic::QuicTransport;
+use network::transport::Transport;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
+use sha3::{Digest as Sha3DigestTrait, Sha3_512};
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::task::JoinHandle;
 
-// SỬA ĐỔI: Import các thành phần QUIC.
-use network::quic::QuicTransport;
-use network::transport::Transport;
-
-// Fixture
-pub fn keys() -> Vec<(PublicKey, SecretKey)> {
+// Fixture to generate keypairs.
+pub fn keys() -> Vec<(PublicKey, SecretKey, ConsensusPublicKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
-    (0..4).map(|_| generate_keypair(&mut rng)).collect()
+    (0..4)
+        .map(|_| {
+            let (pk, sk) = generate_keypair(&mut rng);
+            let (cpk, _) = generate_consensus_keypair(&mut rng);
+            (pk, sk, cpk)
+        })
+        .collect()
 }
 
-// Fixture
+// Fixture to create a committee.
 pub fn committee() -> Committee {
     Committee {
         authorities: keys()
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(i, (id, _))| {
+            .map(|(i, (id, _, consensus_key))| {
                 let primary = PrimaryAddresses {
                     primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
                     worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
@@ -41,13 +47,13 @@ pub fn committee() -> Committee {
                         worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
                     },
                 )]
-                .iter()
-                .cloned()
+                .into_iter()
                 .collect();
                 (
-                    *id,
+                    id,
                     Authority {
                         stake: 1,
+                        consensus_key,
                         primary,
                         workers,
                     },
@@ -57,7 +63,7 @@ pub fn committee() -> Committee {
     }
 }
 
-// Fixture.
+// Fixture to create a committee with a specific base port.
 pub fn committee_with_base_port(base_port: u16) -> Committee {
     let mut committee = committee();
     for authority in committee.authorities.values_mut() {
@@ -83,65 +89,65 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
     committee
 }
 
-// Fixture
+// Fixture for a single transaction.
 pub fn transaction() -> Transaction {
     vec![0; 100]
 }
 
-// Fixture
+// Fixture for a batch of transactions.
 pub fn batch() -> Batch {
     vec![transaction(), transaction()]
 }
 
-// Fixture
+// Fixture for a serialized batch message.
 pub fn serialized_batch() -> Vec<u8> {
     let message = WorkerMessage::Batch(batch());
     bincode::serialize(&message).unwrap()
 }
 
-// Fixture
+// Fixture for the digest of a serialized batch.
 pub fn batch_digest() -> Digest {
     Digest(
-        Sha512::digest(&serialized_batch()).as_slice()[..32]
+        Sha3_512::digest(&serialized_batch()).as_slice()[..32]
             .try_into()
             .unwrap(),
     )
 }
 
-// Fixture
-// SỬA LỖI: Listener này bây giờ có thể xử lý nhiều kết nối (ví dụ: khi sender kết nối lại).
+// A fixture for a test network listener.
 pub fn listener(address: SocketAddr, expected: Option<Bytes>) -> JoinHandle<()> {
     tokio::spawn(async move {
         let transport = QuicTransport::new();
         let mut listener = transport.listen(address).await.unwrap();
 
-        // Vòng lặp bên ngoài để chấp nhận nhiều kết nối.
+        // Loop to accept multiple connections (useful for retries).
         loop {
             let (mut connection, peer) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(e) => {
                     warn!("Listener failed to accept connection: {}", e);
-                    continue; // Chờ kết nối tiếp theo.
+                    continue;
                 }
             };
 
-            // Vòng lặp bên trong để xử lý tin nhắn trên kết nối hiện tại.
+            // Loop to process messages on the current connection.
             loop {
                 match connection.recv().await {
                     Ok(Some(received)) => {
                         connection.send(Bytes::from("Ack")).await.unwrap();
-                        
-                        // Nếu có tin nhắn mong đợi và khớp, task listener hoàn thành.
+
                         if let Some(ref expected_bytes) = expected {
                             if received == *expected_bytes {
-                                return;
+                                return; // End the task when the expected message is received.
                             }
                         }
                     }
-                    // Client đóng kết nối, thoát vòng lặp trong để chờ kết nối mới.
-                    Ok(None) => break,
+                    Ok(None) => break, // Connection closed by peer.
                     Err(e) => {
-                        warn!("Listener ({}) connection error: {}. Ready for new connection.", peer, e);
+                        warn!(
+                            "Listener ({}) connection error: {}. Ready for new connection.",
+                            peer, e
+                        );
                         break;
                     }
                 }
@@ -149,3 +155,4 @@ pub fn listener(address: SocketAddr, expected: Option<Bytes>) -> JoinHandle<()> 
         }
     })
 }
+

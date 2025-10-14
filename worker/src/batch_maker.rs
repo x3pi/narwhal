@@ -6,7 +6,7 @@ use bytes::Bytes;
 use crypto::Digest;
 use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
-use sha2::{Digest as Sha2DigestTrait, Sha512};
+use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::{CancelHandler, ReliableSender, SimpleSender}; // THÊM CancelHandler

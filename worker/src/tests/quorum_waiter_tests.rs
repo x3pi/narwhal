@@ -11,7 +11,7 @@ use tokio::sync::mpsc::channel;
 async fn wait_for_quorum() {
     let (tx_message, rx_message) = channel(1);
     let (tx_batch, mut rx_batch) = channel(1);
-    let (myself, _) = keys().pop().unwrap();
+    let (myself, _,_) = keys().pop().unwrap();
     let committee = committee_with_base_port(7_000);
 
     // Spawn a `QuorumWaiter` instance.

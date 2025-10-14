@@ -1,16 +1,24 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{
-    batch, batch_digest, committee_with_base_port, keys, listener, serialized_batch, transaction,
-}; // Thêm import
-use bytes::Bytes; // Thêm import
+    batch_digest, committee_with_base_port, keys, listener, serialized_batch, transaction,
+};
+use bytes::Bytes;
+use log::info;
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
 use std::fs;
 
 #[tokio::test]
+
 async fn handle_clients_transactions() {
-    let (name, _) = keys().pop().unwrap();
+    println!("Starting test: handle_clients_transactions");
+
+    // Khởi tạo logger để xem output.
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // Sửa lỗi: Destructure tuple trả về từ `keys()` cho đúng.
+    let (name, _, _) = keys().pop().unwrap();
     let id = 0;
     let committee = committee_with_base_port(11_000);
     let parameters = Parameters {
@@ -18,36 +26,65 @@ async fn handle_clients_transactions() {
         ..Parameters::default()
     };
 
-    // Create a new test store.
+    // Tạo một test store mới.
     let path = ".db_test_handle_clients_transactions";
     let _ = fs::remove_dir_all(path);
     let store = Store::new(path).unwrap();
+    println!("Store created at '{}'", path);
 
-    // Spawn a `Worker` instance.
-    Worker::spawn(name, id, committee.clone(), parameters, store).await; // THÊM .await
+    // Spawn một `Worker` instance.
+    println!("Spawning worker instance for node '{}', worker id {}", name, id);
+    Worker::spawn(name, id, committee.clone(), parameters, store).await;
+    println!("Worker instance spawned");
 
-    // Spawn a network listener to receive our batch's digest.
+    // Spawn một network listener để giả lập Primary, nhận message từ worker.
     let primary_address = committee.primary(&name).unwrap().worker_to_primary;
+    println!("Setting up primary listener at {}", primary_address);
 
-    // Listener bây giờ sẽ mong đợi nhận được message có cả nội dung batch.
     let batch_content = serialized_batch();
-    let expected_message =
-        WorkerPrimaryMessage::OurBatch(batch_digest(), id, batch_content.clone());
+    let expected_message = WorkerPrimaryMessage::OurBatch(batch_digest(), id, batch_content.clone());
     let expected_serialized = bincode::serialize(&expected_message).unwrap();
-    let handle = listener(primary_address, Some(Bytes::from(expected_serialized)));
+    let primary_handle = listener(primary_address, Some(Bytes::from(expected_serialized)));
+    println!("Primary listener is ready");
 
-    // Spawn enough workers' listeners to acknowledge our batches.
-    for (_, addresses) in committee.others_workers(&name, &id) {
+    // Spawn các listener cho các worker khác để nhận batch được broadcast.
+    println!("Spawning other worker listeners...");
+    let mut worker_handles = Vec::new();
+    let expected_batch_broadcast = Bytes::from(batch_content);
+    for (i, (worker_name, addresses)) in committee.others_workers(&name, &id).iter().enumerate() {
         let address = addresses.worker_to_worker;
-        let _ = listener(address, /* expected */ None);
+        println!(
+            "Spawning listener for other worker {} ('{}') at {}",
+            i, worker_name, address
+        );
+        let handle = listener(address, Some(expected_batch_broadcast.clone()));
+        worker_handles.push(handle);
     }
+    println!("All other worker listeners are ready");
 
-    // Send enough transactions to create a batch.
+    // Gửi đủ transaction để tạo một batch.
     let mut network = SimpleSender::new();
     let address = committee.worker(&name, &id).unwrap().transactions;
+    println!("Sending transactions to worker at {}", address);
     network.send(address, Bytes::from(transaction())).await;
     network.send(address, Bytes::from(transaction())).await;
+    println!("All transactions sent");
 
-    // Ensure the primary received the batch's digest (ie. it did not panic).
-    assert!(handle.await.is_ok());
+    // Đảm bảo Primary nhận được message.
+    println!("Waiting for primary to receive the batch message...");
+    assert!(primary_handle.await.is_ok(), "Primary listener failed");
+    println!("Primary received message successfully.");
+
+    // Đảm bảo các worker khác cũng nhận được batch.
+    println!("Waiting for other workers to receive the broadcasted batch...");
+    for (i, handle) in worker_handles.into_iter().enumerate() {
+        assert!(
+            handle.await.is_ok(),
+            "Listener for other worker {} failed",
+            i
+        );
+    }
+    println!("Other workers received batch successfully.");
+
+    println!("Test handle_clients_transactions finished successfully");
 }

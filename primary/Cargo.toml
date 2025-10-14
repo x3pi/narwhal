@@ -18,7 +18,7 @@ log = "0.4.11"
 async-recursion = "0.3.2"
 async-trait = "0.1.50"
 anyhow = "1.0"
-sha2 = "0.10.6"
+sha3 = "0.10.6"
 
 crypto = { path = "../crypto" }
 store = { path = "../store" }

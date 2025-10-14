@@ -3,7 +3,10 @@ use crate::messages::{Certificate, Header, Vote};
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
-use crypto::{generate_keypair, PublicKey, SecretKey, Signature};
+use crypto::{
+    generate_consensus_keypair, generate_keypair,ConsensusPublicKey,  ConsensusSecretKey, Digest, PublicKey, SecretKey,
+    Signature,
+};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use std::net::SocketAddr;
@@ -25,19 +28,25 @@ impl PartialEq for Vote {
     }
 }
 
-// Fixture
-pub fn keys() -> Vec<(PublicKey, SecretKey)> {
+// Fixture: Cập nhật để tạo cả khóa mạng và khóa đồng thuận.
+pub fn keys() -> Vec<(PublicKey, SecretKey, ConsensusPublicKey, ConsensusSecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
-    (0..4).map(|_| generate_keypair(&mut rng)).collect()
+    (0..4)
+        .map(|_| {
+            let (pk, sk) = generate_keypair(&mut rng);
+            let (cpk, csk) = generate_consensus_keypair(&mut rng);
+            (pk, sk, cpk, csk)
+        })
+        .collect()
 }
 
-// Fixture
+// Fixture: Cập nhật để thêm consensus_key vào Authority.
 pub fn committee() -> Committee {
     Committee {
         authorities: keys()
-            .iter()
+            .into_iter()
             .enumerate()
-            .map(|(i, (id, _))| {
+            .map(|(i, (id, _, consensus_key, _))| {
                 let primary = PrimaryAddresses {
                     primary_to_primary: format!("127.0.0.1:{}", 100 + i).parse().unwrap(),
                     worker_to_primary: format!("127.0.0.1:{}", 200 + i).parse().unwrap(),
@@ -50,13 +59,13 @@ pub fn committee() -> Committee {
                         worker_to_worker: format!("127.0.0.1:{}", 500 + i).parse().unwrap(),
                     },
                 )]
-                .iter()
-                .cloned()
+                .into_iter()
                 .collect();
                 (
-                    *id,
+                    id,
                     Authority {
                         stake: 1,
+                        consensus_key,
                         primary,
                         workers,
                     },
@@ -92,9 +101,9 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
     committee
 }
 
-// Fixture
+// Fixture: Cập nhật để ký bằng ConsensusSecretKey.
 pub fn header() -> Header {
-    let (author, secret) = keys().pop().unwrap();
+    let (author, _, _, secret) = keys().pop().unwrap();
     let header = Header {
         author,
         round: 1,
@@ -104,18 +113,19 @@ pub fn header() -> Header {
             .collect(),
         ..Header::default()
     };
+    let id = header.digest();
     Header {
-        id: header.digest(),
-        signature: Signature::new(&header.digest(), &secret),
+        id: id.clone(),
+        signature: Signature::new(&id, &secret),
         ..header
     }
 }
 
-// Fixture
+// Fixture: Cập nhật để ký bằng ConsensusSecretKey.
 pub fn headers() -> Vec<Header> {
     keys()
         .into_iter()
-        .map(|(author, secret)| {
+        .map(|(author, _, _, secret)| {
             let header = Header {
                 author,
                 round: 1,
@@ -125,20 +135,21 @@ pub fn headers() -> Vec<Header> {
                     .collect(),
                 ..Header::default()
             };
+            let id = header.digest();
             Header {
-                id: header.digest(),
-                signature: Signature::new(&header.digest(), &secret),
+                id: id.clone(),
+                signature: Signature::new(&id, &secret),
                 ..header
             }
         })
         .collect()
 }
 
-// Fixture
+// Fixture: Cập nhật để ký bằng ConsensusSecretKey.
 pub fn votes(header: &Header) -> Vec<Vote> {
     keys()
         .into_iter()
-        .map(|(author, secret)| {
+        .map(|(author, _, _, secret)| {
             let vote = Vote {
                 id: header.id.clone(),
                 round: header.round,
@@ -146,8 +157,9 @@ pub fn votes(header: &Header) -> Vec<Vote> {
                 author,
                 signature: Signature::default(),
             };
+            let digest = vote.digest();
             Vote {
-                signature: Signature::new(&vote.digest(), &secret),
+                signature: Signature::new(&digest, &secret),
                 ..vote
             }
         })
@@ -158,7 +170,7 @@ pub fn votes(header: &Header) -> Vec<Vote> {
 pub fn certificate(header: &Header) -> Certificate {
     Certificate {
         header: header.clone(),
-        votes: votes(&header)
+        votes: votes(header)
             .into_iter()
             .map(|x| (x.author, x.signature))
             .collect(),
