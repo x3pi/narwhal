@@ -12,14 +12,13 @@ use tokio::sync::mpsc::{channel, Receiver};
 use worker::{Worker, WorkerMessage};
 use consensus::{ConsensusProtocol, Tusk, Bullshark};
 
-use std::io::Write;
+// use std::io::Write;
 
 // Thêm các use statements cần thiết
 use bytes::{BufMut, BytesMut};
 use prost::Message;
 use tokio::io::AsyncWriteExt;
-// SỬA LỖI: Loại bỏ `use` không cần thiết.
-// use tokio::net::UnixStream;
+use tokio::net::UnixStream;
 
 // Thêm module để import các struct được tạo bởi prost
 pub mod comm {
@@ -27,7 +26,7 @@ pub mod comm {
 }
 
 /// The default channel capacity.
-pub const CHANNEL_CAPACITY: usize = 1_000;
+pub const CHANNEL_CAPACITY: usize = 10_000;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -166,45 +165,45 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
 async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {
-    // fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
-    //     loop {
-    //         if value < 0x80 {
-    //             buf.put_u8(value as u8);
-    //             break;
-    //         }
-    //         buf.put_u8(((value & 0x7F) | 0x80) as u8);
-    //         value >>= 7;
-    //     }
-    // }
+    fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
+        loop {
+            if value < 0x80 {
+                buf.put_u8(value as u8);
+                break;
+            }
+            buf.put_u8(((value & 0x7F) | 0x80) as u8);
+            value >>= 7;
+        }
+    }
     
-    // let socket_path = format!("/tmp/executor{}.sock", node_id);
-    // log::info!(
-    //     "[ANALYZE] Node ID {} attempting to connect to {}",
-    //     node_id,
-    //     socket_path
-    // );
+    let socket_path = format!("/tmp/executor{}.sock", node_id);
+    log::info!(
+        "[ANALYZE] Node ID {} attempting to connect to {}",
+        node_id,
+        socket_path
+    );
     
-    // let mut stream = loop { 
-    //     match UnixStream::connect(&socket_path).await {
-    //         Ok(stream) => {
-    //             log::info!(
-    //                 "[ANALYZE] Node ID {} connected successfully to {}",
-    //                 node_id,
-    //                 socket_path
-    //             );
-    //             break stream;
-    //         }
-    //         Err(e) => {
-    //             log::warn!(
-    //                 "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
-    //                 node_id,
-    //                 socket_path,
-    //                 e
-    //             );
-    //             tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-    //         }
-    //     }
-    // };
+    let mut stream = loop { 
+        match UnixStream::connect(&socket_path).await {
+            Ok(stream) => {
+                log::info!(
+                    "[ANALYZE] Node ID {} connected successfully to {}",
+                    node_id,
+                    socket_path
+                );
+                break stream;
+            }
+            Err(e) => {
+                log::warn!(
+                    "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
+                    node_id,
+                    socket_path,
+                    e
+                );
+                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
     log::info!(
         "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
         node_id
@@ -217,106 +216,106 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             certificate.header.round
         );
 
-        // let mut all_transactions = Vec::new();
+        let mut all_transactions = Vec::new();
 
-        // for (digest, worker_id) in certificate.header.payload {
-        //     match store.read(digest.to_vec()).await {
-        //         Ok(Some(serialized_batch_message)) => {
-        //             match bincode::deserialize(&serialized_batch_message) {
-        //                 Ok(WorkerMessage::Batch(batch)) => {
-        //                     log::debug!(
-        //                         "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
-        //                         digest,
-        //                         batch.len(),
-        //                         worker_id
-        //                     );
-        //                     for tx_data in batch {
-        //                         all_transactions.push(comm::Transaction {
-        //                             digest: tx_data,
-        //                             worker_id: worker_id as u32,
-        //                         });
-        //                     }
-        //                 }
-        //                 Ok(_) => {
-        //                     log::warn!(
-        //                         "[ANALYZE] Digest {} did not correspond to a Batch message.",
-        //                         digest
-        //                     );
-        //                 }
-        //                 Err(e) => {
-        //                     log::error!(
-        //                         "[ANALYZE] Failed to deserialize message for digest {}: {}",
-        //                         digest,
-        //                         e
-        //                     );
-        //                 }
-        //             }
-        //         }
-        //         Ok(None) => {
-        //             log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
-        //         }
-        //         Err(e) => {
-        //             log::error!(
-        //                 "[ANALYZE] Failed to read batch for digest {}: {}",
-        //                 digest,
-        //                 e
-        //             );
-        //         }
-        //     }
-        // }
+        for (digest, worker_id) in certificate.header.payload {
+            match store.read(digest.to_vec()).await {
+                Ok(Some(serialized_batch_message)) => {
+                    match bincode::deserialize(&serialized_batch_message) {
+                        Ok(WorkerMessage::Batch(batch)) => {
+                            log::debug!(
+                                "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
+                                digest,
+                                batch.len(),
+                                worker_id
+                            );
+                            for tx_data in batch {
+                                all_transactions.push(comm::Transaction {
+                                    digest: tx_data,
+                                    worker_id: worker_id as u32,
+                                });
+                            }
+                        }
+                        Ok(_) => {
+                            log::warn!(
+                                "[ANALYZE] Digest {} did not correspond to a Batch message.",
+                                digest
+                            );
+                        }
+                        Err(e) => {
+                            log::error!(
+                                "[ANALYZE] Failed to deserialize message for digest {}: {}",
+                                digest,
+                                e
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {
+                    log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
+                }
+                Err(e) => {
+                    log::error!(
+                        "[ANALYZE] Failed to read batch for digest {}: {}",
+                        digest,
+                        e
+                    );
+                }
+            }
+        }
 
-        // let committed_block = comm::CommittedBlock {
-        //     epoch: certificate.header.round,
-        //     height: certificate.header.round,
-        //     transactions: all_transactions,
-        // };
+        let committed_block = comm::CommittedBlock {
+            epoch: certificate.header.round,
+            height: certificate.header.round,
+            transactions: all_transactions,
+        };
 
-        // let epoch_data = comm::CommittedEpochData {
-        //     blocks: vec![committed_block],
-        // };
+        let epoch_data = comm::CommittedEpochData {
+            blocks: vec![committed_block],
+        };
 
-        // log::debug!(
-        //     "[ANALYZE] Node ID {} serializing data for round {}",
-        //     node_id,
-        //     certificate.header.round
-        // );
-        // let mut proto_buf = BytesMut::new();
-        // epoch_data
-        //     .encode(&mut proto_buf)
-        //     .expect("FATAL: Protobuf serialization failed!");
+        log::debug!(
+            "[ANALYZE] Node ID {} serializing data for round {}",
+            node_id,
+            certificate.header.round
+        );
+        let mut proto_buf = BytesMut::new();
+        epoch_data
+            .encode(&mut proto_buf)
+            .expect("FATAL: Protobuf serialization failed!");
 
-        // let mut len_buf = BytesMut::new();
-        // put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+        let mut len_buf = BytesMut::new();
+        put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
 
-        // if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
-        //      log::info!("[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.", node_id, certificate.header.round);
-        // }
+        if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
+             log::info!("[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.", node_id, certificate.header.round);
+        }
 
-        // log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
+        log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
 
-        // if let Err(e) = stream.write_all(&len_buf).await {
-        //     log::error!(
-        //         "[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}",
-        //         node_id,
-        //         e
-        //     );
-        //     break;
-        // }
+        if let Err(e) = stream.write_all(&len_buf).await {
+            log::error!(
+                "[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}",
+                node_id,
+                e
+            );
+            break;
+        }
 
-        // if let Err(e) = stream.write_all(&proto_buf).await {
-        //     log::error!(
-        //         "[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}",
-        //         node_id,
-        //         e
-        //     );
-        //     break;
-        // }
+        if let Err(e) = stream.write_all(&proto_buf).await {
+            log::error!(
+                "[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}",
+                node_id,
+                e
+            );
+            break;
+        }
 
-        // log::info!(
-        //     "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
-        //     node_id,
-        //     certificate.header.round
-        // );
+        log::info!(
+            "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
+            node_id,
+            certificate.header.round
+        );
     }
 
     log::warn!(

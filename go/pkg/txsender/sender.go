@@ -1,108 +1,127 @@
-// File: txsender/sender.go
+// File: pkg/txsender/txsender.go
 package txsender
 
 import (
+	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"fmt"
-	"net"
+	"log"
 	"time"
+
+	"github.com/quic-go/quic-go"
 )
 
-// Client quản lý kết nối bền bỉ và tự động kết nối lại khi cần thiết.
+// Client quản lý kết nối QUIC bền bỉ đến node mempool.
 type Client struct {
 	targetAddress string
-	conn          net.Conn // Lưu trữ kết nối TCP bền bỉ
+	tlsConfig     *tls.Config
+	quicConfig    *quic.Config
+	connection    quic.Connection // Chỉ lưu kết nối, không lưu stream
 }
 
-// NewClient khởi tạo một client mới trỏ đến địa chỉ node mempool mục tiêu.
+// NewClient khởi tạo một client QUIC mới.
 func NewClient(targetAddress string) *Client {
-	return &Client{targetAddress: targetAddress}
+	// SỬA LỖI: ALPN phải là "narwhal" để khớp với server Rust.
+	tlsConfig := &tls.Config{
+		InsecureSkipVerify: true,
+	}
+
+	quicConfig := &quic.Config{
+		MaxIdleTimeout:  time.Minute,
+		KeepAlivePeriod: 30 * time.Second,
+	}
+
+	return &Client{
+		targetAddress: targetAddress,
+		tlsConfig:     tlsConfig,
+		quicConfig:    quicConfig,
+	}
 }
 
-// Connect thiết lập kết nối TCP đến node.
-// Hàm này được gọi tự động bởi SendTransaction nếu cần,
-// nhưng cũng có thể được gọi thủ công để kiểm tra kết nối ban đầu.
+// Connect thiết lập kết nối QUIC đến node.
 func (c *Client) Connect() error {
-	// Đóng kết nối cũ nếu tồn tại trước khi mở kết nối mới.
-	if c.conn != nil {
-		c.conn.Close()
+	if c.connection != nil {
+		c.Close()
 	}
 
-	// Thiết lập kết nối TCP mới.
-	conn, err := net.DialTimeout("tcp", c.targetAddress, 5*time.Second) // Thêm timeout để tránh treo vĩnh viễn
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := quic.DialAddr(ctx, c.targetAddress, c.tlsConfig, c.quicConfig)
 	if err != nil {
-		return fmt.Errorf("không thể kết nối đến %s: %w", c.targetAddress, err)
+		return fmt.Errorf("không thể kết nối QUIC đến %s: %w", c.targetAddress, err)
 	}
 
-	c.conn = conn
+	c.connection = conn
 	return nil
 }
 
-// Close đóng kết nối TCP đang hoạt động.
+// Close đóng kết nối QUIC.
 func (c *Client) Close() error {
-	if c.conn != nil {
-		err := c.conn.Close()
-		c.conn = nil // Đặt lại trạng thái để ensureConnected biết cần kết nối lại.
+	if c.connection != nil {
+		err := c.connection.CloseWithError(0, "client closing")
+		c.connection = nil
 		return err
 	}
 	return nil
 }
 
-// ensureConnected là hàm nội bộ để đảm bảo kết nối tồn tại trước khi thực hiện thao tác.
-func (c *Client) ensureConnected() error {
-	if c.conn == nil {
-		return c.Connect()
-	}
-	return nil
-}
-
-// writeData thực hiện logic gửi dữ liệu length-prefixed.
-func (c *Client) writeData(payload []byte) error {
-	// Chuẩn bị tiền tố độ dài (length prefix).
-	lenBuf := make([]byte, 4)
-	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
-
-	// Gửi tiền tố độ dài.
-	if _, err := c.conn.Write(lenBuf); err != nil {
-		return fmt.Errorf("lỗi khi gửi độ dài giao dịch: %w", err)
+// SendTransaction gửi một giao dịch qua một stream QUIC mới.
+func (c *Client) SendTransaction(payload []byte) error {
+	if c.connection == nil {
+		if err := c.Connect(); err != nil {
+			return fmt.Errorf("kết nối ban đầu thất bại: %w", err)
+		}
 	}
 
-	// Gửi payload giao dịch thực tế.
-	if _, err := c.conn.Write(payload); err != nil {
-		return fmt.Errorf("lỗi khi gửi payload giao dịch: %w", err)
-	}
-	return nil
-}
-
-// SendTransaction gửi một gói dữ liệu giao dịch.
-// Tự động kết nối nếu chưa kết nối, và thử kết nối lại một lần nếu gặp lỗi khi đang gửi.
-func (c *Client) SendTransaction(transactionPayload []byte) error {
-	// --- Bước 1: Đảm bảo đã kết nối trước khi thử gửi ---
-	if err := c.ensureConnected(); err != nil {
-		return fmt.Errorf("kết nối ban đầu thất bại: %w", err)
-	}
-
-	// --- Bước 2: Thử gửi dữ liệu lần đầu tiên ---
-	err := c.writeData(transactionPayload)
+	// Cố gắng gửi.
+	err := c.trySend(payload)
 	if err == nil {
-		return nil // Gửi thành công ngay lần đầu tiên.
+		return nil // Thành công.
 	}
 
-	// --- Bước 3: Xử lý lỗi (kết nối có thể đã mất) và thử lại ---
-	fmt.Printf("Cảnh báo: Gửi thất bại (%v), đang thử kết nối lại...\n", err)
-	c.Close() // Đóng kết nối cũ (đã hỏng).
-
-	// Cố gắng kết nối lại.
+	// Nếu thất bại, có thể do kết nối đã mất. Thử kết nối lại và gửi lần nữa.
+	log.Printf("Cảnh báo: Gửi thất bại (%v), đang thử kết nối lại...", err)
 	if reconnErr := c.Connect(); reconnErr != nil {
 		return fmt.Errorf("kết nối lại thất bại: %w", reconnErr)
 	}
 
-	fmt.Println("Kết nối lại thành công, đang gửi lại giao dịch.")
+	log.Println("Kết nối lại thành công, đang gửi lại giao dịch.")
 
-	// Thử gửi lại lần thứ hai trên kết nối mới.
-	if finalErr := c.writeData(transactionPayload); finalErr != nil {
+	// Thử gửi lại lần cuối.
+	if finalErr := c.trySend(payload); finalErr != nil {
 		return fmt.Errorf("gửi lại thất bại sau khi kết nối lại: %w", finalErr)
 	}
 
-	return nil // Gửi thành công ở lần thử lại.
+	return nil
+}
+
+// trySend thực hiện logic gửi dữ liệu trên một stream mới.
+func (c *Client) trySend(payload []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// SỬA LỖI: Mở một stream mới cho mỗi giao dịch.
+	stream, err := c.connection.OpenUniStreamSync(ctx)
+	if err != nil {
+		return fmt.Errorf("không thể mở stream mới: %w", err)
+	}
+	defer stream.Close()
+
+	// SỬA LỖI: Gửi 8-byte độ dài của payload trước.
+	lenBuf := make([]byte, 8)
+	binary.BigEndian.PutUint64(lenBuf, uint64(len(payload)))
+
+	// Gửi độ dài
+	if _, err := stream.Write(lenBuf); err != nil {
+		return fmt.Errorf("lỗi khi gửi độ dài giao dịch: %w", err)
+	}
+
+	// Gửi payload
+	if _, err := stream.Write(payload); err != nil {
+		return fmt.Errorf("lỗi khi gửi payload giao dịch: %w", err)
+	}
+
+	return nil
 }

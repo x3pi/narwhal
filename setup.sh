@@ -1,13 +1,14 @@
 #!/bin/bash
 
 # ==============================================================================
-# SETUP SCRIPT (Build + Generate Config)
+# SETUP SCRIPT (Build + Generate Config - Keep Data)
 # ==============================================================================
 
 set -e
 
 # --- Cấu hình Benchmark ---
-NODES=3
+NODES=10
+WORKERS_PER_NODE=2 
 HEADER_SIZE=1000
 MAX_HEADER_DELAY=200
 GC_DEPTH=50
@@ -34,12 +35,13 @@ echo "INFO: Building Go executor binary..."
 (cd go/cmd/exetps && go build -o ../../bin/exetps)
 
 # --- Stage 1: Cleanup ---
-echo "--- Stage 1: Cleanup ---"
+echo "--- Stage 1: Cleanup (Keeping Databases) ---"
 pkill -f "$NODE_BINARY" || true
 pkill -f "$CLIENT_BINARY" || true
 pkill -f "$EXECUTOR_BINARY" || true
 sleep 1
-rm -rf "$LOG_DIR" "$BENCHMARK_DIR"/db_* "$BENCHMARK_DIR"/.node* "$COMMITTEE_FILE" "$PARAMETERS_FILE"
+# SỬA ĐỔI: Xóa mọi thứ NGOẠI TRỪ các thư mục database (db_*)
+rm -rf "$LOG_DIR" "$BENCHMARK_DIR"/.node* "$COMMITTEE_FILE" "$PARAMETERS_FILE"
 mkdir -p "$LOG_DIR"
 
 # --- Stage 2: Generate Config ---
@@ -74,24 +76,37 @@ committee_json="$json_template"
 for i in $(seq 0 $((NODES-1))); do
     key_file="${key_files[$i]}"
     name=$(jq -r '.name' "$key_file")
+    consensus_key=$(jq -r '.consensus_key' "$key_file")
 
-    p2p_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*5))"
-    w2p_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*5 + 1))"
-    p2w_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*5 + 2))"
-    tx_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*5 + 3))"
-    w2w_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*5 + 4))"
+    p2p_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*100))"
+    w2p_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*100 + 1))"
+
+    # Tạo JSON cho các workers
+    workers_json="{}"
+    for j in $(seq 0 $((WORKERS_PER_NODE-1))); do
+        p2w_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*100 + 10 + j*10))"
+        tx_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*100 + 10 + j*10 + 1))"
+        w2w_addr="127.0.0.1:$((COMMITTEE_BASE_PORT + i*100 + 10 + j*10 + 2))"
+        worker_entry=$(jq -n \
+            --arg p2w "$p2w_addr" \
+            --arg tx "$tx_addr" \
+            --arg w2w "$w2w_addr" \
+            '{ "primary_to_worker": $p2w, "transactions": $tx, "worker_to_worker": $w2w }'
+        )
+        workers_json=$(echo "$workers_json" | jq --arg j_str "$j" --argjson entry "$worker_entry" '.[$j_str] = $entry')
+    done
 
     committee_json=$(echo "$committee_json" | jq \
       --arg name "$name" \
+      --arg consensus_key "$consensus_key" \
       --arg p2p "$p2p_addr" \
       --arg w2p "$w2p_addr" \
-      --arg p2w "$p2w_addr" \
-      --arg tx "$tx_addr" \
-      --arg w2w "$w2w_addr" \
+      --argjson workers "$workers_json" \
       '.authorities[$name] = {
-        "primary": { "primary_to_primary": $p2p, "worker_to_primary": $w2p },
         "stake": 1,
-        "workers": { "0": { "primary_to_worker": $p2w, "transactions": $tx, "worker_to_worker": $w2w } }
+        "consensus_key": $consensus_key,
+        "primary": { "primary_to_primary": $p2p, "worker_to_primary": $w2p },
+        "workers": $workers
       }'
     )
 done

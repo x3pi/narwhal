@@ -4,27 +4,42 @@ import (
 	"encoding/binary"
 	"log"
 
-	"github.com/meta-node-blockchain/meta-node/pkg/txsender"
-	// Thay thế bằng đường dẫn module thực tế của bạn.
+	"github.com/meta-node-blockchain/meta-node/pkg/txsender" // Sửa lại nếu cần
 )
 
 // createSampleTransaction tạo ra một payload giao dịch mẫu.
 func createSampleTransaction(id uint64, size int) []byte {
 	payload := make([]byte, size)
-	payload[0] = 16 // Loại giao dịch chuẩn
+	payload[0] = 0 // Loại giao dịch mẫu (sample transaction)
 	binary.BigEndian.PutUint64(payload[1:9], id)
 	return payload
 }
 
+// createRandomTransaction tạo ra một payload giao dịch ngẫu nhiên.
+func createRandomTransaction(randomValue uint64, size int) []byte {
+	payload := make([]byte, size)
+	payload[0] = 1 // Loại giao dịch ngẫu nhiên
+	binary.BigEndian.PutUint64(payload[1:9], randomValue)
+	return payload
+}
+
 func main() {
-	nodeAddress := "127.0.0.1:4003"
+	nodeAddress := "127.0.0.1:4111" // Thay đổi cổng này tới worker bạn muốn
 	transactionSize := 128
 
 	// 1. Khởi tạo client.
 	client := txsender.NewClient(nodeAddress)
+	defer client.Close()
 
-	// --- Gửi giao dịch 1 ---
-	// Không cần gọi Connect() trước, SendTransaction sẽ tự động làm điều đó.
+	// Connect() sẽ được gọi tự động bên trong SendTransaction,
+	// nhưng gọi trước ở đây giúp bắt lỗi kết nối sớm hơn.
+	log.Println("Đang kết nối đến node...")
+	if err := client.Connect(); err != nil {
+		log.Fatalf("Kết nối thất bại: %v", err)
+	}
+	log.Println("Kết nối thành công!")
+
+	// --- Gửi giao dịch 1 (sample transaction) ---
 	log.Println("Đang gửi giao dịch #1...")
 	txData1 := createSampleTransaction(101, transactionSize)
 	if err := client.SendTransaction(txData1); err != nil {
@@ -32,19 +47,13 @@ func main() {
 	}
 	log.Println("Giao dịch #1 đã gửi thành công.")
 
-	// --- Gửi giao dịch 2 ---
-	// Sẽ tái sử dụng kết nối từ lần gửi trước.
+	// --- Gửi giao dịch 2 (random transaction) ---
 	log.Println("Đang gửi giao dịch #2...")
-	txData2 := createSampleTransaction(102, transactionSize)
+	txData2 := createRandomTransaction(202, transactionSize)
 	if err := client.SendTransaction(txData2); err != nil {
 		log.Fatalf("Gửi giao dịch #2 thất bại: %v", err)
 	}
 	log.Println("Giao dịch #2 đã gửi thành công.")
 
-	// (Nếu máy chủ bị khởi động lại giữa giao dịch #1 và #2,
-	// client sẽ phát hiện lỗi ở giao dịch #2 và tự động kết nối lại.)
-
-	// 4. Đóng kết nối khi hoàn tất.
-	log.Println("Đóng kết nối.")
-	client.Close()
+	log.Println("Hoàn thành gửi giao dịch.")
 }
