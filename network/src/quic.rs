@@ -48,7 +48,7 @@ impl Listener for QuicListener {
             Some(conn) => conn,
             None => return Err("Endpoint closed".into()),
         };
-        
+
         let connection = connecting.await?;
         let addr = connection.remote_address();
         let conn = Box::new(QuicConnection { connection });
@@ -59,15 +59,22 @@ impl Listener for QuicListener {
 // --- Quic Transport Main Implementation ---
 #[derive(Clone)]
 pub struct QuicTransport {
-    client_config: ClientConfig,
+    // SỬA ĐỔI: Giữ một Endpoint duy nhất cho client để tái sử dụng.
+    client_endpoint: Endpoint,
     server_config: ServerConfig,
 }
 
 impl QuicTransport {
     pub fn new() -> Self {
         let (server_config, client_config) = configure_certificates();
+
+        // SỬA ĐỔI: Tạo client endpoint (socket) MỘT LẦN DUY NHẤT khi khởi tạo.
+        let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
+            .expect("Failed to create QUIC client endpoint");
+        client_endpoint.set_default_client_config(client_config);
+
         Self {
-            client_config,
+            client_endpoint,
             server_config,
         }
     }
@@ -82,10 +89,8 @@ impl Default for QuicTransport {
 #[async_trait]
 impl Transport for QuicTransport {
     async fn connect(&self, address: SocketAddr) -> TransportResult<Box<dyn Connection>> {
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-        endpoint.set_default_client_config(self.client_config.clone());
-
-        let connection = endpoint.connect(address, "localhost")?.await?;
+        // SỬA ĐỔI: Tái sử dụng endpoint đã được tạo sẵn thay vì tạo mới.
+        let connection = self.client_endpoint.connect(address, "localhost")?.await?;
         Ok(Box::new(QuicConnection { connection }))
     }
 
@@ -105,43 +110,34 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
 
     let mut transport_config = TransportConfig::default();
 
-    // === CẤU HÌNH CÂN BẰNG - HIỆU NĂNG TỐT MÀ KHÔNG QUÁ TẢI ===
-    
-    // Stream limits hợp lý
+    // Cấu hình hiệu năng
     transport_config.max_concurrent_uni_streams(VarInt::from_u32(10_000));
-    transport_config.max_concurrent_bidi_streams(VarInt::from_u32(1_000));
-    
-    // Buffer sizes vừa phải
     transport_config.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB
     transport_config.receive_window(VarInt::from_u32(4 * 1024 * 1024)); // 4MB
-    transport_config.send_window(8 * 1024 * 1024); // 8MB
-    
-    // Timeout hợp lý
-    transport_config.max_idle_timeout(Some(Duration::from_secs(30).try_into().unwrap()));
-    transport_config.keep_alive_interval(Some(Duration::from_secs(10)));
-    
-    // Initial RTT conservative
-    transport_config.initial_rtt(Duration::from_millis(100));
-    
+
+    // SỬA ĐỔI: Cấu hình timeout ngắn và keep-alive thường xuyên để phát hiện mất kết nối nhanh hơn.
+    transport_config.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
+    transport_config.keep_alive_interval(Some(Duration::from_secs(3)));
+
     let transport = Arc::new(transport_config);
 
-    // === SERVER CONFIG ===
+    // Cấu hình Server
     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key).unwrap();
     server_config.transport = transport.clone();
 
-    // === CLIENT CONFIG ===
+    // Cấu hình Client
     let client_crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
-    
+
     let mut client_config = ClientConfig::new(Arc::new(client_crypto));
     client_config.transport_config(transport);
 
     (server_config, client_config)
 }
 
-// Helper struct to skip server certificate verification
+// Helper struct để bỏ qua xác thực certificate của server (chỉ dùng cho môi trường dev)
 struct SkipServerVerification;
 
 impl rustls::client::ServerCertVerifier for SkipServerVerification {

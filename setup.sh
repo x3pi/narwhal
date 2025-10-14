@@ -7,7 +7,7 @@
 set -e
 
 # --- Cấu hình Benchmark ---
-NODES=10
+NODES=5
 WORKERS_PER_NODE=2 
 HEADER_SIZE=1000
 MAX_HEADER_DELAY=200
