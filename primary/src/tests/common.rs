@@ -4,8 +4,8 @@ use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::Hash as _;
 use crypto::{
-    generate_consensus_keypair, generate_keypair,ConsensusPublicKey,  ConsensusSecretKey, Digest, PublicKey, SecretKey,
-    Signature,
+    generate_consensus_keypair, generate_keypair, ConsensusPublicKey, ConsensusSecretKey,
+    PublicKey, SecretKey, Signature,
 };
 use rand::rngs::StdRng;
 use rand::SeedableRng;

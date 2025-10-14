@@ -9,12 +9,13 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
-use futures::sink::SinkExt as _;
 use log::{error, info, warn};
 use network::{
     quic::QuicTransport,
     transport::Transport,
-    MessageHandler, Receiver, SimpleSender, // Thêm SimpleSender vào import
+    MessageHandler,
+    Receiver,
+    SimpleSender, // Thêm SimpleSender vào import
     Writer,
 };
 use primary::PrimaryWorkerMessage;
@@ -29,7 +30,6 @@ pub mod worker_tests;
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
-pub type SerializedBatchDigestMessage = Vec<u8>;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
@@ -71,7 +71,6 @@ impl Worker {
         // worker.handle_workers_messages(&transport, tx_primary).await;
         worker.handle_clients_transactions(&transport).await;
         worker.handle_workers_messages(&transport).await;
-
 
         // SỬA ĐỔI: Xóa bỏ PrimaryConnector.
         // PrimaryConnector::spawn(
@@ -130,12 +129,11 @@ impl Worker {
     }
 
     async fn handle_clients_transactions(
-        
         &self,
         transport: &QuicTransport,
         // tx_primary: Sender<SerializedBatchDigestMessage>, // <--- XÓA PARAMETER NÀY
     ) {
-        log::info!("Worker: Processor will send to primary_address: {:?}", 222); 
+        log::info!("Worker: Processor will send to primary_address: {:?}", 222);
 
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -178,7 +176,10 @@ impl Worker {
             .primary(&self.name)
             .expect("Our public key is not in the committee")
             .worker_to_primary;
-        log::info!("Worker: Processor will send to primary_address: {:?}", primary_address); 
+        log::info!(
+            "Worker: Processor will send to primary_address: {:?}",
+            primary_address
+        );
         Processor::spawn(
             self.id,
             self.store.clone(),

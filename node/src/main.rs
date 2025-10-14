@@ -5,12 +5,12 @@ use config::Export as _;
 use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
+use consensus::{Bullshark, ConsensusProtocol};
 use env_logger::Env;
 use primary::{Certificate, Primary};
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver};
 use worker::{Worker, WorkerMessage};
-use consensus::{ConsensusProtocol, Tusk, Bullshark};
 
 // use std::io::Write;
 
@@ -116,7 +116,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-            
+
             tokio::spawn(Primary::spawn(
                 keypair,
                 committee.clone(),
@@ -125,7 +125,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 tx_new_certificates,
                 rx_feedback,
             ));
-            
+
             let committee_clone: Committee = committee.clone();
 
             Consensus::spawn(
@@ -145,11 +145,20 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         }
         ("worker", Some(sub_matches)) => {
             let id_str = sub_matches.value_of("id").unwrap();
-            let id = id_str
-                .parse::<WorkerId>()
-                .with_context(|| format!("Giá trị '{}' không phải là một số nguyên hợp lệ cho tham số --id", id_str))?;
-            
-            tokio::spawn(Worker::spawn(keypair.name, id, committee, parameters, store));
+            let id = id_str.parse::<WorkerId>().with_context(|| {
+                format!(
+                    "Giá trị '{}' không phải là một số nguyên hợp lệ cho tham số --id",
+                    id_str
+                )
+            })?;
+
+            tokio::spawn(Worker::spawn(
+                keypair.name,
+                id,
+                committee,
+                parameters,
+                store,
+            ));
         }
         _ => unreachable!(),
     }
@@ -161,7 +170,6 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     unreachable!();
 }
-
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
 async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {
@@ -175,15 +183,15 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             value >>= 7;
         }
     }
-    
+
     let socket_path = format!("/tmp/executor{}.sock", node_id);
     log::info!(
         "[ANALYZE] Node ID {} attempting to connect to {}",
         node_id,
         socket_path
     );
-    
-    let mut stream = loop { 
+
+    let mut stream = loop {
         match UnixStream::connect(&socket_path).await {
             Ok(stream) => {
                 log::info!(
@@ -288,7 +296,11 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
 
         if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
-             log::info!("[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.", node_id, certificate.header.round);
+            log::info!(
+                "[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.",
+                node_id,
+                certificate.header.round
+            );
         }
 
         log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);

@@ -14,12 +14,13 @@ use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use dashmap::DashMap;
-use futures::sink::SinkExt as _;
 use log::info;
 use network::{
     quic::QuicTransport, // <--- THAY ĐỔI
     transport::Transport,
-    MessageHandler, Receiver as NetworkReceiver, Writer,
+    MessageHandler,
+    Receiver as NetworkReceiver,
+    Writer,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -79,17 +80,22 @@ impl Primary {
 
         parameters.log();
         let name = keypair.name;
-        let secret = keypair.secret;
         let consensus_secret = keypair.consensus_secret;
 
         let consensus_round = Arc::new(AtomicU64::new(0));
-        
+
         // SỬA ĐỔI: Sử dụng QuicTransport.
         let transport = QuicTransport::new(); // <--- THAY ĐỔI
 
-        let mut primary_address = committee.primary(&name).expect("Our public key is not in the committee").primary_to_primary;
+        let mut primary_address = committee
+            .primary(&name)
+            .expect("Our public key is not in the committee")
+            .primary_to_primary;
         primary_address.set_ip("0.0.0.0".parse().unwrap());
-        let primary_listener = transport.listen(primary_address).await.expect("Failed to create primary listener");
+        let primary_listener = transport
+            .listen(primary_address)
+            .await
+            .expect("Failed to create primary listener");
 
         NetworkReceiver::spawn(
             primary_listener,
@@ -98,11 +104,20 @@ impl Primary {
                 tx_cert_requests,
             },
         );
-        info!("Primary {} listening to primary messages on {}", name, primary_address);
-        
-        let mut worker_address = committee.primary(&name).expect("Our public key is not in the committee").worker_to_primary;
+        info!(
+            "Primary {} listening to primary messages on {}",
+            name, primary_address
+        );
+
+        let mut worker_address = committee
+            .primary(&name)
+            .expect("Our public key is not in the committee")
+            .worker_to_primary;
         worker_address.set_ip("0.0.0.0".parse().unwrap());
-        let worker_listener = transport.listen(worker_address).await.expect("Failed to create worker listener");
+        let worker_listener = transport
+            .listen(worker_address)
+            .await
+            .expect("Failed to create worker listener");
 
         NetworkReceiver::spawn(
             worker_listener,
@@ -111,7 +126,10 @@ impl Primary {
                 tx_others_digests,
             },
         );
-        info!("Primary {} listening to workers messages on {}", name, worker_address);
+        info!(
+            "Primary {} listening to workers messages on {}",
+            name, worker_address
+        );
 
         let synchronizer = Synchronizer::new(
             name,
@@ -156,7 +174,11 @@ impl Primary {
             tx_headers_loopback,
         );
 
-        CertificateWaiter::spawn(store.clone(), rx_sync_certificates, tx_certificates_loopback);
+        CertificateWaiter::spawn(
+            store.clone(),
+            rx_sync_certificates,
+            tx_certificates_loopback,
+        );
 
         Proposer::spawn(
             name,
@@ -175,7 +197,11 @@ impl Primary {
         info!(
             "Primary {} successfully booted on {}",
             name,
-            committee.primary(&name).expect("Our public key is not in the committee").primary_to_primary.ip()
+            committee
+                .primary(&name)
+                .expect("Our public key is not in the committee")
+                .primary_to_primary
+                .ip()
         );
     }
 }
@@ -216,7 +242,11 @@ struct WorkerReceiverHandler {
 
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(
+        &self,
+        _writer: &mut Writer,
+        serialized: Bytes,
+    ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
             WorkerPrimaryMessage::OurBatch(digest, worker_id, batch) => self
                 .tx_our_digests

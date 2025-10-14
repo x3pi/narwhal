@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
-use crate::transport::{Connection as _, Transport};
+use crate::transport::Transport;
 use bytes::Bytes;
 use log::{info, warn};
 use rand::prelude::SliceRandom as _;
@@ -127,12 +127,15 @@ impl Connection {
                     info!("Outgoing connection established with {}", self.address);
                     delay = self.retry_delay;
                     retry = 0;
-                    
+
                     let error = self.keep_alive(connection).await;
                     warn!("{}", error);
                 }
                 Err(e) => {
-                    warn!("{}", NetworkError::FailedToConnect(self.address, retry, e.to_string()));
+                    warn!(
+                        "{}",
+                        NetworkError::FailedToConnect(self.address, retry, e.to_string())
+                    );
                     let timer = sleep(Duration::from_millis(delay));
                     tokio::pin!(timer);
 

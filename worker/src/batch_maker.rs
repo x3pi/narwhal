@@ -6,10 +6,10 @@ use bytes::Bytes;
 use crypto::Digest;
 use crypto::PublicKey;
 #[cfg(feature = "benchmark")]
-use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
-#[cfg(feature = "benchmark")]
 use log::info;
-use network::{CancelHandler, ReliableSender, SimpleSender}; // THÊM CancelHandler
+use network::{CancelHandler, SimpleSender}; // THÊM CancelHandler
+#[cfg(feature = "benchmark")]
+use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -40,8 +40,6 @@ pub struct BatchMaker {
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
-    network: ReliableSender,
-    /// A simple network sender.
     simple_network: SimpleSender,
 }
 
@@ -62,7 +60,6 @@ impl BatchMaker {
                 workers_addresses,
                 current_batch: Batch::with_capacity(batch_size * 2),
                 current_batch_size: 0,
-                network: ReliableSender::new(),
                 simple_network: SimpleSender::new(),
             }
             .run()
@@ -151,7 +148,6 @@ impl BatchMaker {
             .iter()
             .map(|_| tokio::sync::oneshot::channel::<Bytes>().1)
             .collect();
-
 
         // Send the batch through the deliver channel for further processing.
         self.tx_message

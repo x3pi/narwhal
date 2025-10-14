@@ -6,6 +6,7 @@ use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, error, info, log_enabled, warn};
+use primary::{Certificate, Round};
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
@@ -14,7 +15,6 @@ use store::Store;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
-use primary::{Certificate, Round};
 
 // ====================
 // ERROR DEFINITIONS
@@ -24,16 +24,16 @@ use primary::{Certificate, Round};
 pub enum ConsensusError {
     #[error("Failed to serialize state: {0}")]
     SerializationError(#[from] bincode::Error),
-    
+
     #[error("Store operation failed: {0}")]
     StoreError(String),
-    
+
     #[error("Missing round {0} in DAG")]
     MissingRound(Round),
-    
+
     #[error("Leader not found for round {0}")]
     LeaderNotFound(Round),
-    
+
     #[error("Channel send failed: {0}")]
     ChannelError(String),
 }
@@ -100,7 +100,7 @@ impl ConsensusState {
                 !authorities.is_empty() && r + gc_depth >= last_committed_round
             });
         }
-        
+
         if removed_count > 0 {
             debug!("GC removed {} certificates from DAG", removed_count);
         }
@@ -138,7 +138,7 @@ mod utils {
     {
         let mut to_commit = vec![leader.clone()];
         let mut current_leader = leader;
-        
+
         for r in (state.last_committed_round + 2..current_leader.round())
             .rev()
             .step_by(2)
@@ -163,7 +163,7 @@ mod utils {
     /// Kiểm tra xem có đường đi giữa hai leader hay không.
     fn linked(leader: &Certificate, prev_leader: &Certificate, dag: &Dag) -> bool {
         let mut parents = vec![leader];
-        
+
         for r in (prev_leader.round()..leader.round()).rev() {
             let round_certificates = match dag.get(&r) {
                 Some(certs) => certs,
@@ -175,19 +175,19 @@ mod utils {
                     return false;
                 }
             };
-            
+
             parents = round_certificates
                 .values()
                 .filter(|(digest, _)| parents.iter().any(|x| x.header.parents.contains(digest)))
                 .map(|(_, certificate)| certificate)
                 .collect();
-                
+
             if parents.is_empty() {
                 debug!("No parents found at round {}, path broken", r);
                 return false;
             }
         }
-        
+
         parents.contains(&prev_leader)
     }
 
@@ -198,14 +198,14 @@ mod utils {
         state: &ConsensusState,
     ) -> Vec<Certificate> {
         debug!("Ordering sub-dag from leader at round {}", leader.round());
-        
+
         let mut ordered = Vec::new();
         let mut already_ordered = HashSet::new();
         let mut buffer = vec![leader];
 
         while let Some(x) = buffer.pop() {
             ordered.push(x.clone());
-            
+
             for parent in &x.header.parents {
                 let (digest, certificate) = match state
                     .dag
@@ -214,7 +214,10 @@ mod utils {
                 {
                     Some(x) => x,
                     None => {
-                        debug!("Parent {} not found in DAG (already GC'd or not yet received)", parent);
+                        debug!(
+                            "Parent {} not found in DAG (already GC'd or not yet received)",
+                            parent
+                        );
                         continue;
                     }
                 };
@@ -225,7 +228,7 @@ mod utils {
                     .last_committed
                     .get(&certificate.origin())
                     .map_or(false, |r| r >= &certificate.round());
-                    
+
                 if !skip {
                     buffer.push(certificate);
                     already_ordered.insert(digest);
@@ -237,7 +240,7 @@ mod utils {
         let before_gc = ordered.len();
         ordered.retain(|x| x.round() + gc_depth >= state.last_committed_round);
         let after_gc = ordered.len();
-        
+
         if before_gc != after_gc {
             debug!("Filtered out {} GC'd certificates", before_gc - after_gc);
         }
@@ -261,7 +264,7 @@ pub trait ConsensusAlgorithm: Send + Sync {
         certificate: Certificate,
         metrics: &mut ConsensusMetrics,
     ) -> Result<(Vec<Certificate>, bool), ConsensusError>;
-    
+
     fn name(&self) -> &'static str;
 }
 
@@ -274,7 +277,10 @@ pub struct Tusk {
 impl Tusk {
     pub fn new(committee: Committee, gc_depth: Round) -> Self {
         info!("Initializing Tusk consensus with gc_depth={}", gc_depth);
-        Self { committee, gc_depth }
+        Self {
+            committee,
+            gc_depth,
+        }
     }
 
     fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
@@ -344,7 +350,7 @@ impl ConsensusAlgorithm for Tusk {
             .sum();
 
         let required_stake = self.committee.validity_threshold();
-        
+
         if stake < required_stake {
             debug!(
                 "Leader at round {} has insufficient stake ({}/{})",
@@ -353,7 +359,10 @@ impl ConsensusAlgorithm for Tusk {
             return Ok((Vec::new(), false));
         }
 
-        info!("Committing leader at round {} with stake {}/{}", leader_round, stake, required_stake);
+        info!(
+            "Committing leader at round {} with stake {}/{}",
+            leader_round, stake, required_stake
+        );
 
         // Order and commit
         let mut sequence = Vec::new();
@@ -389,17 +398,23 @@ pub struct Bullshark {
 
 impl Bullshark {
     pub fn new(committee: Committee, gc_depth: Round) -> Self {
-        info!("Initializing Bullshark consensus with gc_depth={}", gc_depth);
-        Self { committee, gc_depth }
+        info!(
+            "Initializing Bullshark consensus with gc_depth={}",
+            gc_depth
+        );
+        Self {
+            committee,
+            gc_depth,
+        }
     }
 
     /// Chọn leader theo round-robin deterministic
     /// ĐÂY LÀ CÁCH CHÍNH THỨC CỦA BULLSHARK/SUI
-    /// 
+    ///
     /// Bullshark sử dụng predefined leader selection cho steady-state leaders:
     /// - Round 1 của mỗi wave: steady-state leader #1
     /// - Round 3 của mỗi wave: steady-state leader #2
-    /// 
+    ///
     /// Leader được chọn bằng round-robin để:
     /// - Đảm bảo fairness giữa các validators
     /// - Deterministic: tất cả nodes đều tính ra cùng leader
@@ -408,12 +423,12 @@ impl Bullshark {
         // Lấy tất cả public keys và sắp xếp để đảm bảo deterministic order
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
         keys.sort();
-        
+
         // Round-robin selection - ĐÚNG THEO PAPER BULLSHARK
         let leader_pk = &keys[round as usize % self.committee.size()];
-        
+
         debug!("Selected leader for round {}: {:?}", round, leader_pk);
-        
+
         // Tìm certificate của leader trong DAG
         dag.get(&round).and_then(|x| x.get(leader_pk))
     }
@@ -480,7 +495,10 @@ impl ConsensusAlgorithm for Bullshark {
             return Ok((Vec::new(), false));
         }
 
-        info!("Committing leader at round {} with stake {}/{}", leader_round, stake, required_stake);
+        info!(
+            "Committing leader at round {} with stake {}/{}",
+            leader_round, stake, required_stake
+        );
 
         // Order and commit
         let mut sequence = Vec::new();
@@ -521,9 +539,7 @@ impl ConsensusAlgorithm for ConsensusProtocol {
         metrics: &mut ConsensusMetrics,
     ) -> Result<(Vec<Certificate>, bool), ConsensusError> {
         match self {
-            ConsensusProtocol::Tusk(tusk) => {
-                tusk.process_certificate(state, certificate, metrics)
-            }
+            ConsensusProtocol::Tusk(tusk) => tusk.process_certificate(state, certificate, metrics),
             ConsensusProtocol::Bullshark(bullshark) => {
                 bullshark.process_certificate(state, certificate, metrics)
             }
@@ -557,7 +573,7 @@ impl Consensus {
 
     pub fn spawn(
         committee: Committee,
-        gc_depth: Round,
+        _gc_depth: Round,
         store: Store,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
@@ -572,7 +588,10 @@ impl Consensus {
         let metrics = Arc::new(RwLock::new(ConsensusMetrics::default()));
         let metrics_clone = metrics.clone();
 
-        info!("Starting consensus engine with {} protocol", protocol.name());
+        info!(
+            "Starting consensus engine with {} protocol",
+            protocol.name()
+        );
 
         tokio::spawn(async move {
             Self {
@@ -593,18 +612,19 @@ impl Consensus {
 
     async fn load_state(&mut self) -> ConsensusState {
         match self.store.read(Self::STATE_KEY.to_vec()).await {
-            Ok(Some(bytes)) => {
-                match bincode::deserialize(&bytes) {
-                    Ok(state) => {
-                        info!("Loaded consensus state from store");
-                        state
-                    }
-                    Err(e) => {
-                        error!("Failed to deserialize consensus state: {}. Starting from genesis.", e);
-                        ConsensusState::new(self.genesis.clone())
-                    }
+            Ok(Some(bytes)) => match bincode::deserialize(&bytes) {
+                Ok(state) => {
+                    info!("Loaded consensus state from store");
+                    state
                 }
-            }
+                Err(e) => {
+                    error!(
+                        "Failed to deserialize consensus state: {}. Starting from genesis.",
+                        e
+                    );
+                    ConsensusState::new(self.genesis.clone())
+                }
+            },
             Ok(None) => {
                 info!("No consensus state found in store. Starting from genesis.");
                 ConsensusState::new(self.genesis.clone())
@@ -618,29 +638,33 @@ impl Consensus {
 
     async fn save_state(&mut self, state: &ConsensusState) -> Result<(), ConsensusError> {
         let serialized = bincode::serialize(state)?;
-        self.store
-            .write(Self::STATE_KEY.to_vec(), serialized)
-            .await;
+        self.store.write(Self::STATE_KEY.to_vec(), serialized).await;
         Ok(())
     }
 
     async fn run(&mut self) {
         let mut state = self.load_state().await;
-        
+
         // Validate loaded state
         if let Err(e) = state.validate() {
             error!("State validation failed: {}", e);
         }
 
-        info!("Consensus engine ready. Starting from round {}", state.last_committed_round);
+        info!(
+            "Consensus engine ready. Starting from round {}",
+            state.last_committed_round
+        );
 
         // Main processing loop
         while let Some(certificate) = self.rx_primary.recv().await {
             debug!("Received certificate from round {}", certificate.round());
 
             let mut metrics = self.metrics.write().await;
-            
-            match self.protocol.process_certificate(&mut state, certificate, &mut metrics) {
+
+            match self
+                .protocol
+                .process_certificate(&mut state, certificate, &mut metrics)
+            {
                 Ok((sequence, committed)) => {
                     drop(metrics); // Release lock before I/O operations
 

@@ -4,7 +4,6 @@ use crate::common::{
     batch_digest, committee_with_base_port, keys, listener, serialized_batch, transaction,
 };
 use bytes::Bytes;
-use log::info;
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
 use std::fs;
@@ -33,7 +32,10 @@ async fn handle_clients_transactions() {
     println!("Store created at '{}'", path);
 
     // Spawn một `Worker` instance.
-    println!("Spawning worker instance for node '{}', worker id {}", name, id);
+    println!(
+        "Spawning worker instance for node '{}', worker id {}",
+        name, id
+    );
     Worker::spawn(name, id, committee.clone(), parameters, store).await;
     println!("Worker instance spawned");
 
@@ -42,7 +44,8 @@ async fn handle_clients_transactions() {
     println!("Setting up primary listener at {}", primary_address);
 
     let batch_content = serialized_batch();
-    let expected_message = WorkerPrimaryMessage::OurBatch(batch_digest(), id, batch_content.clone());
+    let expected_message =
+        WorkerPrimaryMessage::OurBatch(batch_digest(), id, batch_content.clone());
     let expected_serialized = bincode::serialize(&expected_message).unwrap();
     let primary_handle = listener(primary_address, Some(Bytes::from(expected_serialized)));
     println!("Primary listener is ready");
