@@ -26,3 +26,4 @@ workspace.xml
 scripts/build_and_fab
 benchmark/db_*
 go/bin/exetps
+go/bin/exetps
