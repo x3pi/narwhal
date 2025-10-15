@@ -92,20 +92,16 @@ impl Primary {
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
-
-        // --- THAY ĐỔI: Tạo kênh riêng cho Helper để nhận các loại yêu cầu ---
-        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
+        let (tx_helper_requests, rx_helper_requests) = channel(CHANNEL_CAPACITY);
 
         let payload_cache = Arc::new(DashMap::new());
-
         parameters.log();
         let name = keypair.name;
         let consensus_secret = keypair.consensus_secret;
-
         let consensus_round = Arc::new(AtomicU64::new(0));
-
         let transport = QuicTransport::new();
 
+        // Lắng nghe tin nhắn từ các Primary khác
         let mut primary_address = committee
             .primary(&name)
             .expect("Our public key is not in the committee")
@@ -115,13 +111,11 @@ impl Primary {
             .listen(primary_address)
             .await
             .expect("Failed to create primary listener");
-
-        // --- THAY ĐỔI: NetworkReceiver giờ sẽ gửi các yêu cầu đến Helper ---
         NetworkReceiver::spawn(
             primary_listener,
             PrimaryReceiverHandler {
                 tx_primary_messages: tx_primary_messages.clone(),
-                tx_helper, // Gửi các yêu cầu đến kênh của Helper
+                tx_helper: tx_helper_requests, // Gửi yêu cầu tới Helper
             },
         );
         info!(
@@ -129,6 +123,7 @@ impl Primary {
             name, primary_address
         );
 
+        // Lắng nghe tin nhắn từ các Worker
         let mut worker_address = committee
             .primary(&name)
             .expect("Our public key is not in the committee")
@@ -138,7 +133,6 @@ impl Primary {
             .listen(worker_address)
             .await
             .expect("Failed to create worker listener");
-
         NetworkReceiver::spawn(
             worker_listener,
             WorkerReceiverHandler {
@@ -162,7 +156,6 @@ impl Primary {
 
         let signature_service = SignatureService::new(consensus_secret);
 
-        // --- THAY ĐỔI: Thêm tx_primary_messages vào Core::spawn để Core có thể gửi tin nhắn ra ngoài ---
         Core::spawn(
             name,
             committee.clone(),
@@ -175,15 +168,13 @@ impl Primary {
             rx_headers_loopback,
             rx_certificates_loopback,
             rx_proposer,
-            tx_primary_messages, // Thêm đối số này
+            tx_primary_messages.clone(), // Core có thể gửi tin nhắn ra ngoài
             tx_consensus,
             tx_parents,
         );
 
         GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_consensus);
-
         PayloadReceiver::spawn(store.clone(), payload_cache.clone(), rx_others_digests);
-
         HeaderWaiter::spawn(
             name,
             committee.clone(),
@@ -195,13 +186,11 @@ impl Primary {
             rx_sync_headers,
             tx_headers_loopback,
         );
-
         CertificateWaiter::spawn(
             store.clone(),
             rx_sync_certificates,
             tx_certificates_loopback,
         );
-
         Proposer::spawn(
             name,
             &committee,
@@ -214,21 +203,17 @@ impl Primary {
             tx_headers,
         );
 
-        // --- THAY ĐỔI: Helper giờ nhận kênh mới ---
-        Helper::spawn(committee.clone(), store, rx_helper);
+        // START OF FIX: Cung cấp cho Helper một kênh để gửi tin nhắn ra mạng
+        Helper::spawn(committee.clone(), store, rx_helper_requests);
+        // END OF FIX
 
         info!(
             "Primary {} successfully booted on {}",
             name,
-            committee
-                .primary(&name)
-                .expect("Our public key is not in the committee")
-                .primary_to_primary
-                .ip()
+            committee.primary(&name).unwrap().primary_to_primary.ip()
         );
     }
 }
-
 // --- THAY ĐỔI: PrimaryReceiverHandler được cập nhật để phân loại message ---
 #[derive(Clone)]
 struct PrimaryReceiverHandler {

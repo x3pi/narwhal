@@ -9,6 +9,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+// START OF FIX: Add the missing constant
+/// The maximum size of a QUIC datagram payload.
+/// This value is chosen to be safely under the typical MTU size to avoid IP fragmentation.
+pub const QUIC_MAX_DATAGRAM_SIZE: usize = 1_400;
+// END OF FIX
+
 // --- Quic Connection Implementation ---
 pub struct QuicConnection {
     connection: quinn::Connection,
@@ -59,7 +65,6 @@ impl Listener for QuicListener {
 // --- Quic Transport Main Implementation ---
 #[derive(Clone)]
 pub struct QuicTransport {
-    // SỬA ĐỔI: Giữ một Endpoint duy nhất cho client để tái sử dụng.
     client_endpoint: Endpoint,
     server_config: ServerConfig,
 }
@@ -68,7 +73,6 @@ impl QuicTransport {
     pub fn new() -> Self {
         let (server_config, client_config) = configure_certificates();
 
-        // SỬA ĐỔI: Tạo client endpoint (socket) MỘT LẦN DUY NHẤT khi khởi tạo.
         let mut client_endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())
             .expect("Failed to create QUIC client endpoint");
         client_endpoint.set_default_client_config(client_config);
@@ -89,7 +93,6 @@ impl Default for QuicTransport {
 #[async_trait]
 impl Transport for QuicTransport {
     async fn connect(&self, address: SocketAddr) -> TransportResult<Box<dyn Connection>> {
-        // SỬA ĐỔI: Tái sử dụng endpoint đã được tạo sẵn thay vì tạo mới.
         let connection = self.client_endpoint.connect(address, "localhost")?.await?;
         Ok(Box::new(QuicConnection { connection }))
     }
@@ -109,23 +112,16 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     let cert_chain = vec![rustls::Certificate(cert_der.clone())];
 
     let mut transport_config = TransportConfig::default();
-
-    // Cấu hình hiệu năng
     transport_config.max_concurrent_uni_streams(VarInt::from_u32(10_000));
-    transport_config.stream_receive_window(VarInt::from_u32(2 * 1024 * 1024)); // 2MB
-    transport_config.receive_window(VarInt::from_u32(4 * 1024 * 1024)); // 4MB
-
-    // SỬA ĐỔI: Cấu hình timeout ngắn và keep-alive thường xuyên để phát hiện mất kết nối nhanh hơn.
+    transport_config.stream_receive_window(VarInt::from_u32(20 * 1024 * 1024));
+    transport_config.receive_window(VarInt::from_u32(40 * 1024 * 1024));
     transport_config.max_idle_timeout(Some(Duration::from_secs(10).try_into().unwrap()));
     transport_config.keep_alive_interval(Some(Duration::from_secs(3)));
-
     let transport = Arc::new(transport_config);
 
-    // Cấu hình Server
     let mut server_config = ServerConfig::with_single_cert(cert_chain, priv_key).unwrap();
     server_config.transport = transport.clone();
 
-    // Cấu hình Client
     let client_crypto = rustls::ClientConfig::builder()
         .with_safe_defaults()
         .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
@@ -137,7 +133,6 @@ fn configure_certificates() -> (ServerConfig, ClientConfig) {
     (server_config, client_config)
 }
 
-// Helper struct để bỏ qua xác thực certificate của server (chỉ dùng cho môi trường dev)
 struct SkipServerVerification;
 
 impl rustls::client::ServerCertVerifier for SkipServerVerification {
