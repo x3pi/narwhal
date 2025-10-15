@@ -25,10 +25,12 @@ pub mod core_tests;
 
 const SYNC_CHUNK_SIZE: Round = 200;
 const SYNC_RETRY_DELAY: u64 = 10_000;
+const SYNC_MAX_RETRIES: u32 = 5; // Giới hạn số lần retry
 
 struct SyncState {
     final_target_round: Round,
     current_chunk_target: Round,
+    retry_count: u32, // Đếm số lần retry
 }
 
 pub struct Core {
@@ -47,10 +49,7 @@ pub struct Core {
     tx_proposer: Sender<(Vec<Digest>, Round)>,
     tx_primaries: Sender<PrimaryMessage>,
     gc_round: Round,
-
-    // --- TÁI CẤU TRÚC: Biến riêng để theo dõi round của DAG ---
     dag_round: Round,
-
     last_voted: HashMap<Round, HashSet<PublicKey>>,
     processing: HashMap<Round, HashSet<Digest>>,
     current_header: Header,
@@ -96,7 +95,6 @@ impl Core {
                 tx_proposer,
                 tx_primaries,
                 gc_round: 0,
-                // --- TÁI CẤU TRÚC: Khởi tạo dag_round ---
                 dag_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
@@ -134,26 +132,43 @@ impl Core {
 
     async fn advance_sync(&mut self) {
         if let Some(state) = &mut self.sync_state {
+            // FIX 1: Kiểm tra số lần retry
+            if state.retry_count >= SYNC_MAX_RETRIES {
+                warn!(
+                    "Sync failed after {} retries. Forcing exit from Syncing state at round {}",
+                    SYNC_MAX_RETRIES, self.dag_round
+                );
+                self.sync_state = None;
+                self.last_voted.clear();
+                self.processing.clear();
+                return;
+            }
+
             if self.dag_round >= state.final_target_round {
                 info!(
                     "Synchronization complete. Now at round {}. Switching to Running state.",
                     self.dag_round
                 );
                 self.sync_state = None;
-                // --- FIX: Dọn dẹp trạng thái bỏ phiếu cũ để tránh lỗi AuthorityReuse ---
                 self.last_voted.clear();
                 self.processing.clear();
             } else {
                 let start = self.dag_round + 1;
                 let end = (start + SYNC_CHUNK_SIZE - 1).min(state.final_target_round);
                 state.current_chunk_target = end;
+                state.retry_count += 1; // Tăng retry count
+
+                info!(
+                    "Sync retry #{}: requesting rounds {} to {}",
+                    state.retry_count, start, end
+                );
                 self.request_sync_chunk(start, end).await;
             }
         }
     }
 
     async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
-        self.dag_round = header.round; // Cập nhật round của DAG
+        self.dag_round = header.round;
         self.current_header = header.clone();
         self.votes_aggregator = VotesAggregator::new();
         let addresses = self
@@ -353,24 +368,67 @@ impl Core {
     }
 
     async fn handle_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
+        // FIX 2: Trong trạng thái Syncing, vẫn xử lý certificate đơn lẻ
         if self.sync_state.is_some() {
-            if let PrimaryMessage::CertificateBundle(certificates) = message {
-                info!(
-                    "Received a sync bundle of {} certificates.",
-                    certificates.len()
-                );
-                let mut latest_round_in_bundle = self.dag_round;
-                for certificate in certificates {
+            match message {
+                PrimaryMessage::CertificateBundle(certificates) => {
+                    let bundle_size = certificates.len();
+                    info!("Received a sync bundle of {} certificates.", bundle_size);
+
+                    if certificates.is_empty() {
+                        warn!("Received empty bundle, advancing sync anyway");
+                        self.advance_sync().await;
+                        return Ok(());
+                    }
+
+                    let mut latest_round_in_bundle = self.dag_round;
+                    let mut processed_count = 0;
+
+                    for certificate in certificates {
+                        if self.sanitize_certificate(&certificate).is_ok() {
+                            debug!("Syncing certificate from round {}", certificate.round());
+                            if self.process_certificate(certificate.clone()).await.is_ok() {
+                                processed_count += 1;
+                                latest_round_in_bundle =
+                                    latest_round_in_bundle.max(certificate.round());
+                            }
+                        }
+                    }
+
+                    info!(
+                        "Successfully processed {}/{} certificates in bundle",
+                        processed_count, bundle_size
+                    );
+
+                    if latest_round_in_bundle > self.dag_round {
+                        self.dag_round = latest_round_in_bundle;
+                    }
+
+                    // Reset retry count khi nhận được bundle thành công
+                    if let Some(state) = &mut self.sync_state {
+                        state.retry_count = 0;
+                    }
+
+                    self.advance_sync().await;
+                }
+                // FIX 3: Cho phép xử lý certificate đơn lẻ khi đang sync
+                PrimaryMessage::Certificate(certificate) => {
                     if self.sanitize_certificate(&certificate).is_ok() {
-                        debug!("Syncing certificate from round {}", certificate.round());
-                        let _ = self.process_certificate(certificate.clone()).await;
-                        latest_round_in_bundle = latest_round_in_bundle.max(certificate.round());
+                        let cert_round = certificate.round();
+                        if cert_round > self.dag_round {
+                            info!(
+                                "Processing individual certificate from round {} while syncing",
+                                cert_round
+                            );
+                            if self.process_certificate(certificate).await.is_ok() {
+                                self.dag_round = self.dag_round.max(cert_round);
+                            }
+                        }
                     }
                 }
-                if latest_round_in_bundle > self.dag_round {
-                    self.dag_round = latest_round_in_bundle;
+                _ => {
+                    // Bỏ qua các message khác khi đang sync
                 }
-                self.advance_sync().await;
             }
             return Ok(());
         }
@@ -388,12 +446,13 @@ impl Core {
                 const LAG_THRESHOLD: Round = 50;
                 if certificate.round() > self.dag_round.saturating_add(LAG_THRESHOLD) {
                     info!(
-                        "We are lagging by more than {} rounds. Switching to Syncing state.",
-                        LAG_THRESHOLD
+                        "We are lagging. Switching to Syncing state to catch up to round {}",
+                        certificate.round()
                     );
                     self.sync_state = Some(SyncState {
                         final_target_round: certificate.round(),
                         current_chunk_target: 0,
+                        retry_count: 0, // Khởi tạo retry count
                     });
                     self.advance_sync().await;
                     return Ok(());
