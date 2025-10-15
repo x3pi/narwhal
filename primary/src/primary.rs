@@ -16,11 +16,7 @@ use crypto::{Digest, PublicKey, SignatureService};
 use dashmap::DashMap;
 use log::info;
 use network::{
-    quic::QuicTransport, // <--- THAY ĐỔI
-    transport::Transport,
-    MessageHandler,
-    Receiver as NetworkReceiver,
-    Writer,
+    quic::QuicTransport, transport::Transport, MessageHandler, Receiver as NetworkReceiver, Writer,
 };
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -28,10 +24,21 @@ use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 
+// --- BEGIN: Bổ sung các định nghĩa cần thiết cho logic mới ---
+
+pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
+
+/// Trạng thái hoạt động của Primary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrimaryState {
+    /// Trạng thái hoạt động bình thường, xử lý các round tuần tự.
+    Running,
+    /// Trạng thái đang đồng bộ hàng loạt, chờ dữ liệu để bắt kịp mạng.
+    Syncing,
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
@@ -39,7 +46,17 @@ pub enum PrimaryMessage {
     Vote(Vote),
     Certificate(Certificate),
     CertificatesRequest(Vec<Digest>, PublicKey),
+
+    /// Yêu cầu đồng bộ một loạt certificate trong một dải round.
+    CertificateRangeRequest {
+        start_round: Round,
+        end_round: Round,
+        requestor: PublicKey,
+    },
+    /// Phản hồi chứa một gói các certificate.
+    CertificateBundle(Vec<Certificate>),
 }
+// --- END: Bổ sung các định nghĩa ---
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryWorkerMessage {
@@ -75,7 +92,10 @@ impl Primary {
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
-        let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
+
+        // --- THAY ĐỔI: Tạo kênh riêng cho Helper để nhận các loại yêu cầu ---
+        let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
+
         let payload_cache = Arc::new(DashMap::new());
 
         parameters.log();
@@ -84,8 +104,7 @@ impl Primary {
 
         let consensus_round = Arc::new(AtomicU64::new(0));
 
-        // SỬA ĐỔI: Sử dụng QuicTransport.
-        let transport = QuicTransport::new(); // <--- THAY ĐỔI
+        let transport = QuicTransport::new();
 
         let mut primary_address = committee
             .primary(&name)
@@ -97,11 +116,12 @@ impl Primary {
             .await
             .expect("Failed to create primary listener");
 
+        // --- THAY ĐỔI: NetworkReceiver giờ sẽ gửi các yêu cầu đến Helper ---
         NetworkReceiver::spawn(
             primary_listener,
             PrimaryReceiverHandler {
-                tx_primary_messages,
-                tx_cert_requests,
+                tx_primary_messages: tx_primary_messages.clone(),
+                tx_helper, // Gửi các yêu cầu đến kênh của Helper
             },
         );
         info!(
@@ -142,6 +162,7 @@ impl Primary {
 
         let signature_service = SignatureService::new(consensus_secret);
 
+        // --- THAY ĐỔI: Thêm tx_primary_messages vào Core::spawn để Core có thể gửi tin nhắn ra ngoài ---
         Core::spawn(
             name,
             committee.clone(),
@@ -154,6 +175,7 @@ impl Primary {
             rx_headers_loopback,
             rx_certificates_loopback,
             rx_proposer,
+            tx_primary_messages, // Thêm đối số này
             tx_consensus,
             tx_parents,
         );
@@ -192,7 +214,8 @@ impl Primary {
             tx_headers,
         );
 
-        Helper::spawn(committee.clone(), store, rx_cert_requests);
+        // --- THAY ĐỔI: Helper giờ nhận kênh mới ---
+        Helper::spawn(committee.clone(), store, rx_helper);
 
         info!(
             "Primary {} successfully booted on {}",
@@ -206,34 +229,44 @@ impl Primary {
     }
 }
 
-// --- Các struct Handler (không thay đổi) ---
-
+// --- THAY ĐỔI: PrimaryReceiverHandler được cập nhật để phân loại message ---
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
-    tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_helper: Sender<PrimaryMessage>,
 }
 
 #[async_trait]
 impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         let _ = writer.send(Bytes::from("Ack")).await;
-        match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            PrimaryMessage::CertificatesRequest(missing, requestor) => self
-                .tx_cert_requests
-                .send((missing, requestor))
-                .await
-                .expect("Failed to send primary message"),
-            request => self
-                .tx_primary_messages
-                .send(request)
-                .await
-                .expect("Failed to send certificate"),
+
+        // Deserialize message để xác định loại.
+        let message: PrimaryMessage =
+            bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
+
+        // Phân loại message: các yêu cầu dữ liệu sẽ được gửi đến Helper,
+        // các message khác (chứa dữ liệu) sẽ được gửi đến Core.
+        match message {
+            msg @ PrimaryMessage::CertificatesRequest(..)
+            | msg @ PrimaryMessage::CertificateRangeRequest { .. } => {
+                self.tx_helper
+                    .send(msg)
+                    .await
+                    .expect("Failed to send request to Helper");
+            }
+            msg => {
+                self.tx_primary_messages
+                    .send(msg)
+                    .await
+                    .expect("Failed to send message to Core");
+            }
         }
         Ok(())
     }
 }
 
+// --- WorkerReceiverHandler không thay đổi ---
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId, Vec<u8>)>,

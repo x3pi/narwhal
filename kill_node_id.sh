@@ -47,8 +47,8 @@ EXECUTOR_SESSION="executor-$NODE_ID"
 # --- Dừng các session tmux ---
 # Sử dụng '2>/dev/null || true' để script không báo lỗi và thoát nếu session không tồn tại.
 
-echo " > Dừng session Executor: $EXECUTOR_SESSION..."
-tmux kill-session -t "$EXECUTOR_SESSION" 2>/dev/null || true
+# echo " > Dừng session Executor: $EXECUTOR_SESSION..."
+# tmux kill-session -t "$EXECUTOR_SESSION" 2>/dev/null || true
 
 echo " > Dừng session Primary: $PRIMARY_SESSION..."
 tmux kill-session -t "$PRIMARY_SESSION" 2>/dev/null || true

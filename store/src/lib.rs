@@ -13,11 +13,20 @@ type StoreResult<T> = Result<T, StoreError>;
 type Key = Vec<u8>;
 type Value = Vec<u8>;
 
+// --- BEGIN: Bổ sung hằng số và lệnh mới ---
+/// Tên của column family dùng để tạo chỉ mục round -> [digest].
+pub const ROUND_INDEX_CF: &str = "round_index";
+
 pub enum StoreCommand {
     Write(Key, Value),
     Read(Key, oneshot::Sender<StoreResult<Option<Value>>>),
     NotifyRead(Key, oneshot::Sender<StoreResult<Value>>),
+    // Lệnh để ghi vào một column family được chỉ định.
+    WriteCf(String, Key, Value),
+    // Lệnh để đọc từ một column family được chỉ định.
+    ReadCf(String, Key, oneshot::Sender<StoreResult<Option<Value>>>),
 }
+// --- END: Bổ sung hằng số và lệnh mới ---
 
 #[derive(Clone)]
 pub struct Store {
@@ -26,16 +35,20 @@ pub struct Store {
 
 impl Store {
     pub fn new(path: &str) -> StoreResult<Self> {
-        let db = rocksdb::DB::open_default(path)?;
-        //HashMap này sẽ được dùng để theo dõi các yêu cầu NotifyRead đang chờ dữ liệu. Hashmap lưu nhiều quue[oneshoot]
+        // --- BEGIN: Mở DB với hỗ trợ Column Family ---
+        let mut options = rocksdb::Options::default();
+        options.create_if_missing(true);
+        options.create_missing_column_families(true);
+
+        let db = rocksdb::DB::open_cf(&options, path, vec!["default", ROUND_INDEX_CF])?;
+        // --- END: Mở DB với hỗ trợ Column Family ---
+
         let mut obligations = HashMap::<_, VecDeque<oneshot::Sender<_>>>::new();
         let (tx, mut rx) = channel(100);
+
         tokio::spawn(async move {
             while let Some(command) = rx.recv().await {
                 match command {
-                    //Ghi cặp (key, value) vào RocksDB.
-                    // Kiểm tra xem có yêu cầu NotifyRead nào đang chờ key này trong obligations không.
-                    // Nếu có, nó sẽ gửi value vừa được ghi cho tất cả những người đang chờ thông qua các kênh oneshot của họ và xóa key khỏi obligations.
                     StoreCommand::Write(key, value) => {
                         let _ = db.put(&key, &value);
                         if let Some(mut senders) = obligations.remove(&key) {
@@ -48,22 +61,33 @@ impl Store {
                         let response = db.get(&key);
                         let _ = sender.send(response);
                     }
-                    // Cố gắng đọc key từ RocksDB.
-                    // Nếu key đã tồn tại, nó sẽ gửi ngay giá trị tìm được cho người yêu cầu.
-                    // Nếu key chưa tồn tại (Ok(None)), thay vì trả về None, nó sẽ lưu sender (kênh oneshot) vào obligations dưới key đó.
-                    // Khi key này được ghi vào (thông qua lệnh Write), tác vụ nền sẽ tìm thấy sender này và gửi giá trị mới qua nó.
-                    StoreCommand::NotifyRead(key, sender) => {
-                        let response = db.get(&key);
-                        match response {
-                            Ok(None) => obligations
-                                .entry(key)
-                                .or_insert_with(VecDeque::new)
-                                .push_back(sender),
-                            _ => {
-                                let _ = sender.send(response.map(|x| x.unwrap()));
-                            }
+                    StoreCommand::NotifyRead(key, sender) => match db.get(&key) {
+                        Ok(None) => obligations
+                            .entry(key)
+                            .or_insert_with(VecDeque::new)
+                            .push_back(sender),
+                        Ok(Some(value)) => {
+                            let _ = sender.send(Ok(value));
                         }
+                        Err(e) => {
+                            let _ = sender.send(Err(e));
+                        }
+                    },
+                    // --- BEGIN: Xử lý các lệnh mới cho Column Family ---
+                    StoreCommand::WriteCf(cf_name, key, value) => {
+                        let handle = db
+                            .cf_handle(&cf_name)
+                            .unwrap_or_else(|| panic!("Column family '{}' not found", cf_name));
+                        let _ = db.put_cf(handle, &key, &value);
+                        // Lưu ý: NotifyRead chưa được implement cho CF để giữ code đơn giản.
                     }
+                    StoreCommand::ReadCf(cf_name, key, sender) => {
+                        let handle = db
+                            .cf_handle(&cf_name)
+                            .unwrap_or_else(|| panic!("Column family '{}' not found", cf_name));
+                        let response = db.get_cf(handle, &key);
+                        let _ = sender.send(response);
+                    } // --- END: Xử lý các lệnh mới ---
                 }
             }
         });
@@ -99,4 +123,26 @@ impl Store {
             .await
             .expect("Failed to receive reply to NotifyRead command from store")
     }
+
+    // --- BEGIN: Bổ sung các hàm public mới ---
+    /// Ghi một cặp key-value vào một column family được chỉ định.
+    pub async fn write_cf(&mut self, cf_name: String, key: Key, value: Value) {
+        let command = StoreCommand::WriteCf(cf_name, key, value);
+        if let Err(e) = self.channel.send(command).await {
+            panic!("Failed to send WriteCf command to store: {}", e);
+        }
+    }
+
+    /// Đọc một value từ một column family được chỉ định.
+    pub async fn read_cf(&mut self, cf_name: String, key: Key) -> StoreResult<Option<Value>> {
+        let (sender, receiver) = oneshot::channel();
+        let command = StoreCommand::ReadCf(cf_name, key, sender);
+        if let Err(e) = self.channel.send(command).await {
+            panic!("Failed to send ReadCf command to store: {}", e);
+        }
+        receiver
+            .await
+            .expect("Failed to receive reply to ReadCf command from store")
+    }
+    // --- END: Bổ sung các hàm public mới ---
 }

@@ -57,11 +57,11 @@ echo ""
 
 
 # --- SỬA LỖI: Khởi chạy Executor TRƯỚC ---
-executor_log="$LOG_DIR/executor-$NODE_ID.log"
-executor_cmd="$EXECUTOR_BINARY --id $NODE_ID"
+# executor_log="$LOG_DIR/executor-$NODE_ID.log"
+# executor_cmd="$EXECUTOR_BINARY --id $NODE_ID"
 
-echo "🚀 Khởi động Executor-$NODE_ID..."
-tmux new -d -s "executor-$NODE_ID" "sh -c '$executor_cmd > \"$executor_log\" 2>&1 || echo \"[FATAL] Executor exited\" >> \"$executor_log\"'"
+# echo "🚀 Khởi động Executor-$NODE_ID..."
+# tmux new -d -s "executor-$NODE_ID" "sh -c '$executor_cmd > \"$executor_log\" 2>&1 || echo \"[FATAL] Executor exited\" >> \"$executor_log\"'"
 
 # --- SỬA LỖI: Thêm một khoảng nghỉ ngắn để executor tạo socket ---
 sleep 0.2
