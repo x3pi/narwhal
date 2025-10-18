@@ -20,9 +20,11 @@ use network::{
 };
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
+use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
+use std::convert::TryInto;
 use std::error::Error;
 use store::Store;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, Sender}; // <--- THÊM DÒNG NÀY
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -272,7 +274,11 @@ impl MessageHandler for TxReceiverHandler {
 
         // Cắt lấy phần payload: bắt đầu từ byte thứ 8 cho đến hết.
         let payload = &message[8..];
-
+        info!(
+            target: "payload_logger",
+            "{}",
+            hex::encode(payload)
+        );
         // Gửi phần payload đã được cắt vào quá trình đồng thuận.
         self.tx_batch_maker
             .send(payload.to_vec())
@@ -294,11 +300,21 @@ impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         let _ = writer.send(Bytes::from("Ack")).await;
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self
-                .tx_processor
-                .send(serialized.to_vec())
-                .await
-                .expect("Failed to send batch"),
+            Ok(WorkerMessage::Batch(batch)) => {
+                // -- BỔ SUNG LOG TẠI ĐÂY --
+                let message = WorkerMessage::Batch(batch);
+                let serialized =
+                    bincode::serialize(&message).expect("Failed to serialize our own batch");
+
+                let digest = Digest(Sha512::digest(&serialized)[..32].try_into().unwrap());
+                // -- KẾT THÚC BỔ SUNG --
+                info!("WorkerMessage Batch {:?} ", digest);
+
+                self.tx_processor
+                    .send(serialized.to_vec())
+                    .await
+                    .expect("Failed to send batch")
+            }
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper
                 .send((missing, requestor))

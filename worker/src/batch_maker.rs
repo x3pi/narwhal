@@ -5,7 +5,6 @@ use bytes::Bytes;
 #[cfg(feature = "benchmark")]
 use crypto::Digest;
 use crypto::PublicKey;
-#[cfg(feature = "benchmark")]
 use log::info;
 use network::{CancelHandler, SimpleSender}; // THÊM CancelHandler
 #[cfg(feature = "benchmark")]
@@ -118,11 +117,7 @@ impl BatchMaker {
         #[cfg(feature = "benchmark")]
         {
             // NOTE: This is one extra hash that is only needed to print the following log entries.
-            let digest = Digest(
-                Sha512::digest(&serialized).as_slice()[..32]
-                    .try_into()
-                    .unwrap(),
-            );
+            let digest = Digest(Sha512::digest(&serialized)[..32].try_into().unwrap());
 
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.
@@ -140,6 +135,15 @@ impl BatchMaker {
         // Broadcast the batch through the network.
         let (names, addresses): (Vec<_>, _) = self.workers_addresses.iter().cloned().unzip();
         let bytes = Bytes::from(serialized.clone());
+
+        // Log the broadcast event.
+        // DÒNG ĐƯỢC THÊM VÀO:
+        info!(
+            "Broadcasting batch of {} bytes to workers {:?}",
+            serialized.len(),
+            addresses
+        );
+
         self.simple_network.broadcast(addresses, bytes).await;
 
         // SỬA LỖI: Cung cấp kiểu dữ liệu tường minh cho channel và collection.
