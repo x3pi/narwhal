@@ -4,10 +4,10 @@ use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
-use store::Store;
+use log::{debug, warn};
+use store::{Store, PENDING_BATCHES_CF};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -32,6 +32,8 @@ pub struct Proposer {
     rx_core: Receiver<(Vec<Digest>, Round)>,
     /// Receives the batches' digests from our workers.
     rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
+    /// Receives orphaned batches from the `GarbageCollector`.
+    rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
     /// Sends newly created headers to the `Core`.
     tx_core: Sender<Header>,
 
@@ -56,6 +58,7 @@ impl Proposer {
         max_header_delay: u64,
         rx_core: Receiver<(Vec<Digest>, Round)>,
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
+        rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
         tx_core: Sender<Header>,
     ) {
         let genesis = Certificate::genesis(committee)
@@ -72,6 +75,7 @@ impl Proposer {
                 max_header_delay,
                 rx_core,
                 rx_workers,
+                rx_repropose,
                 tx_core,
                 round: 1,
                 last_parents: genesis,
@@ -84,16 +88,29 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
+        // Collect digests to include in the header.
+        let digests_for_header: Vec<(Digest, WorkerId)> = self.digests.drain(..).collect();
+
         // Make a new header.
         let header = Header::new(
             self.name,
             self.round,
-            self.digests.drain(..).collect(),
+            digests_for_header.iter().cloned().collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,
         )
         .await;
         debug!("Created {:?}", header);
+
+        // Ghi lại các batch đã đề xuất vào store để Garbage Collector theo dõi.
+        for (digest, worker_id) in digests_for_header {
+            // Key bao gồm round và digest để dễ dàng quét và tránh trùng lặp.
+            let key = [self.round.to_le_bytes().to_vec(), digest.to_vec()].concat();
+            let value = bincode::serialize(&worker_id).expect("Failed to serialize worker_id");
+            self.store
+                .write_cf(PENDING_BATCHES_CF.to_string(), key, value)
+                .await;
+        }
 
         #[cfg(feature = "benchmark")]
         for digest in header.payload.keys() {
@@ -116,11 +133,7 @@ impl Proposer {
         tokio::pin!(timer);
 
         loop {
-            // Check if we can propose a new header. We propose a new header when one of the following
-            // conditions is met:
-            // 1. We have a quorum of certificates from the previous round and enough batches' digests;
-            // 2. We have a quorum of certificates from the previous round and the specified maximum
-            // inter-header delay has passed.
+            // Check if we can propose a new header.
             let enough_parents = !self.last_parents.is_empty();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
@@ -148,9 +161,15 @@ impl Proposer {
                     self.last_parents = parents;
                 }
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
-                    // Store the batch in the primary's store for the `analyze` function to find.
+                    // Store the batch in the primary's store.
                     self.store.write(digest.to_vec(), batch).await;
 
+                    self.payload_size += digest.size();
+                    self.digests.push((digest, worker_id));
+                }
+                Some((digest, worker_id, _batch)) = self.rx_repropose.recv() => {
+                    // Batch data is already in the store, just re-add it to be proposed again.
+                    warn!("Re-proposing orphaned batch {}", digest);
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                 }

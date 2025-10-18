@@ -89,6 +89,10 @@ impl Primary {
             channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) =
             channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
+
+        // Kênh mới để gửi lại các batch mồ côi từ GC tới Proposer
+        let (tx_repropose, rx_repropose) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
+
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
         let (tx_headers, rx_proposer) = channel(CHANNEL_CAPACITY);
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
@@ -140,7 +144,7 @@ impl Primary {
         NetworkReceiver::spawn(
             worker_listener,
             WorkerReceiverHandler {
-                tx_our_digests,
+                tx_our_digests: tx_our_digests.clone(), // Clone để cả GC có thể dùng
                 tx_others_digests,
             },
         );
@@ -172,13 +176,23 @@ impl Primary {
             rx_headers_loopback,
             rx_certificates_loopback,
             rx_proposer,
-            tx_primary_messages.clone(), // Core có thể gửi tin nhắn ra ngoài
+            tx_primary_messages.clone(),
             tx_consensus,
             tx_parents,
         );
 
-        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_consensus);
+        // Cập nhật GarbageCollector để có thể giải cứu batch
+        GarbageCollector::spawn(
+            &name,
+            &committee,
+            store.clone(),
+            consensus_round.clone(),
+            rx_consensus,
+            tx_repropose,
+        );
+
         PayloadReceiver::spawn(store.clone(), payload_cache.clone(), rx_others_digests);
+
         HeaderWaiter::spawn(
             name,
             committee.clone(),
@@ -190,11 +204,14 @@ impl Primary {
             rx_sync_headers,
             tx_headers_loopback,
         );
+
         CertificateWaiter::spawn(
             store.clone(),
             rx_sync_certificates,
             tx_certificates_loopback,
         );
+
+        // Cập nhật Proposer để nhận lại batch mồ côi
         Proposer::spawn(
             name,
             &committee,
@@ -204,12 +221,11 @@ impl Primary {
             parameters.max_header_delay,
             rx_parents,
             rx_our_digests,
+            rx_repropose,
             tx_headers,
         );
 
-        // START OF FIX: Cung cấp cho Helper một kênh để gửi tin nhắn ra mạng
         Helper::spawn(committee.clone(), store, rx_helper_requests);
-        // END OF FIX
 
         info!(
             "Primary {} successfully booted on {}",
@@ -218,7 +234,7 @@ impl Primary {
         );
     }
 }
-// --- THAY ĐỔI: PrimaryReceiverHandler được cập nhật để phân loại message ---
+
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
@@ -230,12 +246,9 @@ impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         let _ = writer.send(Bytes::from("Ack")).await;
 
-        // Deserialize message để xác định loại.
         let message: PrimaryMessage =
             bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
 
-        // Phân loại message: các yêu cầu dữ liệu sẽ được gửi đến Helper,
-        // các message khác (chứa dữ liệu) sẽ được gửi đến Core.
         match message {
             msg @ PrimaryMessage::CertificatesRequest(..)
             | msg @ PrimaryMessage::CertificateRangeRequest { .. } => {
@@ -255,7 +268,6 @@ impl MessageHandler for PrimaryReceiverHandler {
     }
 }
 
-// --- WorkerReceiverHandler không thay đổi ---
 #[derive(Clone)]
 struct WorkerReceiverHandler {
     tx_our_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
