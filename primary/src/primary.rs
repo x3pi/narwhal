@@ -6,7 +6,7 @@ use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
 use crate::helper::Helper;
 use crate::messages::{Certificate, Header, Vote};
-use crate::payload_receiver::PayloadReceiver;
+// PayloadReceiver đã bị loại bỏ.
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
@@ -25,8 +25,10 @@ use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
+// --- Định nghĩa các kiểu Cache dùng chung, hiệu năng cao ---
 pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 pub type PendingBatches = Arc<DashMap<Digest, (WorkerId, Round)>>;
+// ---------------------------------------------------------
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
@@ -79,10 +81,10 @@ impl Primary {
         let payload_cache: PayloadCache = Arc::new(DashMap::new());
         let pending_batches: PendingBatches = Arc::new(DashMap::new());
 
-        let (tx_others_digests, rx_others_digests) =
-            channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
-        let (tx_our_digests, rx_our_digests) =
-            channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
+        // Kênh để Proposer nhận batch (bao gồm cả nội dung).
+        let (tx_workers, rx_workers) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
+
+        // Kênh để GC gửi lại batch mồ côi.
         let (tx_repropose, rx_repropose) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
 
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
@@ -121,8 +123,7 @@ impl Primary {
         NetworkReceiver::spawn(
             worker_listener,
             WorkerReceiverHandler {
-                tx_our_digests: tx_our_digests.clone(),
-                tx_others_digests,
+                tx_workers: tx_workers,
             },
         );
         info!(
@@ -163,12 +164,10 @@ impl Primary {
             &committee,
             store.clone(),
             consensus_round.clone(),
-            pending_batches.clone(), // Truyền cache
+            pending_batches.clone(),
             rx_consensus,
             tx_repropose,
         );
-
-        PayloadReceiver::spawn(store.clone(), payload_cache.clone(), rx_others_digests);
 
         Proposer::spawn(
             name,
@@ -177,9 +176,9 @@ impl Primary {
             store.clone(),
             parameters.header_size,
             parameters.max_header_delay,
-            pending_batches.clone(), // Truyền cache
+            pending_batches.clone(),
             rx_parents,
-            rx_our_digests,
+            rx_workers,
             rx_repropose,
             tx_headers,
         );
@@ -210,6 +209,7 @@ impl Primary {
     }
 }
 
+/// Xử lý tin nhắn đến từ các Primary khác.
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
@@ -241,10 +241,10 @@ impl MessageHandler for PrimaryReceiverHandler {
     }
 }
 
+/// Xử lý tin nhắn đến từ các Worker, gửi thẳng đến Proposer.
 #[derive(Clone)]
 struct WorkerReceiverHandler {
-    tx_our_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
-    tx_others_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
+    tx_workers: Sender<(Digest, WorkerId, Vec<u8>)>,
 }
 
 #[async_trait]
@@ -255,16 +255,12 @@ impl MessageHandler for WorkerReceiverHandler {
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id, batch) => self
-                .tx_our_digests
+            WorkerPrimaryMessage::OurBatch(digest, worker_id, batch)
+            | WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch) => self
+                .tx_workers
                 .send((digest, worker_id, batch))
                 .await
-                .expect("Failed to send our workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch) => self
-                .tx_others_digests
-                .send((digest, worker_id, batch))
-                .await
-                .expect("Failed to send others workers' digests"),
+                .expect("Failed to send batch to proposer"),
         }
         Ok(())
     }

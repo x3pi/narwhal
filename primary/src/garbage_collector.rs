@@ -16,14 +16,12 @@ use tokio::time::{interval, Duration};
 const REPROPOSE_SCAN_INTERVAL_MS: u64 = 5_000;
 const ORPHAN_BATCH_THRESHOLD_ROUNDS: Round = 10;
 
-/// Receives the highest round reached by consensus and update it for all tasks.
+/// Dọn dẹp DAG và giải cứu các batch bị bỏ rơi.
 pub struct GarbageCollector {
-    store: Store,
+    // Các trường cần thiết cho luồng chính (xử lý certificate đã commit).
     consensus_round: Arc<AtomicU64>,
-    /// Cache dùng chung cho các batch đang chờ.
     pending_batches: PendingBatches,
     rx_consensus: Receiver<Certificate>,
-    tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
     addresses: Vec<SocketAddr>,
     network: SimpleSender,
 }
@@ -46,13 +44,31 @@ impl GarbageCollector {
             .map(|x| x.primary_to_worker)
             .collect();
 
+        // --- TỐI ƯU HÓA: Chạy tác vụ quét nền độc lập ---
+        let store_clone = store.clone();
+        let pending_batches_clone = pending_batches.clone();
+        let consensus_round_clone = consensus_round.clone();
+        tokio::spawn(async move {
+            let mut repropose_timer = interval(Duration::from_millis(REPROPOSE_SCAN_INTERVAL_MS));
+            loop {
+                repropose_timer.tick().await;
+                Self::re_propose_orphaned_batches(
+                    store_clone.clone(),
+                    pending_batches_clone.clone(),
+                    tx_repropose.clone(),
+                    consensus_round_clone.clone(),
+                )
+                .await;
+            }
+        });
+        // --- KẾT THÚC TỐI ƯU HÓA ---
+
+        // Khởi chạy luồng chính của Garbage Collector.
         tokio::spawn(async move {
             Self {
-                store,
                 consensus_round,
                 pending_batches,
                 rx_consensus,
-                tx_repropose,
                 addresses,
                 network: SimpleSender::new(),
             }
@@ -61,16 +77,23 @@ impl GarbageCollector {
         });
     }
 
-    async fn re_propose_orphaned_batches(&mut self) {
-        let current_round = self.consensus_round.load(Ordering::Relaxed);
+    /// Quét cache để tìm và đề xuất lại các batch mồ côi.
+    /// Chạy trong một tác vụ độc lập để không chặn luồng chính.
+    async fn re_propose_orphaned_batches(
+        mut store: Store,
+        pending_batches: PendingBatches,
+        tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
+        consensus_round: Arc<AtomicU64>,
+    ) {
+        let current_round = consensus_round.load(Ordering::Relaxed);
         if current_round < ORPHAN_BATCH_THRESHOLD_ROUNDS {
             return;
         }
         let orphan_round_threshold = current_round - ORPHAN_BATCH_THRESHOLD_ROUNDS;
 
-        // Quét cache đồng thời một cách an toàn.
         let mut orphaned_digests = Vec::new();
-        for item in self.pending_batches.iter() {
+        // Quét cache trong RAM, không khóa toàn bộ.
+        for item in pending_batches.iter() {
             let (digest, (_worker_id, round)) = item.pair();
             if *round < orphan_round_threshold {
                 orphaned_digests.push(digest.clone());
@@ -79,51 +102,40 @@ impl GarbageCollector {
 
         for digest in orphaned_digests {
             // Xóa khỏi cache và lấy giá trị.
-            if let Some((_, (worker_id, round))) = self.pending_batches.remove(&digest) {
-                if let Ok(Some(batch_data)) = self.store.read(digest.to_vec()).await {
+            if let Some((_, (worker_id, round))) = pending_batches.remove(&digest) {
+                // Đọc lại từ store (chỉ xảy ra khi giải cứu, là cold path).
+                if let Ok(Some(batch_data)) = store.read(digest.to_vec()).await {
                     warn!(
                         "Found orphaned batch {} from round {}, re-proposing.",
                         digest, round
                     );
-                    // Gửi lại cho Proposer để được đề xuất lại.
-                    let _ = self
-                        .tx_repropose
-                        .send((digest, worker_id, batch_data))
-                        .await;
+                    let _ = tx_repropose.send((digest, worker_id, batch_data)).await;
                 }
             }
         }
     }
 
+    /// Vòng lặp chính, chỉ xử lý các tác vụ nhanh trên luồng nóng (hot path).
     async fn run(&mut self) {
         let mut last_committed_round = 0;
-        let mut repropose_timer = interval(Duration::from_millis(REPROPOSE_SCAN_INTERVAL_MS));
 
-        loop {
-            tokio::select! {
-                Some(certificate) = self.rx_consensus.recv() => {
-                    // Xóa các batch đã được commit khỏi cache.
-                    for (digest, _) in certificate.header.payload.iter() {
-                        self.pending_batches.remove(digest);
-                    }
+        while let Some(certificate) = self.rx_consensus.recv().await {
+            // Xóa các batch đã được commit khỏi cache theo dõi (thao tác trong RAM, rất nhanh).
+            for (digest, _) in certificate.header.payload.iter() {
+                self.pending_batches.remove(digest);
+            }
 
-                    let round = certificate.round();
-                    if round > last_committed_round {
-                        last_committed_round = round;
-                        self.consensus_round.store(round, Ordering::Relaxed);
+            let round = certificate.round();
+            if round > last_committed_round {
+                last_committed_round = round;
+                self.consensus_round.store(round, Ordering::Relaxed);
 
-                        // Gửi tín hiệu dọn dẹp cho các worker.
-                        let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
-                            .expect("Failed to serialize our own message");
-                        self.network
-                            .broadcast(self.addresses.clone(), Bytes::from(bytes))
-                            .await;
-                    }
-                },
-                _ = repropose_timer.tick() => {
-                    // Theo định kỳ, quét cache để tìm và đề xuất lại các batch mồ côi.
-                    self.re_propose_orphaned_batches().await;
-                }
+                // Gửi tín hiệu dọn dẹp cho các worker.
+                let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
+                    .expect("Failed to serialize our own message");
+                self.network
+                    .broadcast(self.addresses.clone(), Bytes::from(bytes))
+                    .await;
             }
         }
     }
