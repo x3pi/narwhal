@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
-use crate::transport::Transport;
+use crate::quic::QuicTransport;
+use crate::transport::{Connection, Transport};
 use bytes::Bytes;
 use log::{info, warn};
 use rand::prelude::SliceRandom as _;
@@ -14,8 +15,6 @@ use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
 use tokio::time::{sleep, Duration};
 
-use crate::quic::QuicTransport;
-
 #[cfg(test)]
 #[path = "tests/reliable_sender_tests.rs"]
 pub mod reliable_sender_tests;
@@ -26,12 +25,6 @@ pub struct ReliableSender {
     connections: HashMap<SocketAddr, Sender<InnerMessage>>,
     transport: QuicTransport,
     rng: SmallRng,
-}
-
-impl std::default::Default for ReliableSender {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl ReliableSender {
@@ -45,7 +38,7 @@ impl ReliableSender {
 
     fn spawn_connection(address: SocketAddr, transport: QuicTransport) -> Sender<InnerMessage> {
         let (tx, rx) = channel(1_000);
-        Connection::spawn(address, transport, rx);
+        ConnectionManager::spawn(address, transport, rx);
         tx
     }
 
@@ -89,28 +82,32 @@ impl ReliableSender {
     }
 }
 
+impl Default for ReliableSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[derive(Debug)]
 struct InnerMessage {
     data: Bytes,
     cancel_handler: oneshot::Sender<Bytes>,
 }
 
-struct Connection {
+struct ConnectionManager {
     address: SocketAddr,
     transport: QuicTransport,
     receiver: Receiver<InnerMessage>,
-    retry_delay: u64,
     buffer: VecDeque<(Bytes, oneshot::Sender<Bytes>)>,
 }
 
-impl Connection {
+impl ConnectionManager {
     fn spawn(address: SocketAddr, transport: QuicTransport, receiver: Receiver<InnerMessage>) {
         tokio::spawn(async move {
             Self {
                 address,
                 transport,
                 receiver,
-                retry_delay: 200,
                 buffer: VecDeque::new(),
             }
             .run()
@@ -119,94 +116,80 @@ impl Connection {
     }
 
     async fn run(&mut self) {
-        let mut delay = self.retry_delay;
-        let mut retry = 0;
+        let mut retry_delay = Duration::from_millis(200);
         loop {
+            while let Ok(InnerMessage {
+                data,
+                cancel_handler,
+            }) = self.receiver.try_recv()
+            {
+                if !cancel_handler.is_closed() {
+                    self.buffer.push_back((data, cancel_handler));
+                }
+            }
             match self.transport.connect(self.address).await {
                 Ok(connection) => {
                     info!("Outgoing connection established with {}", self.address);
-                    delay = self.retry_delay;
-                    retry = 0;
-
-                    let error = self.keep_alive(connection).await;
-                    warn!("{}", error);
+                    retry_delay = Duration::from_millis(200);
+                    // SỬA LỖI: Gán trực tiếp kết quả trả về từ `keep_alive` và log nó.
+                    let e = self.keep_alive(connection).await;
+                    warn!("{}", e);
                 }
                 Err(e) => {
                     warn!(
-                        "{}",
-                        NetworkError::FailedToConnect(self.address, retry, e.to_string())
+                        "Failed to connect to {}: {}. Retrying in {:?}...",
+                        self.address, e, retry_delay
                     );
-                    let timer = sleep(Duration::from_millis(delay));
-                    tokio::pin!(timer);
-
-                    'waiter: loop {
-                        tokio::select! {
-                            () = &mut timer => {
-                                delay = min(2 * delay, 60_000);
-                                retry += 1;
-                                break 'waiter;
-                            },
-                            Some(InnerMessage{data, cancel_handler}) = self.receiver.recv() => {
-                                self.buffer.push_back((data, cancel_handler));
-                                self.buffer.retain(|(_, handler)| !handler.is_closed());
-                            }
-                        }
-                    }
+                    sleep(retry_delay).await;
+                    retry_delay = min(retry_delay * 2, Duration::from_secs(60));
                 }
             }
         }
     }
 
-    async fn keep_alive(
-        &mut self,
-        mut connection: Box<dyn crate::transport::Connection>,
-    ) -> NetworkError {
+    async fn keep_alive(&mut self, mut connection: Box<dyn Connection>) -> NetworkError {
         let mut pending_replies = VecDeque::new();
-
-        let error = 'connection: loop {
-            while let Some((data, handler)) = self.buffer.pop_front() {
-                if handler.is_closed() {
-                    continue;
-                }
-                match connection.send(data.clone()).await {
-                    Ok(()) => {
-                        pending_replies.push_back((data, handler));
-                    }
-                    Err(e) => {
-                        self.buffer.push_front((data, handler));
-                        break 'connection NetworkError::FailedToSendMessage(
-                            self.address,
-                            e.to_string(),
-                        );
-                    }
+        while let Some((data, handler)) = self.buffer.pop_front() {
+            if handler.is_closed() {
+                continue;
+            }
+            match connection.send(data.clone()).await {
+                Ok(()) => pending_replies.push_back((data, handler)),
+                Err(e) => {
+                    self.buffer.push_front((data, handler));
+                    return NetworkError::FailedToSendMessage(self.address, e.to_string());
                 }
             }
-
+        }
+        loop {
             tokio::select! {
                 Some(InnerMessage{data, cancel_handler}) = self.receiver.recv() => {
-                    self.buffer.push_back((data, cancel_handler));
+                    if cancel_handler.is_closed() { continue; }
+                    match connection.send(data.clone()).await {
+                        Ok(()) => pending_replies.push_back((data, cancel_handler)),
+                        Err(e) => {
+                            self.buffer.push_front((data, cancel_handler));
+                            return NetworkError::FailedToSendMessage(self.address, e.to_string());
+                        }
+                    }
                 },
                 response = connection.recv() => {
-                    let (data, handler) = match pending_replies.pop_front() {
+                    let (_, handler) = match pending_replies.pop_front() {
                         Some(message) => message,
-                        None => break 'connection NetworkError::UnexpectedAck(self.address)
+                        None => return NetworkError::UnexpectedAck(self.address)
                     };
                     match response {
-                        Ok(Some(bytes)) => {
-                            let _ = handler.send(bytes);
-                        },
+                        Ok(Some(bytes)) => { let _ = handler.send(bytes); },
                         _ => {
-                            pending_replies.push_front((data, handler));
-                            break 'connection NetworkError::FailedToReceiveAck(self.address);
+                            self.buffer.push_front((Bytes::new(), handler));
+                            while let Some(pending) = pending_replies.pop_back() {
+                                self.buffer.push_front(pending);
+                            }
+                            return NetworkError::FailedToReceiveAck(self.address);
                         }
                     }
                 },
             }
-        };
-
-        while let Some(message) = pending_replies.pop_back() {
-            self.buffer.push_front(message);
         }
-        error
     }
 }

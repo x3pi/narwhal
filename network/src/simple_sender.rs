@@ -1,13 +1,13 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
 use crate::quic::QuicTransport;
-use crate::transport::Transport;
+use crate::transport::{Connection, Transport};
 use bytes::Bytes;
-use log::{info, warn};
+use log::{debug, info, warn};
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration};
@@ -22,12 +22,6 @@ pub struct SimpleSender {
     rng: SmallRng,
 }
 
-impl std::default::Default for SimpleSender {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl SimpleSender {
     pub fn new() -> Self {
         Self {
@@ -37,24 +31,35 @@ impl SimpleSender {
         }
     }
 
-    pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
-        let spawn_new_manager = |transport: &QuicTransport, addr: SocketAddr| {
-            let (tx, rx) = channel(1_000);
-            ConnectionManager::spawn(transport.clone(), addr, rx);
-            tx
-        };
+    fn spawn_connection_manager(address: SocketAddr, transport: QuicTransport) -> Sender<Bytes> {
+        let (tx, rx) = channel(1_000);
+        ConnectionManager::spawn(address, transport, rx);
+        tx
+    }
 
+    pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
         let transport_clone = self.transport.clone();
         let tx = self
             .connections
             .entry(address)
-            .or_insert_with(|| spawn_new_manager(&transport_clone, address));
+            .or_insert_with(|| Self::spawn_connection_manager(address, transport_clone));
 
-        if tx.send(data.clone()).await.is_err() {
-            let new_tx = spawn_new_manager(&self.transport, address);
-            if new_tx.send(data).await.is_ok() {
+        if tx.is_closed() {
+            debug!("Connection for {} is closed, recreating.", address);
+            let new_tx = Self::spawn_connection_manager(address, self.transport.clone());
+            if let Err(e) = new_tx.send(data).await {
+                warn!(
+                    "Failed to send to newly created connection for {}: {}",
+                    address, e
+                );
+            } else {
                 self.connections.insert(address, new_tx);
             }
+        } else if let Err(e) = tx.send(data).await {
+            warn!(
+                "Failed to send to {}: {}. Connection manager will retry.",
+                address, e
+            );
         }
     }
 
@@ -76,18 +81,24 @@ impl SimpleSender {
     }
 }
 
+impl Default for SimpleSender {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct ConnectionManager {
-    transport: QuicTransport,
     address: SocketAddr,
+    transport: QuicTransport,
     receiver: Receiver<Bytes>,
 }
 
 impl ConnectionManager {
-    fn spawn(transport: QuicTransport, address: SocketAddr, receiver: Receiver<Bytes>) {
+    fn spawn(address: SocketAddr, transport: QuicTransport, receiver: Receiver<Bytes>) {
         tokio::spawn(async move {
             Self {
-                transport,
                 address,
+                transport,
                 receiver,
             }
             .run()
@@ -97,21 +108,37 @@ impl ConnectionManager {
 
     async fn run(&mut self) {
         let mut retry_delay = Duration::from_millis(200);
-
-        loop {
+        let mut buffer = VecDeque::new();
+        'main: loop {
+            while let Ok(data) = self.receiver.try_recv() {
+                buffer.push_back(data);
+            }
             match self.transport.connect(self.address).await {
                 Ok(mut connection) => {
                     info!("Outgoing connection established with {}", self.address);
                     retry_delay = Duration::from_millis(200);
-
-                    while let Some(data) = self.receiver.recv().await {
-                        if let Err(e) = connection.send(data).await {
+                    while let Some(data) = buffer.pop_front() {
+                        if let Err(e) = connection.send(data.clone()).await {
                             warn!(
                                 "{}",
                                 NetworkError::FailedToSendMessage(self.address, e.to_string())
                             );
-                            break;
+                            buffer.push_front(data);
+                            continue 'main;
                         }
+                    }
+                    while let Some(data) = self.receiver.recv().await {
+                        if let Err(e) = connection.send(data.clone()).await {
+                            warn!(
+                                "{}",
+                                NetworkError::FailedToSendMessage(self.address, e.to_string())
+                            );
+                            buffer.push_back(data);
+                            continue 'main;
+                        }
+                    }
+                    if self.receiver.is_closed() {
+                        break;
                     }
                 }
                 Err(e) => {
@@ -126,5 +153,6 @@ impl ConnectionManager {
                 }
             }
         }
+        warn!("Connection manager for {} is shutting down.", self.address);
     }
 }
