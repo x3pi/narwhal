@@ -13,6 +13,7 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, info, warn};
 use network::{CancelHandler, ReliableSender};
+use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -401,18 +402,46 @@ impl Core {
                             "Processing a sync bundle of {} certificates.",
                             certificates.len()
                         );
+
+                        // --- TỐI ƯU HÓA: Song song hóa xác thực certificate ---
+                        // Di chuyển tác vụ xác thực nặng sang một luồng chặn (blocking thread)
+                        // để không làm nghẽn event loop của Tokio.
+                        // Bên trong luồng đó, sử dụng Rayon để xác thực tất cả certificate song song.
+                        let committee = self.committee.clone();
+                        let verification_results = tokio::task::spawn_blocking(move || {
+                            certificates
+                                .into_par_iter() // Sử dụng parallel iterator của Rayon
+                                .filter_map(|cert| {
+                                    // Xác thực mỗi certificate trên một luồng CPU khác nhau (nếu có).
+                                    match cert.verify(&committee) {
+                                        Ok(_) => Some(cert),
+                                        Err(e) => {
+                                            warn!(
+                                                "Received invalid certificate {} during sync: {}",
+                                                cert.digest(),
+                                                e
+                                            );
+                                            None
+                                        }
+                                    }
+                                })
+                                .collect::<Vec<Certificate>>()
+                        })
+                        .await
+                        .expect("Verification task panicked");
+                        // --- KẾT THÚC TỐI ƯU HÓA ---
+
                         let mut latest_round_in_bundle = self.dag_round;
-                        for certificate in certificates {
-                            if self.sanitize_certificate(&certificate).is_ok() {
-                                // We are in sync state, so pass `true`
-                                if self
-                                    .process_certificate(certificate.clone(), true)
-                                    .await
-                                    .is_ok()
-                                {
-                                    latest_round_in_bundle =
-                                        latest_round_in_bundle.max(certificate.round());
-                                }
+                        // Lặp qua các certificate đã được xác thực trước.
+                        for certificate in verification_results {
+                            // We are in sync state, so pass `true`
+                            if self
+                                .process_certificate(certificate.clone(), true)
+                                .await
+                                .is_ok()
+                            {
+                                latest_round_in_bundle =
+                                    latest_round_in_bundle.max(certificate.round());
                             }
                         }
                         if latest_round_in_bundle > self.dag_round {
@@ -517,9 +546,15 @@ impl Core {
 
             if self.sync_state.is_none() {
                 // Check if it's time to reconfigure the committee.
-                if self.dag_round > 0 && self.dag_round % RECONFIGURE_INTERVAL == 0 && self.dag_round > self.last_reconfigure_round {
+                if self.dag_round > 0
+                    && self.dag_round % RECONFIGURE_INTERVAL == 0
+                    && self.dag_round > self.last_reconfigure_round
+                {
                     self.last_reconfigure_round = self.dag_round;
-                    info!("Round {}, triggering committee reconfiguration", self.dag_round);
+                    info!(
+                        "Round {}, triggering committee reconfiguration",
+                        self.dag_round
+                    );
 
                     // In a real implementation, we would load a new committee from a trusted source.
                     // Here we just create a clone to simulate the process.
@@ -528,18 +563,28 @@ impl Core {
 
                     // Broadcast the reconfigure message to all other primaries.
                     let reconfigure_message = PrimaryMessage::Reconfigure;
-                    let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
-                    let bytes = bincode::serialize(&reconfigure_message).expect("Failed to serialize reconfigure message");
+                    let addresses = self
+                        .committee
+                        .others_primaries(&self.name)
+                        .iter()
+                        .map(|(_, x)| x.primary_to_primary)
+                        .collect();
+                    let bytes = bincode::serialize(&reconfigure_message)
+                        .expect("Failed to serialize reconfigure message");
                     self.network.broadcast(addresses, Bytes::from(bytes)).await;
 
                     // Send reconfigure message to our own workers.
                     let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure;
-                     match self.committee.our_workers(&self.name) {
+                    match self.committee.our_workers(&self.name) {
                         Ok(worker_addresses) => {
-                            let addresses = worker_addresses.iter().map(|x| x.primary_to_worker).collect();
-                            let bytes = bincode::serialize(&worker_reconfigure_message).expect("Failed to serialize worker reconfigure message");
+                            let addresses = worker_addresses
+                                .iter()
+                                .map(|x| x.primary_to_worker)
+                                .collect();
+                            let bytes = bincode::serialize(&worker_reconfigure_message)
+                                .expect("Failed to serialize worker reconfigure message");
                             self.network.broadcast(addresses, Bytes::from(bytes)).await;
-                        },
+                        }
                         Err(e) => warn!("Could not get our worker addresses: {}", e),
                     }
                 }
