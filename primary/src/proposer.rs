@@ -1,13 +1,13 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
-use crate::primary::Round;
+use crate::primary::{PendingBatches, Round};
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::{debug, warn};
-use store::{Store, PENDING_BATCHES_CF};
+use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
@@ -27,6 +27,9 @@ pub struct Proposer {
     header_size: usize,
     /// The maximum delay to wait for batches' digests.
     max_header_delay: u64,
+
+    /// Cache dùng chung để theo dõi các batch đang chờ, được chia sẻ với GarbageCollector.
+    pending_batches: PendingBatches,
 
     /// Receives the parents to include in the next header (along with their round number).
     rx_core: Receiver<(Vec<Digest>, Round)>,
@@ -56,6 +59,7 @@ impl Proposer {
         store: Store,
         header_size: usize,
         max_header_delay: u64,
+        pending_batches: PendingBatches,
         rx_core: Receiver<(Vec<Digest>, Round)>,
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
         rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
@@ -73,6 +77,7 @@ impl Proposer {
                 store,
                 header_size,
                 max_header_delay,
+                pending_batches,
                 rx_core,
                 rx_workers,
                 rx_repropose,
@@ -88,10 +93,10 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
-        // Collect digests to include in the header.
+        // Gom các digest để đưa vào header.
         let digests_for_header: Vec<(Digest, WorkerId)> = self.digests.drain(..).collect();
 
-        // Make a new header.
+        // Tạo header mới.
         let header = Header::new(
             self.name,
             self.round,
@@ -102,80 +107,67 @@ impl Proposer {
         .await;
         debug!("Created {:?}", header);
 
-        // Ghi lại các batch đã đề xuất vào store để Garbage Collector theo dõi.
+        // Ghi vào cache dùng chung (thao tác nhanh, không khóa).
+        // Đây là cách Proposer "thông báo" cho GarbageCollector về các batch đã được đề xuất.
         for (digest, worker_id) in digests_for_header {
-            // Key bao gồm round và digest để dễ dàng quét và tránh trùng lặp.
-            let key = [self.round.to_le_bytes().to_vec(), digest.to_vec()].concat();
-            let value = bincode::serialize(&worker_id).expect("Failed to serialize worker_id");
-            self.store
-                .write_cf(PENDING_BATCHES_CF.to_string(), key, value)
-                .await;
+            self.pending_batches.insert(digest, (worker_id, self.round));
         }
 
         #[cfg(feature = "benchmark")]
         for digest in header.payload.keys() {
-            // NOTE: This log entry is used to compute performance.
             info!("Created {} -> {:?}", header, digest);
         }
 
-        // Send the new header to the `Core` that will broadcast and process it.
+        // Gửi header mới đến Core để xử lý tiếp.
         self.tx_core
             .send(header)
             .await
             .expect("Failed to send header");
     }
 
-    // Main loop listening to incoming messages.
+    /// Vòng lặp chính lắng nghe các tin nhắn đến.
     pub async fn run(&mut self) {
         debug!("Dag starting at round {}", self.round);
-
         let timer = sleep(Duration::from_millis(self.max_header_delay));
         tokio::pin!(timer);
 
         loop {
-            // Check if we can propose a new header.
+            // Kiểm tra các điều kiện để tạo header mới.
             let enough_parents = !self.last_parents.is_empty();
             let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
+
             if (timer_expired || enough_digests) && enough_parents {
-                // Make a new header.
+                // Tạo header mới và reset trạng thái.
                 self.make_header().await;
                 self.payload_size = 0;
-
-                // Reschedule the timer.
                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                 timer.as_mut().reset(deadline);
             }
 
             tokio::select! {
+                // Nhận thông tin về các parent certificate từ Core.
                 Some((parents, round)) = self.rx_core.recv() => {
-                    if round < self.round {
-                        continue;
+                    if round >= self.round {
+                        self.round = round + 1;
+                        debug!("Dag moved to round {}", self.round);
+                        self.last_parents = parents;
                     }
-
-                    // Advance to the next round.
-                    self.round = round + 1;
-                    debug!("Dag moved to round {}", self.round);
-
-                    // Signal that we have enough parent certificates to propose a new header.
-                    self.last_parents = parents;
                 }
+                // Nhận batch mới từ các worker.
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
-                    // Store the batch in the primary's store.
                     self.store.write(digest.to_vec(), batch).await;
-
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                 }
+                // Nhận lại các batch mồ côi từ GarbageCollector.
                 Some((digest, worker_id, _batch)) = self.rx_repropose.recv() => {
-                    // Batch data is already in the store, just re-add it to be proposed again.
                     warn!("Re-proposing orphaned batch {}", digest);
                     self.payload_size += digest.size();
                     self.digests.push((digest, worker_id));
                 }
-                () = &mut timer => {
-                    // Nothing to do.
-                }
+                // Xử lý khi timer hết hạn.
+                () = &mut timer => {}
             }
         }
     }

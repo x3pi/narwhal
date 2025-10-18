@@ -4,7 +4,7 @@ use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::{ConsensusPublicKey, Digest, Hash, PublicKey, Signature, SignatureService};
 use serde::{Deserialize, Serialize};
-use sha3::{Digest as Sha3Digest};
+use sha3::Digest as Sha3Digest;
 use sha3::Sha3_512 as Sha512;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::TryInto;
@@ -59,24 +59,20 @@ impl Header {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the header id is well formed.
         ensure!(self.digest() == self.id, DagError::InvalidHeaderId);
 
-        // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
         ensure!(
             voting_rights > 0,
             DagError::UnknownAuthority(self.author.clone())
         );
 
-        // Ensure all worker ids are correct.
         for worker_id in self.payload.values() {
             committee
                 .worker(&self.author, &worker_id)
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
-        // Check the signature using the consensus public key.
         let consensus_pk = committee
             .consensus_key(&self.author)
             .ok_or_else(|| DagError::UnknownAuthority(self.author.clone()))?;
@@ -98,7 +94,7 @@ impl Hash for Header {
         for x in &self.parents {
             hasher.update(x.as_ref());
         }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest((&hasher.finalize()[..32]).try_into().unwrap())
     }
 }
 
@@ -148,13 +144,11 @@ impl Vote {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Ensure the authority has voting rights.
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author.clone())
         );
 
-        // Check the signature using the consensus public key.
         let consensus_pk = committee
             .consensus_key(&self.author)
             .ok_or_else(|| DagError::UnknownAuthority(self.author.clone()))?;
@@ -170,7 +164,7 @@ impl Hash for Vote {
         hasher.update(self.id.as_ref());
         hasher.update(self.round.to_le_bytes());
         hasher.update(self.origin.as_ref());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest((&hasher.finalize()[..32]).try_into().unwrap())
     }
 }
 
@@ -209,15 +203,12 @@ impl Certificate {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        // Genesis certificates are always valid.
         if Self::genesis(committee).contains(self) {
             return Ok(());
         }
 
-        // Check the embedded header.
         self.header.verify(committee)?;
 
-        // Ensure the certificate has a quorum.
         let mut weight = 0;
         let mut used = HashSet::new();
         for (name, _) in self.votes.iter() {
@@ -232,7 +223,6 @@ impl Certificate {
             DagError::CertificateRequiresQuorum
         );
 
-        // Check the signatures.
         let votes_to_verify: DagResult<Vec<(ConsensusPublicKey, Signature)>> = self
             .votes
             .iter()
@@ -262,7 +252,7 @@ impl Hash for Certificate {
         hasher.update(self.header.id.as_ref());
         hasher.update(self.round().to_le_bytes());
         hasher.update(self.origin().as_ref());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        Digest((&hasher.finalize()[..32]).try_into().unwrap())
     }
 }
 

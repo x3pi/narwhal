@@ -25,18 +25,15 @@ use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 
-// --- BEGIN: Bổ sung các định nghĩa cần thiết cho logic mới ---
-
 pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
+pub type PendingBatches = Arc<DashMap<Digest, (WorkerId, Round)>>;
+
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
 
-/// Trạng thái hoạt động của Primary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PrimaryState {
-    /// Trạng thái hoạt động bình thường, xử lý các round tuần tự.
     Running,
-    /// Trạng thái đang đồng bộ hàng loạt, chờ dữ liệu để bắt kịp mạng.
     Syncing,
 }
 
@@ -46,25 +43,19 @@ pub enum PrimaryMessage {
     Vote(Vote),
     Certificate(Certificate),
     CertificatesRequest(Vec<Digest>, PublicKey),
-
-    /// Yêu cầu đồng bộ một loạt certificate trong một dải round.
     CertificateRangeRequest {
         start_round: Round,
         end_round: Round,
         requestor: PublicKey,
     },
-    /// Phản hồi chứa một gói các certificate.
     CertificateBundle(Vec<Certificate>),
-    /// Yêu cầu cập nhật committee.
     Reconfigure,
 }
-// --- END: Bổ sung các định nghĩa ---
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, PublicKey),
     Cleanup(Round),
-    /// Yêu cầu worker cập nhật committee.
     Reconfigure,
 }
 
@@ -85,12 +76,13 @@ impl Primary {
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
     ) {
+        let payload_cache: PayloadCache = Arc::new(DashMap::new());
+        let pending_batches: PendingBatches = Arc::new(DashMap::new());
+
         let (tx_others_digests, rx_others_digests) =
             channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
         let (tx_our_digests, rx_our_digests) =
             channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
-
-        // Kênh mới để gửi lại các batch mồ côi từ GC tới Proposer
         let (tx_repropose, rx_repropose) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
 
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
@@ -102,28 +94,20 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_helper_requests, rx_helper_requests) = channel(CHANNEL_CAPACITY);
 
-        let payload_cache = Arc::new(DashMap::new());
         parameters.log();
         let name = keypair.name;
         let consensus_secret = keypair.consensus_secret;
         let consensus_round = Arc::new(AtomicU64::new(0));
         let transport = QuicTransport::new();
 
-        // Lắng nghe tin nhắn từ các Primary khác
-        let mut primary_address = committee
-            .primary(&name)
-            .expect("Our public key is not in the committee")
-            .primary_to_primary;
+        let mut primary_address = committee.primary(&name).unwrap().primary_to_primary;
         primary_address.set_ip("0.0.0.0".parse().unwrap());
-        let primary_listener = transport
-            .listen(primary_address)
-            .await
-            .expect("Failed to create primary listener");
+        let primary_listener = transport.listen(primary_address).await.unwrap();
         NetworkReceiver::spawn(
             primary_listener,
             PrimaryReceiverHandler {
                 tx_primary_messages: tx_primary_messages.clone(),
-                tx_helper: tx_helper_requests, // Gửi yêu cầu tới Helper
+                tx_helper: tx_helper_requests,
             },
         );
         info!(
@@ -131,20 +115,13 @@ impl Primary {
             name, primary_address
         );
 
-        // Lắng nghe tin nhắn từ các Worker
-        let mut worker_address = committee
-            .primary(&name)
-            .expect("Our public key is not in the committee")
-            .worker_to_primary;
+        let mut worker_address = committee.primary(&name).unwrap().worker_to_primary;
         worker_address.set_ip("0.0.0.0".parse().unwrap());
-        let worker_listener = transport
-            .listen(worker_address)
-            .await
-            .expect("Failed to create worker listener");
+        let worker_listener = transport.listen(worker_address).await.unwrap();
         NetworkReceiver::spawn(
             worker_listener,
             WorkerReceiverHandler {
-                tx_our_digests: tx_our_digests.clone(), // Clone để cả GC có thể dùng
+                tx_our_digests: tx_our_digests.clone(),
                 tx_others_digests,
             },
         );
@@ -181,17 +158,31 @@ impl Primary {
             tx_parents,
         );
 
-        // Cập nhật GarbageCollector để có thể giải cứu batch
         GarbageCollector::spawn(
             &name,
             &committee,
             store.clone(),
             consensus_round.clone(),
+            pending_batches.clone(), // Truyền cache
             rx_consensus,
             tx_repropose,
         );
 
         PayloadReceiver::spawn(store.clone(), payload_cache.clone(), rx_others_digests);
+
+        Proposer::spawn(
+            name,
+            &committee,
+            signature_service,
+            store.clone(),
+            parameters.header_size,
+            parameters.max_header_delay,
+            pending_batches.clone(), // Truyền cache
+            rx_parents,
+            rx_our_digests,
+            rx_repropose,
+            tx_headers,
+        );
 
         HeaderWaiter::spawn(
             name,
@@ -204,27 +195,11 @@ impl Primary {
             rx_sync_headers,
             tx_headers_loopback,
         );
-
         CertificateWaiter::spawn(
             store.clone(),
             rx_sync_certificates,
             tx_certificates_loopback,
         );
-
-        // Cập nhật Proposer để nhận lại batch mồ côi
-        Proposer::spawn(
-            name,
-            &committee,
-            signature_service,
-            store.clone(),
-            parameters.header_size,
-            parameters.max_header_delay,
-            rx_parents,
-            rx_our_digests,
-            rx_repropose,
-            tx_headers,
-        );
-
         Helper::spawn(committee.clone(), store, rx_helper_requests);
 
         info!(
@@ -245,10 +220,8 @@ struct PrimaryReceiverHandler {
 impl MessageHandler for PrimaryReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         let _ = writer.send(Bytes::from("Ack")).await;
-
         let message: PrimaryMessage =
             bincode::deserialize(&serialized).map_err(DagError::SerializationError)?;
-
         match message {
             msg @ PrimaryMessage::CertificatesRequest(..)
             | msg @ PrimaryMessage::CertificateRangeRequest { .. } => {
@@ -286,12 +259,12 @@ impl MessageHandler for WorkerReceiverHandler {
                 .tx_our_digests
                 .send((digest, worker_id, batch))
                 .await
-                .expect("Failed to send workers' digests"),
+                .expect("Failed to send our workers' digests"),
             WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch) => self
                 .tx_others_digests
                 .send((digest, worker_id, batch))
                 .await
-                .expect("Failed to send workers' digests"),
+                .expect("Failed to send others workers' digests"),
         }
         Ok(())
     }

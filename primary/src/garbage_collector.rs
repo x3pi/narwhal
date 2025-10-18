@@ -1,26 +1,27 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::Certificate;
-use crate::primary::{PrimaryWorkerMessage, Round};
+use crate::primary::{PendingBatches, PrimaryWorkerMessage, Round};
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
-use log::{debug, warn};
+use log::warn;
 use network::SimpleSender;
-use std::convert::TryInto;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use store::{Store, PENDING_BATCHES_CF};
+use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{interval, Duration};
 
-const REPROPOSE_SCAN_INTERVAL_MS: u64 = 5_000; // Quét 5 giây một lần
-const ORPHAN_BATCH_THRESHOLD_ROUNDS: Round = 10; // Batch cũ hơn 10 round sẽ bị coi là mồ côi
+const REPROPOSE_SCAN_INTERVAL_MS: u64 = 5_000;
+const ORPHAN_BATCH_THRESHOLD_ROUNDS: Round = 10;
 
 /// Receives the highest round reached by consensus and update it for all tasks.
 pub struct GarbageCollector {
     store: Store,
     consensus_round: Arc<AtomicU64>,
+    /// Cache dùng chung cho các batch đang chờ.
+    pending_batches: PendingBatches,
     rx_consensus: Receiver<Certificate>,
     tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
     addresses: Vec<SocketAddr>,
@@ -28,11 +29,13 @@ pub struct GarbageCollector {
 }
 
 impl GarbageCollector {
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: &PublicKey,
         committee: &Committee,
         store: Store,
         consensus_round: Arc<AtomicU64>,
+        pending_batches: PendingBatches,
         rx_consensus: Receiver<Certificate>,
         tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
     ) {
@@ -47,6 +50,7 @@ impl GarbageCollector {
             Self {
                 store,
                 consensus_round,
+                pending_batches,
                 rx_consensus,
                 tx_repropose,
                 addresses,
@@ -64,48 +68,29 @@ impl GarbageCollector {
         }
         let orphan_round_threshold = current_round - ORPHAN_BATCH_THRESHOLD_ROUNDS;
 
-        let pending_batches_cf = PENDING_BATCHES_CF.to_string();
-
-        // Sử dụng phương thức iter_cf mới để lấy tất cả các batch đang chờ.
-        match self.store.iter_cf(pending_batches_cf.clone()).await {
-            Ok(pending_items) => {
-                for (key, value_bytes) in pending_items {
-                    // Key có cấu trúc [round_bytes (8), digest_bytes (32)]
-                    if key.len() < 8 {
-                        continue;
-                    }
-                    let round_bytes: [u8; 8] = key[0..8].try_into().unwrap();
-                    let round = Round::from_le_bytes(round_bytes);
-
-                    if round < orphan_round_threshold {
-                        // Đây là một batch mồ côi.
-                        let digest_bytes: [u8; 32] = key[8..].try_into().unwrap();
-                        let digest = Digest(digest_bytes);
-
-                        if let Ok(worker_id) = bincode::deserialize::<WorkerId>(&value_bytes) {
-                            // Đọc lại dữ liệu batch từ store chính.
-                            if let Ok(Some(batch_data)) = self.store.read(digest.to_vec()).await {
-                                warn!(
-                                    "Found orphaned batch {} from round {}, re-proposing.",
-                                    digest, round
-                                );
-                                // Gửi lại cho Proposer.
-                                if self
-                                    .tx_repropose
-                                    .send((digest, worker_id, batch_data))
-                                    .await
-                                    .is_ok()
-                                {
-                                    // Sau khi gửi thành công, xóa khỏi danh sách chờ.
-                                    self.store.delete_cf(pending_batches_cf.clone(), key).await;
-                                }
-                            }
-                        }
-                    }
-                }
+        // Quét cache đồng thời một cách an toàn.
+        let mut orphaned_digests = Vec::new();
+        for item in self.pending_batches.iter() {
+            let (digest, (_worker_id, round)) = item.pair();
+            if *round < orphan_round_threshold {
+                orphaned_digests.push(digest.clone());
             }
-            Err(e) => {
-                warn!("Failed to iterate over pending batches: {}", e);
+        }
+
+        for digest in orphaned_digests {
+            // Xóa khỏi cache và lấy giá trị.
+            if let Some((_, (worker_id, round))) = self.pending_batches.remove(&digest) {
+                if let Ok(Some(batch_data)) = self.store.read(digest.to_vec()).await {
+                    warn!(
+                        "Found orphaned batch {} from round {}, re-proposing.",
+                        digest, round
+                    );
+                    // Gửi lại cho Proposer để được đề xuất lại.
+                    let _ = self
+                        .tx_repropose
+                        .send((digest, worker_id, batch_data))
+                        .await;
+                }
             }
         }
     }
@@ -117,20 +102,17 @@ impl GarbageCollector {
         loop {
             tokio::select! {
                 Some(certificate) = self.rx_consensus.recv() => {
-                    // Khi một certificate được commit, xóa các batch của nó khỏi danh sách chờ.
+                    // Xóa các batch đã được commit khỏi cache.
                     for (digest, _) in certificate.header.payload.iter() {
-                        let key = [certificate.round().to_le_bytes().to_vec(), digest.to_vec()].concat();
-                        self.store
-                            .delete_cf(PENDING_BATCHES_CF.to_string(), key)
-                            .await;
+                        self.pending_batches.remove(digest);
                     }
 
                     let round = certificate.round();
                     if round > last_committed_round {
                         last_committed_round = round;
-
                         self.consensus_round.store(round, Ordering::Relaxed);
 
+                        // Gửi tín hiệu dọn dẹp cho các worker.
                         let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
                             .expect("Failed to serialize our own message");
                         self.network
@@ -139,7 +121,7 @@ impl GarbageCollector {
                     }
                 },
                 _ = repropose_timer.tick() => {
-                    // Theo định kỳ, quét và đề xuất lại các batch mồ côi.
+                    // Theo định kỳ, quét cache để tìm và đề xuất lại các batch mồ côi.
                     self.re_propose_orphaned_batches().await;
                 }
             }
