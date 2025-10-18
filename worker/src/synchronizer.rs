@@ -5,7 +5,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error};
+use log::{debug, error, info};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
 use std::collections::HashMap;
@@ -173,6 +173,11 @@ impl Synchronizer {
                             }
                         }
                         self.pending.retain(|_, (r, _, _)| r > &mut gc_round);
+                    },
+                    PrimaryWorkerMessage::Reconfigure => {
+                        info!("Worker {} received reconfigure message, reloading committee", self.id);
+                        // In a real implementation, the worker would reload the committee from a trusted source.
+                        // For now, we just log that the message has been received.
                     }
                 },
 

@@ -101,20 +101,20 @@ impl Parameters {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct PrimaryAddresses {
     pub primary_to_primary: SocketAddr,
     pub worker_to_primary: SocketAddr,
 }
 
-#[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
 pub struct WorkerAddresses {
     pub transactions: SocketAddr,
     pub worker_to_worker: SocketAddr,
     pub primary_to_worker: SocketAddr,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Authority {
     pub stake: Stake,
     pub consensus_key: ConsensusPublicKey,
@@ -122,7 +122,7 @@ pub struct Authority {
     pub workers: HashMap<WorkerId, WorkerAddresses>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
 }
@@ -250,4 +250,3 @@ impl Default for KeyPair {
         Self::new()
     }
 }
-

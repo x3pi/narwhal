@@ -4,7 +4,7 @@
 use crate::aggregators::{CertificatesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Vote};
-use crate::primary::{PrimaryMessage, Round};
+use crate::primary::{PrimaryMessage, PrimaryWorkerMessage, Round};
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -28,6 +28,7 @@ pub mod core_tests;
 const SYNC_CHUNK_SIZE: Round = 1000;
 const SYNC_RETRY_DELAY: u64 = 5_000;
 const SYNC_MAX_RETRIES: u32 = 10;
+const RECONFIGURE_INTERVAL: Round = 1000;
 
 struct SyncState {
     final_target_round: Round,
@@ -60,6 +61,7 @@ pub struct Core {
     network: ReliableSender,
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
     sync_state: Option<SyncState>,
+    last_reconfigure_round: Round,
 }
 
 impl Core {
@@ -106,6 +108,7 @@ impl Core {
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 sync_state: None,
+                last_reconfigure_round: 0,
             }
             .run()
             .await;
@@ -473,6 +476,14 @@ impl Core {
                 }
                 Ok(())
             }
+            PrimaryMessage::Reconfigure => {
+                info!("Received committee reconfiguration signal. Node should now reload the committee.");
+                // In a real implementation, each component would be responsible for reloading the committee,
+                // for example, by reading a new committee file from a well-known location.
+                // For simplicity, we just log this event here.
+                // self.committee = Committee::import("new_committee.json").expect("Failed to load new committee");
+                Ok(())
+            }
             _ => Ok(()),
         }
     }
@@ -505,6 +516,34 @@ impl Core {
             }
 
             if self.sync_state.is_none() {
+                // Check if it's time to reconfigure the committee.
+                if self.dag_round > 0 && self.dag_round % RECONFIGURE_INTERVAL == 0 && self.dag_round > self.last_reconfigure_round {
+                    self.last_reconfigure_round = self.dag_round;
+                    info!("Round {}, triggering committee reconfiguration", self.dag_round);
+
+                    // In a real implementation, we would load a new committee from a trusted source.
+                    // Here we just create a clone to simulate the process.
+                    let new_committee = self.committee.clone();
+                    self.committee = new_committee;
+
+                    // Broadcast the reconfigure message to all other primaries.
+                    let reconfigure_message = PrimaryMessage::Reconfigure;
+                    let addresses = self.committee.others_primaries(&self.name).iter().map(|(_, x)| x.primary_to_primary).collect();
+                    let bytes = bincode::serialize(&reconfigure_message).expect("Failed to serialize reconfigure message");
+                    self.network.broadcast(addresses, Bytes::from(bytes)).await;
+
+                    // Send reconfigure message to our own workers.
+                    let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure;
+                     match self.committee.our_workers(&self.name) {
+                        Ok(worker_addresses) => {
+                            let addresses = worker_addresses.iter().map(|x| x.primary_to_worker).collect();
+                            let bytes = bincode::serialize(&worker_reconfigure_message).expect("Failed to serialize worker reconfigure message");
+                            self.network.broadcast(addresses, Bytes::from(bytes)).await;
+                        },
+                        Err(e) => warn!("Could not get our worker addresses: {}", e),
+                    }
+                }
+
                 let round = self.consensus_round.load(Ordering::Relaxed);
                 if round > self.gc_depth {
                     let gc_round = round - self.gc_depth;

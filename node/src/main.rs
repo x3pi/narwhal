@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use anyhow::{Context, Result};
+use bytes::{BufMut, BytesMut};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
@@ -8,17 +9,12 @@ use consensus::Consensus;
 use consensus::{Bullshark, ConsensusProtocol};
 use env_logger::Env;
 use primary::{Certificate, Primary};
-use store::Store;
-use tokio::sync::mpsc::{channel, Receiver};
-use worker::{Worker, WorkerMessage};
-
-// use std::io::Write;
-
-// Thêm các use statements cần thiết
-use bytes::{BufMut, BytesMut};
 use prost::Message;
+use store::Store;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
+use tokio::sync::mpsc::{channel, Receiver};
+use worker::{Worker, WorkerMessage};
 
 // Thêm module để import các struct được tạo bởi prost
 pub mod comm {
@@ -163,9 +159,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         _ => unreachable!(),
     }
 
-    // Giữ cho tiến trình chính sống mãi mãi.
-    // SỬA LỖI: Đổi tên biến không sử dụng thành `_tx`.
-    let (_tx, mut rx) = channel::<()>(1);
+    // Keep the main thread alive.
+    let (tx, mut rx) = channel::<()>(1);
     rx.recv().await;
 
     unreachable!();

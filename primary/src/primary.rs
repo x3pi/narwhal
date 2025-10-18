@@ -55,6 +55,8 @@ pub enum PrimaryMessage {
     },
     /// Phản hồi chứa một gói các certificate.
     CertificateBundle(Vec<Certificate>),
+    /// Yêu cầu cập nhật committee.
+    Reconfigure,
 }
 // --- END: Bổ sung các định nghĩa ---
 
@@ -62,6 +64,8 @@ pub enum PrimaryMessage {
 pub enum PrimaryWorkerMessage {
     Synchronize(Vec<Digest>, PublicKey),
     Cleanup(Round),
+    /// Yêu cầu worker cập nhật committee.
+    Reconfigure,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

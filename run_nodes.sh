@@ -19,15 +19,15 @@ COMMITTEE_FILE="$BENCHMARK_DIR/.committee.json"
 PARAMETERS_FILE="$BENCHMARK_DIR/.parameters.json"
 
 # --- Dọn dẹp triệt để trước khi chạy ---
-echo "--- 🧹 Stage 0: Cleanup ---"
-tmux kill-server || true
-pkill -f "$NODE_BINARY" || true
-pkill -f "$EXECUTOR_BINARY" || true
-sleep 1
-# SỬA LỖI: Xóa cả các file socket cũ trong /tmp
-rm -rf "$LOG_DIR" "$BENCHMARK_DIR"/db-* /tmp/executor*.sock
-mkdir -p "$LOG_DIR"
-echo "✅ Cleanup done!"
+# echo "--- 🧹 Stage 0: Cleanup ---"
+# tmux kill-server || true
+# pkill -f "$NODE_BINARY" || true
+# pkill -f "$EXECUTOR_BINARY" || true
+# sleep 1
+# # SỬA LỖI: Xóa cả các file socket cũ trong /tmp
+# rm -rf "$LOG_DIR" "$BENCHMARK_DIR"/db-* /tmp/executor*.sock
+# mkdir -p "$LOG_DIR"
+# echo "✅ Cleanup done!"
 
 
 echo "🚀 Launching Nodes, Workers, and Executors in tmux..."
@@ -43,8 +43,9 @@ for i in $(seq 0 $((NODES-1))); do
     # --- SỬA LỖI: Khởi chạy Executor TRƯỚC ---
     executor_log_file="$LOG_DIR/executor-$i.log"
     executor_cmd="$EXECUTOR_BINARY --id $i"
-    tmux new -d -s "executor-$i" "$executor_cmd > '$executor_log_file' 2>&1"
-
+    if [ "$i" -ne 0 ]; then
+        tmux new -d -s "executor-$i" "$executor_cmd > '$executor_log_file' 2>&1"
+    fi
     # --- SỬA LỖI: Thêm một khoảng nghỉ ngắn để executor tạo socket ---
     sleep 0.2
 

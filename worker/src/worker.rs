@@ -261,10 +261,24 @@ struct TxReceiverHandler {
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+        // Kiểm tra xem message có đủ 8 byte để cắt không.
+        if message.len() < 8 {
+            warn!(
+                "Giao dịch nhận được quá ngắn ({_len} bytes), không chứa đủ 8 byte độ dài. Bỏ qua.",
+                _len = message.len()
+            );
+            return Ok(());
+        }
+
+        // Cắt lấy phần payload: bắt đầu từ byte thứ 8 cho đến hết.
+        let payload = &message[8..];
+
+        // Gửi phần payload đã được cắt vào quá trình đồng thuận.
         self.tx_batch_maker
-            .send(message.to_vec())
+            .send(payload.to_vec())
             .await
-            .expect("Failed to send transaction");
+            .expect("Failed to send transaction payload");
+
         Ok(())
     }
 }
@@ -310,11 +324,17 @@ impl MessageHandler for PrimaryReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => self
-                .tx_synchronizer
-                .send(message)
-                .await
-                .expect("Failed to send transaction"),
+            Ok(message) => {
+                if let PrimaryWorkerMessage::Reconfigure = message {
+                    info!("Received reconfigure signal from primary.");
+                    // The synchronizer and other worker components should handle this message
+                    // to reload the committee and update their configurations.
+                }
+                self.tx_synchronizer
+                    .send(message)
+                    .await
+                    .expect("Failed to send message to synchronizer")
+            }
         }
         Ok(())
     }

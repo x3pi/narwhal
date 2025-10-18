@@ -15,7 +15,7 @@ futures = "0.3.14"
 async-trait = "0.1.50"
 env_logger = "0.7.1"
 sha3 = "0.10.6"
-
+hex = "0.4.3"
 crypto = { path = "../crypto" }
 store = { path = "../store" }
 config = { path = "../config" }
