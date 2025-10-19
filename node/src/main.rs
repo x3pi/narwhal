@@ -1,3 +1,5 @@
+// In node/src/main.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use anyhow::{Context, Result};
 use bytes::{BufMut, BytesMut};
@@ -10,18 +12,18 @@ use consensus::{Bullshark, ConsensusProtocol};
 use env_logger::Env;
 use primary::{Certificate, Primary};
 use prost::Message;
+use std::sync::Arc;
 use store::Store;
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 use tokio::sync::mpsc::{channel, Receiver};
+use tokio::sync::RwLock;
 use worker::{Worker, WorkerMessage};
 
-// Thêm module để import các struct được tạo bởi prost
 pub mod comm {
     include!(concat!(env!("OUT_DIR"), "/comm.rs"));
 }
 
-/// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 10_000;
 
 #[tokio::main]
@@ -75,7 +77,6 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-// Runs either a worker or a primary.
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let key_file = matches.value_of("keys").unwrap();
     let committee_file = matches.value_of("committee").unwrap();
@@ -98,6 +99,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     match matches.subcommand() {
         ("primary", _) => {
+            let committee_arc = Arc::new(RwLock::new(committee.clone()));
+
             let mut primary_keys: Vec<_> = committee.authorities.keys().cloned().collect();
             primary_keys.sort();
 
@@ -107,8 +110,6 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 .context("Public key không tìm thấy trong committee file")?;
 
             log::info!("Node {} khởi chạy với ID: {}", keypair.name, node_id);
-            log::info!("Node's eth secret: {}", keypair.secret.encode_base64());
-            log::info!("Node's eth address: {:?}", keypair.name.to_eth_address());
 
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
@@ -122,19 +123,14 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 rx_feedback,
             ));
 
-            let committee_clone: Committee = committee.clone();
-
             Consensus::spawn(
-                committee,
+                committee.clone(),
                 parameters.gc_depth,
                 store.clone(),
                 rx_new_certificates,
                 tx_feedback,
                 tx_output,
-                ConsensusProtocol::Bullshark(Bullshark {
-                    committee: committee_clone,
-                    gc_depth: parameters.gc_depth,
-                }),
+                ConsensusProtocol::Bullshark(Bullshark::new(committee, parameters.gc_depth)),
             );
 
             analyze(rx_output, node_id, store).await;
@@ -159,14 +155,12 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         _ => unreachable!(),
     }
 
-    // Keep the main thread alive.
     let (tx, mut rx) = channel::<()>(1);
     rx.recv().await;
 
     unreachable!();
 }
 
-/// Receives an ordered list of certificates and apply any application-specific logic.
 async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {

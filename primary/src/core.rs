@@ -20,7 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use store::{Store, ROUND_INDEX_CF};
 use tokio::sync::mpsc::{Receiver, Sender};
-use tokio::time::sleep;
+use tokio::sync::RwLock;
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
@@ -29,7 +29,7 @@ pub mod core_tests;
 const SYNC_CHUNK_SIZE: Round = 1000;
 const SYNC_RETRY_DELAY: u64 = 5_000;
 const SYNC_MAX_RETRIES: u32 = 10;
-const RECONFIGURE_INTERVAL: Round = 1000;
+const RECONFIGURE_INTERVAL: Round = 100;
 
 struct SyncState {
     final_target_round: Round,
@@ -37,9 +37,17 @@ struct SyncState {
     retry_count: u32,
 }
 
+enum ReconfigurationState {
+    Running,
+    Reconfiguring {
+        new_committee: Committee,
+        pending_reconfiguration: HashSet<PublicKey>,
+    },
+}
+
 pub struct Core {
     name: PublicKey,
-    committee: Committee,
+    committee: Arc<RwLock<Committee>>,
     store: Store,
     synchronizer: Synchronizer,
     signature_service: SignatureService,
@@ -63,13 +71,14 @@ pub struct Core {
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
     sync_state: Option<SyncState>,
     last_reconfigure_round: Round,
+    reconfiguration_state: ReconfigurationState,
 }
 
 impl Core {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
-        committee: Committee,
+        committee: Arc<RwLock<Committee>>,
         store: Store,
         synchronizer: Synchronizer,
         signature_service: SignatureService,
@@ -110,6 +119,7 @@ impl Core {
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 sync_state: None,
                 last_reconfigure_round: 0,
+                reconfiguration_state: ReconfigurationState::Running,
             }
             .run()
             .await;
@@ -128,6 +138,8 @@ impl Core {
         };
         let addresses = self
             .committee
+            .read()
+            .await
             .others_primaries(&self.name)
             .iter()
             .map(|(_, x)| x.primary_to_primary)
@@ -181,6 +193,8 @@ impl Core {
 
         let addresses = self
             .committee
+            .read()
+            .await
             .others_primaries(&self.name)
             .iter()
             .map(|(_, x)| x.primary_to_primary)
@@ -194,7 +208,6 @@ impl Core {
             .or_insert_with(Vec::new)
             .extend(handlers);
 
-        // Not syncing, so pass `false`
         self.process_header(&header, false).await
     }
 
@@ -210,16 +223,18 @@ impl Core {
             debug!("Processing of {} suspended: missing parent(s)", header.id);
             return Ok(());
         }
+
+        let committee_guard = self.committee.read().await;
         let mut stake = 0;
         for x in parents {
             ensure!(
                 x.round() + 1 == header.round,
                 DagError::MalformedHeader(header.id.clone())
             );
-            stake += self.committee.stake(&x.origin());
+            stake += committee_guard.stake(&x.origin());
         }
         ensure!(
-            stake >= self.committee.quorum_threshold(),
+            stake >= committee_guard.quorum_threshold(),
             DagError::HeaderRequiresQuorum(header.id.clone())
         );
         if self.synchronizer.missing_payload(header).await? {
@@ -238,14 +253,16 @@ impl Core {
             {
                 let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
                 debug!("Created {:?}", vote);
+
+                let author_address_result = committee_guard.primary(&header.author);
+                drop(committee_guard);
+
                 if vote.origin == self.name {
                     self.process_vote(vote)
                         .await
                         .expect("Failed to process our own vote");
                 } else {
-                    let address = self
-                        .committee
-                        .primary(&header.author)
+                    let address = author_address_result
                         .expect("Author not in committee")
                         .primary_to_primary;
                     let bytes = bincode::serialize(&PrimaryMessage::Vote(vote))
@@ -264,15 +281,22 @@ impl Core {
     #[async_recursion]
     async fn process_vote(&mut self, vote: Vote) -> DagResult<()> {
         debug!("Processing {:?}", vote);
-        if let Some(certificate) =
-            self.votes_aggregator
-                .append(vote, &self.committee, &self.current_header)?
+        let certificate_option;
         {
+            let committee = self.committee.read().await;
+            certificate_option =
+                self.votes_aggregator
+                    .append(vote, &committee, &self.current_header)?;
+        }
+
+        if let Some(certificate) = certificate_option {
             debug!("Assembled {:?}", certificate);
 
             let cert_round = certificate.round();
             let addresses = self
                 .committee
+                .read()
+                .await
                 .others_primaries(&self.name)
                 .iter()
                 .map(|(_, x)| x.primary_to_primary)
@@ -281,7 +305,6 @@ impl Core {
                 .expect("Failed to serialize certificate");
             let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
 
-            // Not syncing, so pass `false`
             self.process_certificate(certificate, false)
                 .await
                 .expect("Failed to process valid certificate");
@@ -306,7 +329,6 @@ impl Core {
             .get(&certificate.header.round)
             .map_or(false, |x| x.contains(&certificate.header.id))
         {
-            // Pass the syncing flag down
             self.process_header(&certificate.header, syncing).await?;
         }
         if !self.synchronizer.deliver_certificate(&certificate).await? {
@@ -336,12 +358,18 @@ impl Core {
                 self.store.write_cf(cf_name, round_key, digests_value).await;
             }
         }
-        if let Some(parents) = self
-            .certificates_aggregators
-            .entry(certificate.round())
-            .or_insert_with(|| Box::new(CertificatesAggregator::new()))
-            .append(certificate.clone(), &self.committee)?
+
+        let parents_option;
         {
+            let committee = self.committee.read().await;
+            parents_option = self
+                .certificates_aggregators
+                .entry(certificate.round())
+                .or_insert_with(|| Box::new(CertificatesAggregator::new()))
+                .append(certificate.clone(), &committee)?;
+        }
+
+        if let Some(parents) = parents_option {
             if !syncing {
                 self.tx_proposer
                     .send((parents, certificate.round()))
@@ -349,6 +377,20 @@ impl Core {
                     .expect("Failed to send certificate to proposer");
             }
         }
+
+        if let ReconfigurationState::Reconfiguring {
+            pending_reconfiguration,
+            ..
+        } = &mut self.reconfiguration_state
+        {
+            if certificate.round() == self.dag_round {
+                pending_reconfiguration.remove(&certificate.origin());
+                if pending_reconfiguration.is_empty() {
+                    self.finalize_reconfiguration().await;
+                }
+            }
+        }
+
         let id = certificate.header.id.clone();
         if let Err(e) = self.tx_consensus.send(certificate).await {
             warn!(
@@ -359,15 +401,16 @@ impl Core {
         Ok(())
     }
 
-    fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
+    async fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
         ensure!(
             self.gc_round <= header.round,
             DagError::TooOld(header.id.clone(), header.round)
         );
-        header.verify(&self.committee)
+        let committee = self.committee.read().await;
+        header.verify(&committee)
     }
 
-    fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
+    async fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
         ensure!(
             self.current_header.round <= vote.round,
             DagError::TooOld(vote.digest(), vote.round)
@@ -378,20 +421,21 @@ impl Core {
                 && vote.round == self.current_header.round,
             DagError::UnexpectedVote(vote.id.clone())
         );
-        vote.verify(&self.committee).map_err(DagError::from)
+        let committee = self.committee.read().await;
+        vote.verify(&committee).map_err(DagError::from)
     }
 
-    fn sanitize_certificate(&mut self, certificate: &Certificate) -> DagResult<()> {
+    async fn sanitize_certificate(&mut self, certificate: &Certificate) -> DagResult<()> {
         ensure!(
             self.gc_round <= certificate.round(),
             DagError::TooOld(certificate.digest(), certificate.round())
         );
-        certificate.verify(&self.committee).map_err(DagError::from)
+        let committee = self.committee.read().await;
+        certificate.verify(&committee).map_err(DagError::from)
     }
 
     async fn handle_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
         if self.sync_state.is_some() {
-            // Logic when in sync state.
             match message {
                 PrimaryMessage::CertificateBundle(certificates) => {
                     let mut state = self.sync_state.take().unwrap();
@@ -402,39 +446,28 @@ impl Core {
                             "Processing a sync bundle of {} certificates.",
                             certificates.len()
                         );
-
-                        // --- TỐI ƯU HÓA: Song song hóa xác thực certificate ---
-                        // Di chuyển tác vụ xác thực nặng sang một luồng chặn (blocking thread)
-                        // để không làm nghẽn event loop của Tokio.
-                        // Bên trong luồng đó, sử dụng Rayon để xác thực tất cả certificate song song.
-                        let committee = self.committee.clone();
+                        let committee = self.committee.read().await.clone();
                         let verification_results = tokio::task::spawn_blocking(move || {
                             certificates
-                                .into_par_iter() // Sử dụng parallel iterator của Rayon
-                                .filter_map(|cert| {
-                                    // Xác thực mỗi certificate trên một luồng CPU khác nhau (nếu có).
-                                    match cert.verify(&committee) {
-                                        Ok(_) => Some(cert),
-                                        Err(e) => {
-                                            warn!(
-                                                "Received invalid certificate {} during sync: {}",
-                                                cert.digest(),
-                                                e
-                                            );
-                                            None
-                                        }
+                                .into_par_iter()
+                                .filter_map(|cert| match cert.verify(&committee) {
+                                    Ok(_) => Some(cert),
+                                    Err(e) => {
+                                        warn!(
+                                            "Received invalid certificate {} during sync: {}",
+                                            cert.digest(),
+                                            e
+                                        );
+                                        None
                                     }
                                 })
                                 .collect::<Vec<Certificate>>()
                         })
                         .await
                         .expect("Verification task panicked");
-                        // --- KẾT THÚC TỐI ƯU HÓA ---
 
                         let mut latest_round_in_bundle = self.dag_round;
-                        // Lặp qua các certificate đã được xác thực trước.
                         for certificate in verification_results {
-                            // We are in sync state, so pass `true`
                             if self
                                 .process_certificate(certificate.clone(), true)
                                 .await
@@ -456,7 +489,8 @@ impl Core {
                     let target_round = self.sync_state.as_ref().map_or(0, |s| s.final_target_round);
                     let cert_round = certificate.round();
 
-                    if cert_round > target_round && self.sanitize_certificate(&certificate).is_ok()
+                    if cert_round > target_round
+                        && self.sanitize_certificate(&certificate).await.is_ok()
                     {
                         info!(
                             "Sync target updated to a newer round {}. Still syncing.",
@@ -472,15 +506,13 @@ impl Core {
             return Ok(());
         }
 
-        // Logic when not in sync state
         match message {
             PrimaryMessage::Header(header) => {
-                self.sanitize_header(&header)?;
-                // Not syncing, so pass `false`
+                self.sanitize_header(&header).await?;
                 self.process_header(&header, false).await
             }
             PrimaryMessage::Vote(vote) => {
-                self.sanitize_vote(&vote)?;
+                self.sanitize_vote(&vote).await?;
                 self.process_vote(vote).await
             }
             PrimaryMessage::Certificate(certificate) => {
@@ -498,22 +530,49 @@ impl Core {
                     });
                     self.advance_sync().await;
                 } else {
-                    self.sanitize_certificate(&certificate)?;
+                    self.sanitize_certificate(&certificate).await?;
                     self.dag_round = self.dag_round.max(certificate.round());
-                    // Not syncing, so pass `false`
                     self.process_certificate(certificate, false).await?;
                 }
                 Ok(())
             }
-            PrimaryMessage::Reconfigure => {
-                info!("Received committee reconfiguration signal. Node should now reload the committee.");
-                // In a real implementation, each component would be responsible for reloading the committee,
-                // for example, by reading a new committee file from a well-known location.
-                // For simplicity, we just log this event here.
-                // self.committee = Committee::import("new_committee.json").expect("Failed to load new committee");
+            PrimaryMessage::Reconfigure(new_committee) => {
+                // Khi nhận tin nhắn này từ một node khác, ta cũng bắt đầu quá trình nội bộ.
+                info!("Received committee reconfiguration signal from another primary.");
+                self.start_reconfiguration(new_committee).await;
                 Ok(())
             }
             _ => Ok(()),
+        }
+    }
+
+    async fn start_reconfiguration(&mut self, new_committee: Committee) {
+        if let ReconfigurationState::Running = self.reconfiguration_state {
+            info!(
+                "Starting internal reconfiguration to new committee at round {}",
+                self.dag_round
+            );
+
+            // Không cần chờ các node cũ nữa, chỉ cần cập nhật trực tiếp.
+            let mut committee_lock = self.committee.write().await;
+            *committee_lock = new_committee;
+
+            info!("Internal committee update complete.");
+        }
+    }
+
+    async fn finalize_reconfiguration(&mut self) {
+        // Hàm này có thể không cần thiết nữa với logic nội bộ,
+        // nhưng chúng ta giữ lại để tương thích cấu trúc.
+        if let ReconfigurationState::Reconfiguring { new_committee, .. } = std::mem::replace(
+            &mut self.reconfiguration_state,
+            ReconfigurationState::Running,
+        ) {
+            info!("Finalizing reconfiguration.");
+            let mut committee_lock = self.committee.write().await;
+            *committee_lock = new_committee;
+            self.reconfiguration_state = ReconfigurationState::Running;
+            info!("Reconfiguration complete. Now operating with new committee.");
         }
     }
 
@@ -527,7 +586,6 @@ impl Core {
                 Some(header) = self.rx_header_waiter.recv(), if self.sync_state.is_none() => self.process_header(&header, false).await,
                 Some(certificate) = self.rx_certificate_waiter.recv(), if self.sync_state.is_none() => self.process_certificate(certificate, false).await,
                 Some(header) = self.rx_proposer.recv(), if self.sync_state.is_none() => self.process_own_header(header).await,
-
                 _ = sync_retry_timer.tick(), if self.sync_state.is_some() => {
                     warn!("Sync request timed out. Retrying...");
                     self.advance_sync().await;
@@ -545,37 +603,49 @@ impl Core {
             }
 
             if self.sync_state.is_none() {
-                // Check if it's time to reconfigure the committee.
                 if self.dag_round > 0
                     && self.dag_round % RECONFIGURE_INTERVAL == 0
                     && self.dag_round > self.last_reconfigure_round
                 {
                     self.last_reconfigure_round = self.dag_round;
                     info!(
-                        "Round {}, triggering committee reconfiguration",
+                        "Round {}, triggering INTERNAL committee reconfiguration",
                         self.dag_round
                     );
 
-                    // In a real implementation, we would load a new committee from a trusted source.
-                    // Here we just create a clone to simulate the process.
-                    let new_committee = self.committee.clone();
-                    self.committee = new_committee;
+                    let new_committee;
+                    {
+                        let committee = self.committee.read().await;
+                        // Trong thực tế, bạn sẽ tải committee mới từ một file hoặc nguồn tin cậy
+                        new_committee = committee.clone();
+                    }
 
-                    // Broadcast the reconfigure message to all other primaries.
-                    let reconfigure_message = PrimaryMessage::Reconfigure;
-                    let addresses = self
-                        .committee
-                        .others_primaries(&self.name)
-                        .iter()
-                        .map(|(_, x)| x.primary_to_primary)
-                        .collect();
+                    // Bắt đầu quá trình cập nhật nội bộ
+                    self.start_reconfiguration(new_committee.clone()).await;
+
+                    // SỬA ĐỔI: Vô hiệu hóa việc gửi tin nhắn Reconfigure đến các Primary khác
+                    /*
+                    let reconfigure_message = PrimaryMessage::Reconfigure(new_committee.clone());
+                    let addresses;
+                    {
+                        let committee = self.committee.read().await;
+                        addresses = committee
+                            .others_primaries(&self.name)
+                            .iter()
+                            .map(|(_, x)| x.primary_to_primary)
+                            .collect();
+                    }
                     let bytes = bincode::serialize(&reconfigure_message)
                         .expect("Failed to serialize reconfigure message");
                     self.network.broadcast(addresses, Bytes::from(bytes)).await;
+                    */
+                    info!("Skipping broadcast of Reconfigure message to other primaries.");
 
-                    // Send reconfigure message to our own workers.
-                    let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure;
-                    match self.committee.our_workers(&self.name) {
+                    // Vẫn gửi tin nhắn cập nhật đến các Worker của chính node này
+                    let worker_reconfigure_message =
+                        PrimaryWorkerMessage::Reconfigure(new_committee);
+                    let committee = self.committee.read().await;
+                    match committee.our_workers(&self.name) {
                         Ok(worker_addresses) => {
                             let addresses = worker_addresses
                                 .iter()
