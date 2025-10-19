@@ -87,17 +87,25 @@ impl Listener for QuicListener {
 // --- Triển khai Transport chính ---
 #[derive(Clone)]
 pub struct QuicTransport {
-    client_config: ClientConfig,
+    client_endpoint: Arc<Endpoint>,
     server_config: ServerConfig,
+    client_config: ClientConfig, // THÊM: Lưu trữ client config
 }
 impl QuicTransport {
     pub fn new() -> Self {
         let (server_config, client_config) = configure_certificates();
+
+        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(client_config.clone()); // Clone config để sử dụng ở đây
+
         Self {
-            client_config,
+            client_endpoint: Arc::new(endpoint),
             server_config,
+            client_config, // Và lưu trữ bản gốc ở đây
         }
     }
+
+    // SỬA LỖI: Bây giờ hàm này có thể trả về một bản sao của config đã lưu trữ.
     pub fn get_client_config(&self) -> ClientConfig {
         self.client_config.clone()
     }
@@ -111,11 +119,8 @@ impl Default for QuicTransport {
 #[async_trait]
 impl Transport for QuicTransport {
     async fn connect(&self, address: SocketAddr) -> TransportResult<Box<dyn Connection>> {
-        // SỬA LỖI: Tạo và cấu hình endpoint ngay tại đây để đảm bảo mọi kết nối đều đúng.
-        let mut endpoint = Endpoint::client("0.0.0.0:0".parse().unwrap())?;
-        endpoint.set_default_client_config(self.client_config.clone());
+        let connection = self.client_endpoint.connect(address, "localhost")?.await?;
 
-        let connection = endpoint.connect(address, "localhost")?.await?;
         let (sender, receiver) = connection.open_bi().await?;
         let stream = QuicStream { sender, receiver };
         let framed = Framed::new(stream, LengthDelimitedCodec::new());

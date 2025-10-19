@@ -131,7 +131,6 @@ impl ConnectionManager {
                 Ok(connection) => {
                     info!("Outgoing connection established with {}", self.address);
                     retry_delay = Duration::from_millis(200);
-                    // SỬA LỖI: Gán trực tiếp kết quả trả về từ `keep_alive` và log nó.
                     let e = self.keep_alive(connection).await;
                     warn!("{}", e);
                 }
@@ -174,14 +173,16 @@ impl ConnectionManager {
                     }
                 },
                 response = connection.recv() => {
-                    let (_, handler) = match pending_replies.pop_front() {
+                    // SỬA LỖI: Lấy cả data và handler ra khỏi hàng đợi.
+                    let (data, handler) = match pending_replies.pop_front() {
                         Some(message) => message,
                         None => return NetworkError::UnexpectedAck(self.address)
                     };
                     match response {
                         Ok(Some(bytes)) => { let _ = handler.send(bytes); },
                         _ => {
-                            self.buffer.push_front((Bytes::new(), handler));
+                            // SỬA LỖI: Đưa lại tin nhắn gốc (data) vào buffer, không phải tin nhắn rỗng.
+                            self.buffer.push_front((data, handler));
                             while let Some(pending) = pending_replies.pop_back() {
                                 self.buffer.push_front(pending);
                             }
