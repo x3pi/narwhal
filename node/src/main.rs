@@ -179,7 +179,7 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         }
     }
 
-    let socket_path = format!("/tmp/executor{}.sock", node_id);
+    let socket_path: String = format!("/tmp/executor{}.sock", node_id);
     log::info!(
         "[ANALYZE] Node ID {} attempting to connect to {}",
         node_id,
