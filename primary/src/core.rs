@@ -369,7 +369,17 @@ impl Core {
                 .append(certificate.clone(), &committee)?;
         }
 
+        // SỬA ĐỔI: Chuyển logic cập nhật vào đây
         if let Some(parents) = parents_option {
+            let next_round = certificate.round() + 1;
+
+            if next_round > 0
+                && next_round % RECONFIGURE_INTERVAL == 0
+                && next_round > self.last_reconfigure_round
+            {
+                self.trigger_reconfiguration(next_round).await;
+            }
+
             if !syncing {
                 self.tx_proposer
                     .send((parents, certificate.round()))
@@ -399,6 +409,51 @@ impl Core {
             );
         }
         Ok(())
+    }
+
+    // SỬA ĐỔI: Tách logic tái cấu hình ra hàm riêng
+    async fn trigger_reconfiguration(&mut self, next_round: Round) {
+        self.last_reconfigure_round = next_round;
+        info!(
+            "Round {}, triggering INTERNAL committee reconfiguration BEFORE proposing.",
+            next_round
+        );
+
+        let new_committee;
+        {
+            let committee = self.committee.read().await;
+            // Trong thực tế, bạn sẽ tải committee mới từ một file hoặc nguồn tin cậy
+            new_committee = committee.clone();
+        }
+
+        // Cập nhật committee được chia sẻ
+        {
+            let mut committee_guard = self.committee.write().await;
+            *committee_guard = new_committee.clone();
+        }
+        info!(
+            "Internal committee update complete for round {}.",
+            next_round
+        );
+
+        // Gửi tin nhắn cập nhật cho các Worker của chính node này
+        let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure(new_committee);
+        let committee = self.committee.read().await; // Đọc committee MỚI
+        match committee.our_workers(&self.name) {
+            Ok(worker_addresses) => {
+                let addresses = worker_addresses
+                    .iter()
+                    .map(|x| x.primary_to_worker)
+                    .collect();
+                let bytes = bincode::serialize(&worker_reconfigure_message)
+                    .expect("Failed to serialize worker reconfigure message");
+                self.network.broadcast(addresses, Bytes::from(bytes)).await;
+            }
+            Err(e) => warn!(
+                "Could not get our worker addresses for reconfiguring: {}",
+                e
+            ),
+        }
     }
 
     async fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
@@ -536,10 +591,10 @@ impl Core {
                 }
                 Ok(())
             }
-            PrimaryMessage::Reconfigure(new_committee) => {
-                // Khi nhận tin nhắn này từ một node khác, ta cũng bắt đầu quá trình nội bộ.
-                info!("Received committee reconfiguration signal from another primary.");
-                self.start_reconfiguration(new_committee).await;
+            PrimaryMessage::Reconfigure(_) => {
+                // Logic này sẽ không được gọi nữa nếu chỉ cập nhật nội bộ,
+                // nhưng giữ lại để phòng trường hợp cần mở rộng.
+                info!("Received committee reconfiguration signal. Ignoring in internal-only mode.");
                 Ok(())
             }
             _ => Ok(()),
@@ -553,7 +608,6 @@ impl Core {
                 self.dag_round
             );
 
-            // Không cần chờ các node cũ nữa, chỉ cần cập nhật trực tiếp.
             let mut committee_lock = self.committee.write().await;
             *committee_lock = new_committee;
 
@@ -562,8 +616,6 @@ impl Core {
     }
 
     async fn finalize_reconfiguration(&mut self) {
-        // Hàm này có thể không cần thiết nữa với logic nội bộ,
-        // nhưng chúng ta giữ lại để tương thích cấu trúc.
         if let ReconfigurationState::Reconfiguring { new_committee, .. } = std::mem::replace(
             &mut self.reconfiguration_state,
             ReconfigurationState::Running,
@@ -602,63 +654,8 @@ impl Core {
                 Err(e) => warn!("{}", e),
             }
 
+            // SỬA ĐỔI: Xóa bỏ logic cập nhật cũ khỏi vòng lặp chính
             if self.sync_state.is_none() {
-                if self.dag_round > 0
-                    && self.dag_round % RECONFIGURE_INTERVAL == 0
-                    && self.dag_round > self.last_reconfigure_round
-                {
-                    self.last_reconfigure_round = self.dag_round;
-                    info!(
-                        "Round {}, triggering INTERNAL committee reconfiguration",
-                        self.dag_round
-                    );
-
-                    let new_committee;
-                    {
-                        let committee = self.committee.read().await;
-                        // Trong thực tế, bạn sẽ tải committee mới từ một file hoặc nguồn tin cậy
-                        new_committee = committee.clone();
-                    }
-
-                    // Bắt đầu quá trình cập nhật nội bộ
-                    self.start_reconfiguration(new_committee.clone()).await;
-
-                    // SỬA ĐỔI: Vô hiệu hóa việc gửi tin nhắn Reconfigure đến các Primary khác
-                    /*
-                    let reconfigure_message = PrimaryMessage::Reconfigure(new_committee.clone());
-                    let addresses;
-                    {
-                        let committee = self.committee.read().await;
-                        addresses = committee
-                            .others_primaries(&self.name)
-                            .iter()
-                            .map(|(_, x)| x.primary_to_primary)
-                            .collect();
-                    }
-                    let bytes = bincode::serialize(&reconfigure_message)
-                        .expect("Failed to serialize reconfigure message");
-                    self.network.broadcast(addresses, Bytes::from(bytes)).await;
-                    */
-                    info!("Skipping broadcast of Reconfigure message to other primaries.");
-
-                    // Vẫn gửi tin nhắn cập nhật đến các Worker của chính node này
-                    let worker_reconfigure_message =
-                        PrimaryWorkerMessage::Reconfigure(new_committee);
-                    let committee = self.committee.read().await;
-                    match committee.our_workers(&self.name) {
-                        Ok(worker_addresses) => {
-                            let addresses = worker_addresses
-                                .iter()
-                                .map(|x| x.primary_to_worker)
-                                .collect();
-                            let bytes = bincode::serialize(&worker_reconfigure_message)
-                                .expect("Failed to serialize worker reconfigure message");
-                            self.network.broadcast(addresses, Bytes::from(bytes)).await;
-                        }
-                        Err(e) => warn!("Could not get our worker addresses: {}", e),
-                    }
-                }
-
                 let round = self.consensus_round.load(Ordering::Relaxed);
                 if round > self.gc_depth {
                     let gc_round = round - self.gc_depth;
