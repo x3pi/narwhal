@@ -264,16 +264,16 @@ struct TxReceiverHandler {
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         // Kiểm tra xem message có đủ 8 byte để cắt không.
-        if message.len() < 8 {
-            warn!(
-                "Giao dịch nhận được quá ngắn ({_len} bytes), không chứa đủ 8 byte độ dài. Bỏ qua.",
-                _len = message.len()
-            );
-            return Ok(());
-        }
+        // if message.len() < 4 {
+        //     warn!(
+        //         "Giao dịch nhận được quá ngắn ({_len} bytes), không chứa đủ 8 byte độ dài. Bỏ qua.",
+        //         _len = message.len()
+        //     );
+        //     return Ok(());
+        // }
 
         // Cắt lấy phần payload: bắt đầu từ byte thứ 8 cho đến hết.
-        let payload = &message[8..];
+        let payload = &message;
         info!(
             target: "payload_logger",
             "{}",

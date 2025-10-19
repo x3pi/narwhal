@@ -571,6 +571,32 @@ pub struct Consensus {
 impl Consensus {
     const STATE_KEY: &'static [u8] = b"consensus_state";
 
+    pub async fn load_last_committed_round(store: &mut Store) -> Round {
+        match store.read(Self::STATE_KEY.to_vec()).await {
+            Ok(Some(bytes)) => match bincode::deserialize::<ConsensusState>(&bytes) {
+                Ok(state) => {
+                    log::info!(
+                        "Loaded last committed round {} from store.",
+                        state.last_committed_round
+                    );
+                    state.last_committed_round
+                }
+                Err(e) => {
+                    log::error!(
+                        "Failed to deserialize consensus state from store: {}. Starting from genesis (Round 0).",
+                        e
+                    );
+                    0
+                }
+            },
+            Ok(None) => 0,
+            Err(e) => {
+                log::error!("Failed to read consensus state from store: {:?}. Starting from genesis (Round 0).", e);
+                0
+            }
+        }
+    }
+
     pub fn spawn(
         committee: Committee,
         _gc_depth: Round,

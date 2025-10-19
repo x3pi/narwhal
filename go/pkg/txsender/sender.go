@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"time"
@@ -17,12 +18,13 @@ type Client struct {
 	targetAddress string
 	tlsConfig     *tls.Config
 	quicConfig    *quic.Config
-	connection    quic.Connection // Chỉ lưu kết nối, không lưu stream
+	connection    quic.Connection
+	stream        quic.Stream // Sửa đổi: Lưu trữ stream dài hạn
 }
 
 // NewClient khởi tạo một client QUIC mới.
 func NewClient(targetAddress string) *Client {
-	// SỬA LỖI: ALPN phải là "narwhal" để khớp với server Rust.
+	// Cần thêm ServerName ("localhost") để khớp với chứng chỉ tự ký của server Rust.
 	tlsConfig := &tls.Config{
 		InsecureSkipVerify: true,
 	}
@@ -39,7 +41,7 @@ func NewClient(targetAddress string) *Client {
 	}
 }
 
-// Connect thiết lập kết nối QUIC đến node.
+// Connect thiết lập kết nối QUIC đến node và mở một stream hai chiều dài hạn.
 func (c *Client) Connect() error {
 	if c.connection != nil {
 		c.Close()
@@ -52,13 +54,27 @@ func (c *Client) Connect() error {
 	if err != nil {
 		return fmt.Errorf("không thể kết nối QUIC đến %s: %w", c.targetAddress, err)
 	}
-
 	c.connection = conn
+
+	// SỬA ĐỔI CHÍNH: Mở stream hai chiều (BI-DIRECTIONAL stream) ngay sau khi kết nối
+	// và lưu trữ để tái sử dụng.
+	stream, err := c.connection.OpenStreamSync(ctx)
+	if err != nil {
+		c.Close()
+		return fmt.Errorf("không thể mở stream dài hạn: %w", err)
+	}
+	c.stream = stream
+
 	return nil
 }
 
-// Close đóng kết nối QUIC.
+// Close đóng stream và kết nối QUIC.
 func (c *Client) Close() error {
+	if c.stream != nil {
+		// Đóng stream khi toàn bộ client đóng.
+		c.stream.Close()
+		c.stream = nil
+	}
 	if c.connection != nil {
 		err := c.connection.CloseWithError(0, "client closing")
 		c.connection = nil
@@ -67,9 +83,10 @@ func (c *Client) Close() error {
 	return nil
 }
 
-// SendTransaction gửi một giao dịch qua một stream QUIC mới.
+// SendTransaction gửi một giao dịch qua stream QUIC đã mở.
 func (c *Client) SendTransaction(payload []byte) error {
-	if c.connection == nil {
+	// Kiểm tra stream trước khi gửi.
+	if c.stream == nil {
 		if err := c.Connect(); err != nil {
 			return fmt.Errorf("kết nối ban đầu thất bại: %w", err)
 		}
@@ -81,7 +98,7 @@ func (c *Client) SendTransaction(payload []byte) error {
 		return nil // Thành công.
 	}
 
-	// Nếu thất bại, có thể do kết nối đã mất. Thử kết nối lại và gửi lần nữa.
+	// Nếu thất bại, thử kết nối/mở lại stream và gửi lần nữa.
 	log.Printf("Cảnh báo: Gửi thất bại (%v), đang thử kết nối lại...", err)
 	if reconnErr := c.Connect(); reconnErr != nil {
 		return fmt.Errorf("kết nối lại thất bại: %w", reconnErr)
@@ -97,31 +114,30 @@ func (c *Client) SendTransaction(payload []byte) error {
 	return nil
 }
 
-// trySend thực hiện logic gửi dữ liệu trên một stream mới.
+// trySend thực hiện logic gửi dữ liệu trên stream dài hạn.
 func (c *Client) trySend(payload []byte) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	// SỬA LỖI: Mở một stream mới cho mỗi giao dịch.
-	stream, err := c.connection.OpenUniStreamSync(ctx)
-	if err != nil {
-		return fmt.Errorf("không thể mở stream mới: %w", err)
+	if c.stream == nil {
+		return fmt.Errorf("stream QUIC chưa được thiết lập")
 	}
-	defer stream.Close()
 
-	// SỬA LỖI: Gửi 8-byte độ dài của payload trước.
-	lenBuf := make([]byte, 8)
-	binary.BigEndian.PutUint64(lenBuf, uint64(len(payload)))
+	// 1. Gửi 4-byte độ dài của payload.
+	lenBuf := make([]byte, 4)
+	binary.BigEndian.PutUint32(lenBuf, uint32(len(payload)))
+	log.Printf("lenBuf %v", hex.EncodeToString(lenBuf))
+	log.Printf("payload %v", hex.EncodeToString(payload))
 
-	// Gửi độ dài
-	if _, err := stream.Write(lenBuf); err != nil {
+	// Sử dụng stream đã lưu.
+	if _, err := c.stream.Write(lenBuf); err != nil {
 		return fmt.Errorf("lỗi khi gửi độ dài giao dịch: %w", err)
 	}
 
-	// Gửi payload
-	if _, err := stream.Write(payload); err != nil {
+	// 2. Gửi payload.
+	if _, err := c.stream.Write(payload); err != nil {
 		return fmt.Errorf("lỗi khi gửi payload giao dịch: %w", err)
 	}
+
+	// KHÔNG đóng stream ở đây. Nó sẽ được tái sử dụng.
+	// KHÔNG cần Flush, vì QUIC stream thường không có bộ đệm.
 
 	return nil
 }
