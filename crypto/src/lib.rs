@@ -14,13 +14,14 @@ use fastcrypto::bls12381::min_pk::{
 use fastcrypto::error::FastCryptoError;
 use fastcrypto::traits::{AggregateAuthenticator, Signer};
 
-use serde::Serialize;
-// --- CÁC IMPORT CHUNG ---
+use anyhow::{Context, Result};
+use base64;
 use fastcrypto::encoding::{Base64, Encoding};
 use fastcrypto::traits::{AllowedRng, KeyPair, ToFromBytes, VerifyingKey};
 use hex;
 use rand::SeedableRng;
 use rand::{CryptoRng, RngCore};
+use serde::Serialize;
 use serde::{de, ser, Deserialize};
 use sha3::{Digest as Sha3Digest, Keccak256};
 use std::array::TryFromSliceError;
@@ -228,6 +229,17 @@ impl fmt::Display for ConsensusPublicKey {
     }
 }
 
+impl ConsensusPublicKey {
+    pub fn decode_base64(s: &str) -> Result<Self, FastCryptoError> {
+        let bytes = Base64::decode(s)?;
+        let public_key =
+            BLS12381PublicKey::from_bytes(&bytes).map_err(|_| FastCryptoError::InvalidInput)?;
+        Ok(Self(public_key))
+    }
+}
+
+#[derive(Debug)]
+
 pub struct ConsensusSecretKey(BLS12381PrivateKey);
 
 // Implement Clone manually by reconstructing the key from its bytes.
@@ -240,6 +252,11 @@ impl Clone for ConsensusSecretKey {
     }
 }
 
+impl ConsensusSecretKey {
+    pub fn encode_base64(&self) -> String {
+        Base64::encode(self.0.as_ref())
+    }
+}
 // Manual implementation of Serialize and Deserialize for ConsensusSecretKey
 impl ser::Serialize for ConsensusSecretKey {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
@@ -347,4 +364,29 @@ impl SignatureService {
             .await
             .expect("Failed to receive signature from Signature Service")
     }
+}
+
+pub fn hex_to_base64(hex_string: &str) -> Result<String> {
+    // 1. Giải mã chuỗi hex thành các bytes
+    let hex_no_prefix = hex_string.strip_prefix("0x").unwrap_or(&hex_string);
+    let bytes = hex::decode(hex_no_prefix)
+        .context(format!("Failed to decode hex string: '{}'", hex_no_prefix))?;
+
+    // 2. Mã hóa các bytes thành chuỗi base64
+    let base64_string = base64::encode(&bytes);
+
+    Ok(base64_string)
+}
+
+pub fn base64_to_hex(base64_string: &str) -> Result<String> {
+    // 1. Giải mã chuỗi base64 thành các bytes
+    let bytes = base64::decode(base64_string).context(format!(
+        "Failed to decode base64 string: '{}'",
+        base64_string
+    ))?;
+
+    // 2. Mã hóa các bytes thành chuỗi hex
+    let hex_string = hex::encode(&bytes);
+
+    Ok(hex_string)
 }

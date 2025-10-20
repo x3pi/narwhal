@@ -37,18 +37,20 @@ pub enum ConfigError {
     ParseError(String),
 }
 
-/// Struct wrapper containing a validator's information, independent of Protobuf.
-#[derive(Debug, Clone)]
+// SỬA ĐỔI: Thêm Serialize và Deserialize để có thể import/export
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Validator {
     pub address: String,
     pub primary_address: String,
     pub worker_address: String,
     pub p2p_address: String,
     pub total_staked_amount: String,
+    pub pubkey_bls: String,
+    pub pubkey_secp: String,
 }
 
 /// Struct wrapper containing a list of validators.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ValidatorInfo {
     pub validators: Vec<Validator>,
 }
@@ -86,7 +88,7 @@ pub trait Export: Serialize {
 pub type Stake = u32;
 pub type WorkerId = u32;
 
-#[derive(Deserialize, Clone)]
+#[derive(Clone, Deserialize, Serialize)]
 pub struct Parameters {
     pub header_size: usize,
     pub max_header_delay: u64,
@@ -112,6 +114,7 @@ impl Default for Parameters {
 }
 
 impl Import for Parameters {}
+impl Export for Parameters {}
 
 impl Parameters {
     pub fn log(&self) {
@@ -125,20 +128,20 @@ impl Parameters {
     }
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct PrimaryAddresses {
     pub primary_to_primary: SocketAddr,
     pub worker_to_primary: SocketAddr,
 }
 
-#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize, Debug)]
 pub struct WorkerAddresses {
     pub transactions: SocketAddr,
     pub worker_to_worker: SocketAddr,
     pub primary_to_worker: SocketAddr,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Authority {
     pub stake: Stake,
     pub consensus_key: ConsensusPublicKey,
@@ -146,43 +149,77 @@ pub struct Authority {
     pub workers: HashMap<WorkerId, WorkerAddresses>,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
 }
 
 impl Committee {
-    pub fn from_validator_info(validator_info: ValidatorInfo) -> Result<Self, ConfigError> {
+    // Xóa tham số self_address, không cần thiết nữa
+    pub fn from_validator_info(mut validator_info: ValidatorInfo) -> Result<Self, ConfigError> {
+        const BASE_PRIMARY_TO_WORKER_PORT: u16 = 10000;
+        const BASE_WORKER_TO_PRIMARY_PORT: u16 = 11000;
+        const BASE_TRANSACTIONS_PORT: u16 = 12000;
+
+        validator_info
+            .validators
+            .sort_by(|a, b| a.address.cmp(&b.address));
+
         let mut authorities = BTreeMap::new();
-        for val in validator_info.validators {
-            let public_key = PublicKey::decode_base64(&val.address).map_err(|e| {
+        // Dùng enumerate để lấy chỉ số `i` cho mỗi validator
+        for (i, val) in validator_info.validators.iter().enumerate() {
+            // Parse a validator's secp256k1 public key.
+            let base64_address = crypto::hex_to_base64(&val.pubkey_secp).map_err(|e| {
+                ConfigError::ParseError(format!("Failed to convert hex address to base64: {}", e))
+            })?;
+            let public_key = PublicKey::decode_base64(&base64_address).map_err(|e| {
                 ConfigError::ParseError(format!(
                     "Failed to parse public key '{}': {}",
                     val.address, e
                 ))
             })?;
 
-            let stake: Stake = val.total_staked_amount.parse().unwrap_or(0);
+            // Parse the consensus public key (bls).
+            let base64_bls_key = crypto::hex_to_base64(&val.pubkey_bls).map_err(|e| {
+                ConfigError::ParseError(format!("Failed to convert BLS hex key to base64: {}", e))
+            })?;
+            let consensus_key =
+                ConsensusPublicKey::decode_base64(&base64_bls_key).map_err(|e| {
+                    ConfigError::ParseError(format!(
+                        "Failed to parse consensus key '{}': {}",
+                        val.pubkey_bls, e
+                    ))
+                })?;
 
+            // Parse other validator info.
+            let stake: Stake = val.total_staked_amount.parse().unwrap_or(1);
             let primary_to_primary: SocketAddr = val.primary_address.parse().map_err(|e| {
                 ConfigError::ParseError(format!(
                     "Invalid primary_address '{}': {}",
                     val.primary_address, e
                 ))
             })?;
-            let worker_to_primary: SocketAddr = val.worker_address.parse().map_err(|e| {
-                ConfigError::ParseError(format!(
-                    "Invalid worker_address '{}': {}",
-                    val.worker_address, e
-                ))
-            })?;
+
+            // --- LUÔN TỰ ĐỘNG GÁN ĐỊA CHỈ NỘI BỘ CHO TẤT CẢ VALIDATOR ---
+            let worker_to_primary: SocketAddr =
+                format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
+                    .parse()
+                    .unwrap();
+            let primary_to_worker: SocketAddr =
+                format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
+                    .parse()
+                    .unwrap();
+            let transactions: SocketAddr =
+                format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
+                    .parse()
+                    .unwrap();
 
             let workers = [(
                 0,
                 WorkerAddresses {
-                    primary_to_worker: "127.0.0.1:8000".parse().unwrap(),
-                    transactions: "127.0.0.1:9000".parse().unwrap(),
-                    worker_to_worker: val.p2p_address.parse().map_err(|e| {
+                    primary_to_worker,
+                    transactions,
+                    worker_to_worker: val.worker_address.parse().map_err(|e| {
                         ConfigError::ParseError(format!(
                             "Invalid p2p_address '{}': {}",
                             val.p2p_address, e
@@ -194,20 +231,9 @@ impl Committee {
             .cloned()
             .collect();
 
-            // --- SỬA LỖI: Tạo khóa đồng thuận một cách an toàn và quyết định ---
-            // 1. Tạo một "hạt giống" (seed) từ public key của validator.
-            let mut hasher = Sha3_256::new();
-            hasher.update(public_key.as_ref());
-            let seed: [u8; 32] = hasher.finalize().into();
-
-            // 2. Sử dụng seed để tạo ra một cặp khóa đồng thuận.
-            let mut rng = rand::rngs::StdRng::from_seed(seed);
-            let (consensus_key, _) = generate_consensus_keypair(&mut rng);
-            // -----------------------------------------------------------------
-
             let authority = Authority {
                 stake,
-                consensus_key, // <-- Sử dụng khóa vừa tạo
+                consensus_key,
                 primary: PrimaryAddresses {
                     primary_to_primary,
                     worker_to_primary,
@@ -221,6 +247,7 @@ impl Committee {
 }
 
 impl Import for Committee {}
+impl Export for Committee {}
 
 impl Committee {
     pub fn size(&self) -> usize {

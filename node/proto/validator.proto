@@ -39,6 +39,8 @@ message Validator {
     string total_staked_amount = 15;
     string worker_address = 16;
     string p2p_address = 17;
+    string pubkey_bls = 18;
+    string pubkey_secp = 19;
 }
 // Thêm một loại request/response mới để làm ví dụ
 message StatusRequest {

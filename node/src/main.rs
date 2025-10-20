@@ -140,12 +140,17 @@ async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Resul
     // 9. Chuyển đổi Protobuf sang cấu trúc nội bộ (ValidatorInfo)
     let mut wrapper_list = ValidatorInfo::default();
     for proto_val in proto_list.validators {
+        // SỬA ĐỔI: Thêm hai trường pubkey mới vào quá trình khởi tạo.
+        // LƯU Ý: Điều này yêu cầu cấu trúc `config::Validator` cũng phải có
+        // hai trường `pubkey_bls` và `pubkey_secp`.
         let wrapper_val = Validator {
             address: proto_val.address,
             primary_address: proto_val.primary_address,
             worker_address: proto_val.worker_address,
             p2p_address: proto_val.p2p_address,
             total_staked_amount: proto_val.total_staked_amount,
+            pubkey_bls: proto_val.pubkey_bls,   // <-- TRƯỜNG MỚI
+            pubkey_secp: proto_val.pubkey_secp, // <-- TRƯỜNG MỚI
         };
         wrapper_list.validators.push(wrapper_val);
     }
@@ -205,7 +210,7 @@ async fn main() -> Result<()> {
                 .args_from_usage("--keys=<FILE> 'The file containing the node keys'")
                 .args_from_usage("--committee=[FILE] 'The file containing committee information (Optional)'")
                 .args_from_usage(
-                    "--uds-socket=[PATH] 'Unix Domain Socket path to fetch committee (Required if --committee is absent)'", 
+                    "--uds-socket=[PATH] 'Unix Domain Socket path to fetch committee (Required if --committee is absent)'",
                 )
                 // THAY ĐỔI: Loại bỏ --block-number
                 // .args_from_usage(
@@ -254,10 +259,23 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
 
+    log::info!("address: {}", keypair.name.to_eth_address());
+    let name = crypto::base64_to_hex(&keypair.name.encode_base64());
+
+    log::info!("name: {:?}", name);
+
+    let secret = crypto::base64_to_hex(&keypair.secret.encode_base64());
+    log::info!("secret: {:?}", secret);
+    let consensus_key = crypto::base64_to_hex(&keypair.consensus_key.to_string());
+    log::info!("consensus_key: {:?}", consensus_key);
+    let consensus_secret = crypto::base64_to_hex(&keypair.consensus_secret.encode_base64());
+
+    log::info!("consensus_secret: {:?}", consensus_secret);
+
     // KHỞI TẠO STORE SỚM VÀ CẦN PHẢI LÀ MUTABLE ĐỂ load_consensus_state VÀ analyze SỬ DỤNG
     let mut store = Store::new(store_path).context("Failed to create a store")?;
 
-    let always_false = true;
+    let always_false = false;
     let committee = if always_false && committee_file.is_some() {
         let filename = committee_file.unwrap();
         // TẢI TỪ FILE: Nếu --committee được cung cấp
@@ -326,6 +344,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     // Store đã được khởi tạo ở trên
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
+
+    log::info!("committee {:?}", committee);
 
     match matches.subcommand() {
         ("primary", _) => {
@@ -464,7 +484,6 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             node_id,
             certificate.header.round
         );
-        // ... (phần còn lại của analyze không đổi)
         let mut all_transactions = Vec::new();
 
         for (digest, worker_id) in certificate.header.payload {

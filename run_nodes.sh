@@ -17,6 +17,7 @@ EXECUTOR_BINARY="./go/bin/exetps"
 LOG_DIR="$BENCHMARK_DIR/logs"
 COMMITTEE_FILE="$BENCHMARK_DIR/.committee.json"
 PARAMETERS_FILE="$BENCHMARK_DIR/.parameters.json"
+UDS_SOCKET_PATH="/tmp/rust-go.sock_1"
 
 # --- Dọn dẹp triệt để trước khi chạy ---
 # echo "--- 🧹 Stage 0: Cleanup ---"
@@ -37,7 +38,7 @@ AUTHORITY_NAMES=($(jq -r '.authorities | keys[]' < "$COMMITTEE_FILE"))
 
 # --- Khởi chạy các node trong các session tmux ---
 for i in $(seq 0 $((NODES-1))); do
-    key_file="$BENCHMARK_DIR/.node-$i.json"
+    key_file="$BENCHMARK_DIR/node-$i.json"
     AUTHORITY_NAME=${AUTHORITY_NAMES[$i]}
 
     # --- SỬA LỖI: Khởi chạy Executor TRƯỚC ---
@@ -52,7 +53,7 @@ for i in $(seq 0 $((NODES-1))); do
     # --- Khởi chạy Primary ---
     primary_db_path="$BENCHMARK_DIR/db-primary-$i"
     primary_log_file="$LOG_DIR/primary-$i.log"
-    primary_cmd="$NODE_BINARY run --keys '$key_file' --committee '$COMMITTEE_FILE' --parameters '$PARAMETERS_FILE' --store '$primary_db_path' primary"
+    primary_cmd="$NODE_BINARY run --keys '$key_file' --committee '$COMMITTEE_FILE' --uds-socket '$UDS_SOCKET_PATH' --parameters '$PARAMETERS_FILE' --store '$primary_db_path' primary"
     tmux new -d -s "primary-$i" "RUST_LOG=info $primary_cmd > '$primary_log_file' 2>&1"
     
     # --- Khởi chạy tất cả Workers cho node này ---
@@ -60,7 +61,7 @@ for i in $(seq 0 $((NODES-1))); do
     for j in $(seq 0 $((WORKERS_PER_NODE-1))); do
         worker_db_path="$BENCHMARK_DIR/db-worker-$i-$j"
         worker_log_file="$LOG_DIR/worker-$i-$j.log"
-        worker_cmd="$NODE_BINARY run --keys '$key_file' --committee '$COMMITTEE_FILE' --parameters '$PARAMETERS_FILE' --store '$worker_db_path' worker --id $j"
+        worker_cmd="$NODE_BINARY run --keys '$key_file' --committee '$COMMITTEE_FILE' --uds-socket '$UDS_SOCKET_PATH' --parameters '$PARAMETERS_FILE' --store '$worker_db_path' worker --id $j"
         tmux new -d -s "worker-$i-$j" "RUST_LOG=info $worker_cmd > '$worker_log_file' 2>&1"
     done
 done
