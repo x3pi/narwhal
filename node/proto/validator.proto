@@ -1,0 +1,74 @@
+syntax = "proto3";
+
+package validator;
+
+import "google/protobuf/timestamp.proto";
+
+// Request để yêu cầu thông tin validators của một block
+message BlockRequest {
+    uint64 block_number = 1;
+}
+
+// StringStringPair định nghĩa một cặp key-value dạng chuỗi
+message StringStringPair {
+    string key = 1;
+    string value = 2;
+}
+
+// Danh sách các validators
+message ValidatorList {
+    repeated Validator validators = 1;
+}
+
+// Thông tin chi tiết của một validator
+message Validator {
+    string address = 1;
+    string name = 2;
+    string description = 3;
+    string website = 4;
+    bool is_jailed = 5;
+    google.protobuf.Timestamp jailed_until = 6;
+    int64 missed_blocks_counter = 7;
+    uint64 commission_rate = 8;
+    string min_self_delegation = 9;
+    repeated StringStringPair delegators = 10;
+    string accumulated_rewards_per_share = 11;
+    repeated StringStringPair delegator_reward_indexes = 12;
+    string image = 13;
+    string primary_address = 14;
+    string total_staked_amount = 15;
+    string worker_address = 16;
+    string p2p_address = 17;
+}
+// Thêm một loại request/response mới để làm ví dụ
+message StatusRequest {
+    // Không cần tham số gì, chỉ cần hỏi status
+}
+
+message ServerStatus {
+    string status_message = 1;
+    uint64 uptime_seconds = 2;
+}
+
+
+// --- Message bao bọc cho Request (đây là phần chính) ---
+
+message Request {
+    // oneof đảm bảo chỉ một trong các trường sau có thể được set tại một thời điểm
+    oneof payload {
+        BlockRequest block_request = 1;
+        StatusRequest status_request = 2;
+        // Thêm các loại request khác ở đây trong tương lai
+    }
+}
+
+
+// --- Message bao bọc cho Response (tương tự cho chiều về) ---
+
+message Response {
+    oneof payload {
+        ValidatorList validator_list = 1;
+        ServerStatus server_status = 2;
+        // Thêm các loại response khác ở đây
+    }
+}

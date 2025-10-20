@@ -32,8 +32,11 @@ class CommandMaker:
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
+        # SỬA ĐỔI: Thêm tham số --uds-socket cố định
+        UDS_SOCKET_PATH = '/tmp/rust-go.sock_1'
         return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters} primary')
+                f'--store {store} --parameters {parameters} '
+                f'--uds-socket {UDS_SOCKET_PATH} primary') # <--- Đã thêm
 
     @staticmethod
     def run_worker(keys, committee, store, parameters, id, debug=False):
@@ -42,8 +45,11 @@ class CommandMaker:
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
+        # SỬA ĐỔI: Thêm tham số --uds-socket cố định
+        UDS_SOCKET_PATH = '/tmp/rust-go.sock_1'
         return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters} worker --id {id}')
+                f'--store {store} --parameters {parameters} '
+                f'--uds-socket {UDS_SOCKET_PATH} worker --id {id}') # <--- Đã thêm
 
     @staticmethod
     def run_client(address, size, rate, nodes):

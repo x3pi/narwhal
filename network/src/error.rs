@@ -5,9 +5,8 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum NetworkError {
-    #[error("Failed to connect to {0} (retry {1}): {2}")]
-    FailedToConnect(SocketAddr, u16, String),
-
+    // #[error("Failed to connect to {0} (retry {1}): {2}")]
+    // FailedToConnect(SocketAddr, u16, String),
     #[error("Failed to send message to {0}: {1}")]
     FailedToSendMessage(SocketAddr, String),
 

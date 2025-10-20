@@ -1,18 +1,23 @@
+// In config/src/lib.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crypto::{
-    generate_consensus_keypair, generate_production_keypair, ConsensusPublicKey, ConsensusSecretKey,
-    PublicKey, SecretKey,
+    generate_consensus_keypair, generate_production_keypair, ConsensusPublicKey,
+    ConsensusSecretKey, PublicKey, SecretKey,
 };
 use log::info;
+use rand::{RngCore, SeedableRng}; // <-- Thêm RngCore
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use sha3::{Digest, Sha3_256}; // <-- Thêm các import cho sha3
 use std::collections::{BTreeMap, HashMap};
+use std::convert::TryFrom;
 use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::io::Write as _;
 use std::net::SocketAddr;
+use std::str::FromStr;
 use thiserror::Error;
-use rand::SeedableRng;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -27,6 +32,25 @@ pub enum ConfigError {
 
     #[error("Failed to write config file '{file}': {message}")]
     ExportError { file: String, message: String },
+
+    #[error("Failed to parse validator data: {0}")]
+    ParseError(String),
+}
+
+/// Struct wrapper containing a validator's information, independent of Protobuf.
+#[derive(Debug, Clone)]
+pub struct Validator {
+    pub address: String,
+    pub primary_address: String,
+    pub worker_address: String,
+    pub p2p_address: String,
+    pub total_staked_amount: String,
+}
+
+/// Struct wrapper containing a list of validators.
+#[derive(Debug, Clone, Default)]
+pub struct ValidatorInfo {
+    pub validators: Vec<Validator>,
 }
 
 pub trait Import: DeserializeOwned {
@@ -127,6 +151,75 @@ pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
 }
 
+impl Committee {
+    pub fn from_validator_info(validator_info: ValidatorInfo) -> Result<Self, ConfigError> {
+        let mut authorities = BTreeMap::new();
+        for val in validator_info.validators {
+            let public_key = PublicKey::decode_base64(&val.address).map_err(|e| {
+                ConfigError::ParseError(format!(
+                    "Failed to parse public key '{}': {}",
+                    val.address, e
+                ))
+            })?;
+
+            let stake: Stake = val.total_staked_amount.parse().unwrap_or(0);
+
+            let primary_to_primary: SocketAddr = val.primary_address.parse().map_err(|e| {
+                ConfigError::ParseError(format!(
+                    "Invalid primary_address '{}': {}",
+                    val.primary_address, e
+                ))
+            })?;
+            let worker_to_primary: SocketAddr = val.worker_address.parse().map_err(|e| {
+                ConfigError::ParseError(format!(
+                    "Invalid worker_address '{}': {}",
+                    val.worker_address, e
+                ))
+            })?;
+
+            let workers = [(
+                0,
+                WorkerAddresses {
+                    primary_to_worker: "127.0.0.1:8000".parse().unwrap(),
+                    transactions: "127.0.0.1:9000".parse().unwrap(),
+                    worker_to_worker: val.p2p_address.parse().map_err(|e| {
+                        ConfigError::ParseError(format!(
+                            "Invalid p2p_address '{}': {}",
+                            val.p2p_address, e
+                        ))
+                    })?,
+                },
+            )]
+            .iter()
+            .cloned()
+            .collect();
+
+            // --- SỬA LỖI: Tạo khóa đồng thuận một cách an toàn và quyết định ---
+            // 1. Tạo một "hạt giống" (seed) từ public key của validator.
+            let mut hasher = Sha3_256::new();
+            hasher.update(public_key.as_ref());
+            let seed: [u8; 32] = hasher.finalize().into();
+
+            // 2. Sử dụng seed để tạo ra một cặp khóa đồng thuận.
+            let mut rng = rand::rngs::StdRng::from_seed(seed);
+            let (consensus_key, _) = generate_consensus_keypair(&mut rng);
+            // -----------------------------------------------------------------
+
+            let authority = Authority {
+                stake,
+                consensus_key, // <-- Sử dụng khóa vừa tạo
+                primary: PrimaryAddresses {
+                    primary_to_primary,
+                    worker_to_primary,
+                },
+                workers,
+            };
+            authorities.insert(public_key, authority);
+        }
+        Ok(Committee { authorities })
+    }
+}
+
 impl Import for Committee {}
 
 impl Committee {
@@ -185,11 +278,12 @@ impl Committee {
             .iter()
             .find(|(worker_id, _)| worker_id == &id)
             .map(|(_, worker)| worker.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee(*to))
+            .ok_or_else(|| ConfigError::UnknownWorker(*id))
     }
 
     pub fn our_workers(&self, myself: &PublicKey) -> Result<Vec<WorkerAddresses>, ConfigError> {
-        self.authorities
+        Ok(self
+            .authorities
             .iter()
             .find(|(name, _)| name == &myself)
             .map(|(_, authority)| authority)
@@ -197,8 +291,7 @@ impl Committee {
             .workers
             .values()
             .cloned()
-            .map(Ok)
-            .collect()
+            .collect())
     }
 
     pub fn others_workers(

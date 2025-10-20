@@ -1,7 +1,9 @@
+// In network/src/simple_sender.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::NetworkError;
 use crate::quic::QuicTransport;
-use crate::transport::{Connection, Transport};
+use crate::transport::Transport;
 use bytes::Bytes;
 use log::{debug, info, warn};
 use rand::prelude::SliceRandom as _;
