@@ -148,7 +148,7 @@ impl AsRef<[u8]> for PublicKey {
 }
 
 pub struct SecretKey(Secp256k1PrivateKey);
-/* ... implementation của SecretKey giữ nguyên ... */
+
 impl Clone for SecretKey {
     fn clone(&self) -> Self {
         let bytes = self.0.as_ref();
@@ -157,6 +157,18 @@ impl Clone for SecretKey {
     }
 }
 
+// --- ADD THIS DEBUG IMPLEMENTATION ---
+impl fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f, "{}", self.encode_base64())
+    }
+}
+
+impl fmt::Display for SecretKey {
+    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+        write!(f, "{}", self.encode_base64().get(0..16).unwrap_or(""))
+    }
+}
 impl SecretKey {
     pub fn encode_base64(&self) -> String {
         Base64::encode(self.0.as_ref())

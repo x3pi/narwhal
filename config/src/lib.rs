@@ -204,11 +204,6 @@ impl Committee {
             let primary_to_worker: SocketAddr;
             let transactions: SocketAddr;
 
-            // Kiểm tra xem validator đang xử lý có phải là chính node này không.
-            info!(
-                "Assigning sequential internal ports for self (address: {}  :: {}).",
-                self_address, val.address
-            );
             if val.address.to_lowercase() == self_address.to_lowercase() {
                 // Nếu ĐÚNG, tự động gán cổng tuần tự cho chính nó.
                 info!(
@@ -369,7 +364,7 @@ impl Committee {
 }
 
 // ... existing code ...
-#[derive(Clone, Serialize, Deserialize)] // Thêm Debug để dễ dàng in ra thông tin cấu hình
+#[derive(Clone, Serialize, Deserialize, Debug)] // Thêm Debug để dễ dàng in ra thông tin cấu hình
 pub struct NodeConfig {
     // Đổi tên KeyPair thành NodeConfig
     pub name: PublicKey,

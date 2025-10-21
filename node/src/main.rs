@@ -232,6 +232,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     let node_config = NodeConfig::import(key_file).context("Failed to load the node's keypair")?;
 
+    log::info!("node_config: {:?}", node_config);
+
     let address = node_config.name.to_eth_address();
 
     log::info!("address: {}", address);
@@ -330,6 +332,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
             let mut primary_keys: Vec<_> = committee.authorities.keys().cloned().collect();
             primary_keys.sort();
+            log::info!("node_config: {:?}", node_config);
 
             let node_id = primary_keys
                 .iter()
@@ -371,6 +374,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                     id_str
                 )
             })?;
+
+            log::info!("node_config: {:?}", node_config);
 
             tokio::spawn(Worker::spawn(
                 node_config.name,

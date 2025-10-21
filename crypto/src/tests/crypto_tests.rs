@@ -20,12 +20,6 @@ impl PartialEq for SecretKey {
     }
 }
 
-impl fmt::Debug for SecretKey {
-    fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "{}", self.encode_base64())
-    }
-}
-
 /// Fixture for generating network identity keypairs (secp256k1).
 pub fn keys() -> Vec<(PublicKey, SecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
@@ -35,9 +29,10 @@ pub fn keys() -> Vec<(PublicKey, SecretKey)> {
 /// Fixture for generating consensus keypairs (BLS12-381).
 pub fn consensus_keys() -> Vec<(ConsensusPublicKey, ConsensusSecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
-    (0..4).map(|_| generate_consensus_keypair(&mut rng)).collect()
+    (0..4)
+        .map(|_| generate_consensus_keypair(&mut rng))
+        .collect()
 }
-
 
 // ##################################################################
 // ### Network Identity Key Tests (secp256k1)                     ###
@@ -149,4 +144,3 @@ async fn signature_service() {
     // Verify the signature we received.
     assert!(signature.verify(&digest, &public_key).is_ok());
 }
-
