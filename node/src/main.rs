@@ -7,15 +7,18 @@ use bytes::{BufMut, BytesMut};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
+// Sửa đổi: Thêm Digest để có thể sử dụng kiểu dữ liệu này
 use config::{Committee, NodeConfig, Parameters, WorkerId};
 use config::{Validator, ValidatorInfo};
 use consensus::Consensus;
 use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
+use crypto::Digest;
 use env_logger::Env;
-use log::{error, info};
+use log::{error, info, warn};
 use primary::Core;
 use primary::{Certificate, Primary};
 use prost::Message;
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 use store::Store;
@@ -400,6 +403,10 @@ async fn analyze(
     mut store: Store,
     node_config: NodeConfig,
 ) {
+    // **FIX 1**: Khai báo `processed_rounds` BÊN NGOÀI vòng lặp `while`
+    // để nó có thể ghi nhớ các round đã được xử lý.
+    let mut processed_rounds = HashSet::new();
+
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
             if value < 0x80 {
@@ -410,11 +417,9 @@ async fn analyze(
             value >>= 7;
         }
     }
-    // node_config.uds_block_path // Dòng này có thể bị xóa
 
-    // Thêm kiểm tra điều kiện cho uds_block_path
     if !node_config.uds_block_path.is_empty() {
-        let socket_path = node_config.uds_block_path; // Sử dụng đường dẫn từ node_config
+        let socket_path = node_config.uds_block_path;
         log::info!(
             "[ANALYZE] Node ID {} attempting to connect to {}",
             node_id,
@@ -448,56 +453,72 @@ async fn analyze(
         );
 
         while let Some(certificate) = rx_output.recv().await {
-            // ... existing code ...
+            // **FIX 1**: Kiểm tra xem round này đã được xử lý chưa.
+            // Nếu `insert` trả về `false`, có nghĩa là round đã tồn tại và chúng ta bỏ qua.
+            if !processed_rounds.insert(certificate.header.round) {
+                warn!(
+                    "[ANALYZE] Node ID {} skipping duplicate certificate for round {}.",
+                    node_id, certificate.header.round
+                );
+                continue; // Bỏ qua và đợi certificate tiếp theo
+            }
+
             log::info!(
-                "[ANALYZE] Node ID {} RECEIVED certificate for round {} from consensus.",
+                "[ANALYZE] Node ID {} PROCESSING certificate for round {} from consensus.",
                 node_id,
                 certificate.header.round
             );
+
             let mut all_transactions = Vec::new();
+            // `processed_digests` vẫn nằm trong vòng lặp `while` để đảm bảo
+            // nó được reset cho mỗi round mới.
+            let mut processed_digests = HashSet::<Digest>::new();
 
             for (digest, worker_id) in certificate.header.payload {
-                match store.read(digest.to_vec()).await {
-                    Ok(Some(serialized_batch_message)) => {
-                        match bincode::deserialize(&serialized_batch_message) {
-                            Ok(WorkerMessage::Batch(batch)) => {
-                                log::debug!(
-                                    "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
-                                    digest,
-                                    batch.len(),
-                                    worker_id
-                                );
-                                for tx_data in batch {
-                                    all_transactions.push(comm::Transaction {
-                                        digest: tx_data,
-                                        worker_id: worker_id as u32,
-                                    });
+                // **FIX 2**: Logic kiểm tra digest của BATCH đã được di chuyển ra ngoài
+                // vòng lặp `for tx_data`, đảm bảo mỗi BATCH chỉ được xử lý một lần.
+                if processed_digests.insert(digest.clone()) {
+                    match store.read(digest.to_vec()).await {
+                        Ok(Some(serialized_batch_message)) => {
+                            match bincode::deserialize(&serialized_batch_message) {
+                                Ok(WorkerMessage::Batch(batch)) => {
+                                    log::debug!(
+                                        "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
+                                        digest,
+                                        batch.len(),
+                                        worker_id
+                                    );
+                                    // Thêm tất cả các giao dịch từ batch này
+                                    for tx_data in batch {
+                                        all_transactions.push(comm::Transaction {
+                                            digest: tx_data,
+                                            worker_id: worker_id as u32,
+                                        });
+                                    }
+                                }
+                                Ok(_) => {
+                                    warn!(
+                                        "[ANALYZE] Digest {} did not correspond to a Batch message.",
+                                        digest
+                                    );
+                                }
+                                Err(e) => {
+                                    error!(
+                                        "[ANALYZE] Failed to deserialize message for digest {}: {}",
+                                        digest, e
+                                    );
                                 }
                             }
-                            Ok(_) => {
-                                log::warn!(
-                                    "[ANALYZE] Digest {} did not correspond to a Batch message.",
-                                    digest
-                                );
-                            }
-                            Err(e) => {
-                                log::error!(
-                                    "[ANALYZE] Failed to deserialize message for digest {}: {}",
-                                    digest,
-                                    e
-                                );
-                            }
                         }
-                    }
-                    Ok(None) => {
-                        log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
-                    }
-                    Err(e) => {
-                        log::error!(
-                            "[ANALYZE] Failed to read batch for digest {}: {}",
-                            digest,
-                            e
-                        );
+                        Ok(None) => {
+                            warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
+                        }
+                        Err(e) => {
+                            error!(
+                                "[ANALYZE] Failed to read batch for digest {}: {}",
+                                digest, e
+                            );
+                        }
                     }
                 }
             }
@@ -569,8 +590,5 @@ async fn analyze(
             "[ANALYZE] Node ID {}: uds_block_path is empty. Skipping socket_path_executor initialization.",
             node_id
         );
-        // Nếu không có uds_block_path, có thể cần xử lý rx_output một cách khác
-        // hoặc đơn giản là bỏ qua nếu không có logic nào khác phụ thuộc vào nó.
-        // Ở đây, tôi chỉ bỏ qua và để rx_output tự động đóng khi hàm kết thúc.
     }
 }
