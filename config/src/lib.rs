@@ -369,7 +369,7 @@ impl Committee {
 }
 
 // ... existing code ...
-#[derive(Serialize, Deserialize)] // Thêm Debug để dễ dàng in ra thông tin cấu hình
+#[derive(Clone, Serialize, Deserialize)] // Thêm Debug để dễ dàng in ra thông tin cấu hình
 pub struct NodeConfig {
     // Đổi tên KeyPair thành NodeConfig
     pub name: PublicKey,
