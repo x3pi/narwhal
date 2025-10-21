@@ -155,8 +155,11 @@ pub struct Committee {
 }
 
 impl Committee {
-    // Xóa tham số self_address, không cần thiết nữa
-    pub fn from_validator_info(mut validator_info: ValidatorInfo) -> Result<Self, ConfigError> {
+    // Thêm tham số `self_address` để xác định node hiện tại.
+    pub fn from_validator_info(
+        mut validator_info: ValidatorInfo,
+        self_address: &str,
+    ) -> Result<Self, ConfigError> {
         const BASE_PRIMARY_TO_WORKER_PORT: u16 = 10000;
         const BASE_WORKER_TO_PRIMARY_PORT: u16 = 11000;
         const BASE_TRANSACTIONS_PORT: u16 = 12000;
@@ -166,7 +169,6 @@ impl Committee {
             .sort_by(|a, b| a.address.cmp(&b.address));
 
         let mut authorities = BTreeMap::new();
-        // Dùng enumerate để lấy chỉ số `i` cho mỗi validator
         for (i, val) in validator_info.validators.iter().enumerate() {
             // Parse a validator's secp256k1 public key.
             let base64_address = crypto::hex_to_base64(&val.pubkey_secp).map_err(|e| {
@@ -200,29 +202,58 @@ impl Committee {
                 ))
             })?;
 
-            // --- LUÔN TỰ ĐỘNG GÁN ĐỊA CHỈ NỘI BỘ CHO TẤT CẢ VALIDATOR ---
-            let worker_to_primary: SocketAddr =
-                format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
+            // --- LOGIC GÁN ĐỊA CHỈ NỘI BỘ ---
+            let worker_to_primary: SocketAddr;
+            let primary_to_worker: SocketAddr;
+            let transactions: SocketAddr;
+
+            // Kiểm tra xem validator đang xử lý có phải là chính node này không.
+            info!(
+                "Assigning sequential internal ports for self (address: {}  :: {}).",
+                self_address, val.address
+            );
+            if val.address.to_lowercase() == self_address.to_lowercase() {
+                // Nếu ĐÚNG, tự động gán cổng tuần tự cho chính nó.
+                info!(
+                    "Assigning sequential internal ports for self (address: {}).",
+                    self_address
+                );
+                worker_to_primary = format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
                     .parse()
                     .unwrap();
-            let primary_to_worker: SocketAddr =
-                format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
+                primary_to_worker = format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
                     .parse()
                     .unwrap();
-            let transactions: SocketAddr =
-                format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
+                transactions = format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
                     .parse()
                     .unwrap();
+            } else {
+                // Nếu KHÔNG, gán địa chỉ placeholder "0.0.0.0:0" vì không cần thiết.
+                // let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                // worker_to_primary = placeholder_addr;
+                // primary_to_worker = placeholder_addr;
+                // transactions = placeholder_addr;
+                transactions = format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
+                    .parse()
+                    .unwrap();
+                worker_to_primary = format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
+                    .parse()
+                    .unwrap();
+                primary_to_worker = format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
+                    .parse()
+                    .unwrap();
+            }
+            // --- KẾT THÚC LOGIC GÁN ĐỊA CHỈ ---
 
             let workers = [(
-                0,
+                0, // Giả sử mỗi validator chỉ có một worker với id = 0.
                 WorkerAddresses {
                     primary_to_worker,
                     transactions,
                     worker_to_worker: val.worker_address.parse().map_err(|e| {
                         ConfigError::ParseError(format!(
-                            "Invalid p2p_address '{}': {}",
-                            val.p2p_address, e
+                            "Invalid worker_address '{}': {}",
+                            val.worker_address, e
                         ))
                     })?,
                 },

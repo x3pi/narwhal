@@ -259,12 +259,15 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
 
-    log::info!("address: {}", keypair.name.to_eth_address());
+    let address = keypair.name.to_eth_address();
+
+    log::info!("address: {}", address);
     let name = crypto::base64_to_hex(&keypair.name.encode_base64());
 
     log::info!("name: {:?}", name);
 
-    let secret = crypto::base64_to_hex(&keypair.secret.encode_base64());
+    let secret: std::result::Result<String, anyhow::Error> =
+        crypto::base64_to_hex(&keypair.secret.encode_base64());
     log::info!("secret: {:?}", secret);
     let consensus_key = crypto::base64_to_hex(&keypair.consensus_key.to_string());
     log::info!("consensus_key: {:?}", consensus_key);
@@ -331,7 +334,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
         log::info!("validator_info {:?}", validator_info.validators);
 
-        Committee::from_validator_info(validator_info)
+        Committee::from_validator_info(validator_info, &address)
             .context("Failed to create committee from validator info")?
     };
 
