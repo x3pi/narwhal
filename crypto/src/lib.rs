@@ -147,7 +147,6 @@ impl AsRef<[u8]> for PublicKey {
     }
 }
 
-/// Represents a secret key used for network identity.
 pub struct SecretKey(Secp256k1PrivateKey);
 /* ... implementation của SecretKey giữ nguyên ... */
 impl Clone for SecretKey {

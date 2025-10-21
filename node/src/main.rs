@@ -7,7 +7,7 @@ use bytes::{BufMut, BytesMut};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
-use config::{Committee, KeyPair, Parameters, WorkerId};
+use config::{Committee, NodeConfig, Parameters, WorkerId};
 use config::{Validator, ValidatorInfo};
 use consensus::Consensus;
 use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
@@ -215,7 +215,7 @@ async fn main() -> Result<()> {
     logger.init();
 
     match matches.subcommand() {
-        ("generate_keys", Some(sub_matches)) => KeyPair::new()
+        ("generate_keys", Some(sub_matches)) => NodeConfig::new()
             .export(sub_matches.value_of("filename").unwrap())
             .context("Failed to generate key pair")?,
         ("run", Some(sub_matches)) => run(sub_matches).await?,
@@ -230,7 +230,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();
 
-    let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
+    let keypair = NodeConfig::import(key_file).context("Failed to load the node's keypair")?;
 
     let address = keypair.name.to_eth_address();
 

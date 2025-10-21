@@ -368,18 +368,23 @@ impl Committee {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-pub struct KeyPair {
+// ... existing code ...
+#[derive(Serialize, Deserialize)] // Thêm Debug để dễ dàng in ra thông tin cấu hình
+pub struct NodeConfig {
+    // Đổi tên KeyPair thành NodeConfig
     pub name: PublicKey,
     pub secret: SecretKey,
     pub consensus_key: ConsensusPublicKey,
     pub consensus_secret: ConsensusSecretKey,
+    pub uds_get_validators_path: String, // Trường mới
+    pub uds_block_path: String,          // Trường mới
 }
 
-impl Import for KeyPair {}
-impl Export for KeyPair {}
+impl Import for NodeConfig {} // Cập nhật Import cho NodeConfig
+impl Export for NodeConfig {} // Cập nhật Export cho NodeConfig
 
-impl KeyPair {
+impl NodeConfig {
+    // Cập nhật impl cho NodeConfig
     pub fn new() -> Self {
         let (name, secret) = generate_production_keypair();
         let mut rng = rand::rngs::StdRng::from_entropy();
@@ -389,11 +394,14 @@ impl KeyPair {
             secret,
             consensus_key,
             consensus_secret,
+            uds_get_validators_path: "/tmp/get_validator.sock_1".to_string(), // Giá trị mặc định
+            uds_block_path: "/tmp/block.sock_1".to_string(),                  // Giá trị mặc định
         }
     }
 }
 
-impl Default for KeyPair {
+impl Default for NodeConfig {
+    // Cập nhật Default cho NodeConfig
     fn default() -> Self {
         Self::new()
     }

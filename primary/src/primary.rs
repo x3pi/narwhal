@@ -12,7 +12,7 @@ use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
 use bytes::Bytes;
-use config::{Committee, KeyPair, Parameters, WorkerId};
+use config::{Committee, NodeConfig, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use dashmap::DashMap;
 use log::info;
@@ -103,7 +103,7 @@ pub struct Primary;
 
 impl Primary {
     pub async fn spawn(
-        keypair: KeyPair,
+        node_config: NodeConfig,
         initial_committee: Committee,
         parameters: Parameters,
         store: Store,
@@ -127,8 +127,8 @@ impl Primary {
         let (tx_helper_requests, rx_helper_requests) = channel(CHANNEL_CAPACITY);
 
         parameters.log();
-        let name = keypair.name;
-        let consensus_secret = keypair.consensus_secret;
+        let name = node_config.name;
+        let consensus_secret = node_config.consensus_secret;
         let consensus_round = Arc::new(AtomicU64::new(0));
         let transport = QuicTransport::new();
 
