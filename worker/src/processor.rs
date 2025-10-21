@@ -6,7 +6,6 @@ use config::WorkerId;
 use crypto::Digest;
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
-use serde::{Deserialize, Serialize};
 use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
 use std::convert::TryInto;
 use std::net::SocketAddr;

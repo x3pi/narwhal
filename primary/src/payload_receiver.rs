@@ -7,18 +7,24 @@ use tokio::sync::mpsc::Receiver;
 
 pub struct PayloadReceiver {
     store: Store,
-    cache: PayloadCache, // <--- THÊM TRƯỜNG CACHE
+    cache: PayloadCache,
     rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
 }
 
 impl PayloadReceiver {
     pub fn spawn(
         store: Store,
-        cache: PayloadCache, // <--- NHẬN CACHE
+        cache: PayloadCache,
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
     ) {
         tokio::spawn(async move {
-            Self { store, cache, rx_workers }.run().await;
+            Self {
+                store,
+                cache,
+                rx_workers,
+            }
+            .run()
+            .await;
         });
     }
 

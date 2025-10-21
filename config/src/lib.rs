@@ -6,17 +6,14 @@ use crypto::{
     ConsensusSecretKey, PublicKey, SecretKey,
 };
 use log::info;
-use rand::{RngCore, SeedableRng}; // <-- Thêm RngCore
+use rand::SeedableRng; // <-- Thêm RngCore
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use sha3::{Digest, Sha3_256}; // <-- Thêm các import cho sha3
 use std::collections::{BTreeMap, HashMap};
-use std::convert::TryFrom;
 use std::fs::{self, OpenOptions};
 use std::io::BufWriter;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::str::FromStr;
 use thiserror::Error;
 
 #[derive(Error, Debug)]
@@ -229,19 +226,19 @@ impl Committee {
                     .unwrap();
             } else {
                 // Nếu KHÔNG, gán địa chỉ placeholder "0.0.0.0:0" vì không cần thiết.
-                // let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                // worker_to_primary = placeholder_addr;
-                // primary_to_worker = placeholder_addr;
-                // transactions = placeholder_addr;
-                transactions = format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
-                    .parse()
-                    .unwrap();
-                worker_to_primary = format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
-                    .parse()
-                    .unwrap();
-                primary_to_worker = format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
-                    .parse()
-                    .unwrap();
+                let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                worker_to_primary = placeholder_addr;
+                primary_to_worker = placeholder_addr;
+                transactions = placeholder_addr;
+                // transactions = format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
+                //     .parse()
+                //     .unwrap();
+                // worker_to_primary = format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
+                //     .parse()
+                //     .unwrap();
+                // primary_to_worker = format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
+                //     .parse()
+                //     .unwrap();
             }
             // --- KẾT THÚC LOGIC GÁN ĐỊA CHỈ ---
 

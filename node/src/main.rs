@@ -10,12 +10,12 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use config::{Validator, ValidatorInfo};
 use consensus::Consensus;
-use consensus::{Bullshark, ConsensusProtocol};
+use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
 use env_logger::Env;
 use log::{error, info};
+use primary::Core;
 use primary::{Certificate, Primary};
 use prost::Message;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 use store::Store;
@@ -25,7 +25,6 @@ use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use worker::{Worker, WorkerMessage};
-
 // --- Thêm module validator ---
 pub mod validator {
     include!(concat!(env!("OUT_DIR"), "/validator.rs"));
@@ -38,31 +37,6 @@ pub mod comm {
 }
 
 pub const CHANNEL_CAPACITY: usize = 10_000;
-
-// =========================================================================
-// SỬA ĐỔI: Thêm cấu trúc ConsensusState và logic tải/tạo mới
-// =========================================================================
-
-/// Định nghĩa Round (Giả định Round = u64)
-type Round = u64;
-
-/// Mô phỏng cấu trúc ConsensusState cần thiết để tải từ Store.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsensusState {
-    pub last_committed_round: Round,
-    // Trong môi trường thực, các trường khác như `genesis` sẽ ở đây.
-}
-
-impl ConsensusState {
-    const STATE_KEY: &'static [u8] = b"consensus_state";
-
-    /// Mô phỏng việc tạo trạng thái mới từ genesis (Round 0).
-    pub fn new() -> Self {
-        Self {
-            last_committed_round: 0,
-        }
-    }
-}
 
 /// Hàm mới để lấy và chuyển đổi danh sách validator qua Unix Domain Socket.
 async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Result<ValidatorInfo> {
@@ -161,8 +135,7 @@ async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Resul
 /// Hàm mới để tải toàn bộ ConsensusState từ Store.
 /// Hàm này mô phỏng logic `load_state` bạn cung cấp.
 async fn load_consensus_state(store: &mut Store) -> ConsensusState {
-    // SỬA ĐỔI: Sử dụng STATE_KEY và deserialize ConsensusState
-    match store.read(ConsensusState::STATE_KEY.to_vec()).await {
+    match store.read(STATE_KEY.to_vec()).await {
         // Lỗi E0596 đã được sửa
         Ok(Some(bytes)) => {
             match bincode::deserialize::<ConsensusState>(&bytes) {
@@ -175,20 +148,20 @@ async fn load_consensus_state(store: &mut Store) -> ConsensusState {
                 }
                 Err(e) => {
                     error!("Failed to deserialize consensus state: {}. Starting from genesis (Round 0).", e);
-                    ConsensusState::new()
+                    ConsensusState::default()
                 }
             }
         }
         Ok(None) => {
             info!("No consensus state found in store. Starting from genesis (Round 0).");
-            ConsensusState::new()
+            ConsensusState::default()
         }
         Err(e) => {
             error!(
                 "Failed to read from store: {:?}. Starting from genesis (Round 0).",
                 e
             );
-            ConsensusState::new()
+            ConsensusState::default()
         }
     }
 }
@@ -295,11 +268,12 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         // LẤY BLOCK NUMBER TỪ CONSENSUS STATE
         // SỬA LỖI: Truyền tham chiếu thay đổi (mutable reference)
         let consensus_state = load_consensus_state(&mut store).await;
-        let block_number = consensus_state.last_committed_round; // Trích xuất Round
-
+        let block_number =
+            Core::calculate_last_reconfiguration_round(consensus_state.last_committed_round);
         log::info!(
-            "Using last committed round {} as block number for fetching committee.",
-            block_number
+            "Using last committed round {} :: {} as block number for fetching committee.",
+            block_number,
+            consensus_state.last_committed_round
         );
 
         // Logic retry cho UDS
@@ -461,25 +435,6 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
     );
 
     while let Some(certificate) = rx_output.recv().await {
-        let new_round = certificate.header.round;
-        let state = ConsensusState {
-            last_committed_round: new_round,
-        };
-
-        match bincode::serialize(&state) {
-            Ok(bytes) => {
-                // write() trả về (), không cần match
-                store.write(ConsensusState::STATE_KEY.to_vec(), bytes).await;
-                info!("[ANALYZE] Saved new last committed round: {}", new_round);
-            }
-            Err(e) => {
-                error!(
-                    "[ANALYZE] Failed to serialize ConsensusState (Round {}): {}",
-                    new_round, e
-                );
-            }
-        }
-
         // KẾT THÚC CẬP NHẬT
 
         log::info!(

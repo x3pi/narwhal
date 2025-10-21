@@ -16,6 +16,8 @@ use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
 
+pub const STATE_KEY: &'static [u8] = b"consensus_state";
+
 // ====================
 // ERROR DEFINITIONS
 // ====================
@@ -120,6 +122,16 @@ impl ConsensusState {
     }
 }
 
+impl Default for ConsensusState {
+    /// Tạo một trạng thái genesis mặc định, hoàn toàn trống.
+    fn default() -> Self {
+        Self {
+            last_committed_round: 0,
+            last_committed: HashMap::new(),
+            dag: HashMap::new(),
+        }
+    }
+}
 // ====================
 // UTILITY MODULE
 // ====================
@@ -569,10 +581,8 @@ pub struct Consensus {
 }
 
 impl Consensus {
-    const STATE_KEY: &'static [u8] = b"consensus_state";
-
     pub async fn load_last_committed_round(store: &mut Store) -> Round {
-        match store.read(Self::STATE_KEY.to_vec()).await {
+        match store.read(STATE_KEY.to_vec()).await {
             Ok(Some(bytes)) => match bincode::deserialize::<ConsensusState>(&bytes) {
                 Ok(state) => {
                     log::info!(
@@ -637,7 +647,7 @@ impl Consensus {
     }
 
     async fn load_state(&mut self) -> ConsensusState {
-        match self.store.read(Self::STATE_KEY.to_vec()).await {
+        match self.store.read(STATE_KEY.to_vec()).await {
             Ok(Some(bytes)) => match bincode::deserialize(&bytes) {
                 Ok(state) => {
                     info!("Loaded consensus state from store");
@@ -664,7 +674,7 @@ impl Consensus {
 
     async fn save_state(&mut self, state: &ConsensusState) -> Result<(), ConsensusError> {
         let serialized = bincode::serialize(state)?;
-        self.store.write(Self::STATE_KEY.to_vec(), serialized).await;
+        self.store.write(STATE_KEY.to_vec(), serialized).await;
         Ok(())
     }
 

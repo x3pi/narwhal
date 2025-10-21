@@ -29,20 +29,12 @@ pub mod core_tests;
 const SYNC_CHUNK_SIZE: Round = 1000;
 const SYNC_RETRY_DELAY: u64 = 5_000;
 const SYNC_MAX_RETRIES: u32 = 10;
-const RECONFIGURE_INTERVAL: Round = 100;
+pub const RECONFIGURE_INTERVAL: Round = 100;
 
 struct SyncState {
     final_target_round: Round,
     current_chunk_target: Round,
     retry_count: u32,
-}
-
-enum ReconfigurationState {
-    Running,
-    Reconfiguring {
-        new_committee: Committee,
-        pending_reconfiguration: HashSet<PublicKey>,
-    },
 }
 
 pub struct Core {
@@ -59,7 +51,6 @@ pub struct Core {
     rx_proposer: Receiver<Header>,
     tx_consensus: Sender<Certificate>,
     tx_proposer: Sender<(Vec<Digest>, Round)>,
-    tx_primaries: Sender<PrimaryMessage>,
     gc_round: Round,
     dag_round: Round,
     last_voted: HashMap<Round, HashSet<PublicKey>>,
@@ -71,7 +62,6 @@ pub struct Core {
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
     sync_state: Option<SyncState>,
     last_reconfigure_round: Round,
-    reconfiguration_state: ReconfigurationState,
 }
 
 impl Core {
@@ -88,7 +78,6 @@ impl Core {
         rx_header_waiter: Receiver<Header>,
         rx_certificate_waiter: Receiver<Certificate>,
         rx_proposer: Receiver<Header>,
-        tx_primaries: Sender<PrimaryMessage>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
     ) {
@@ -107,7 +96,6 @@ impl Core {
                 rx_proposer,
                 tx_consensus,
                 tx_proposer,
-                tx_primaries,
                 gc_round: 0,
                 dag_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
@@ -119,11 +107,17 @@ impl Core {
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 sync_state: None,
                 last_reconfigure_round: 0,
-                reconfiguration_state: ReconfigurationState::Running,
             }
             .run()
             .await;
         });
+    }
+
+    pub fn calculate_last_reconfiguration_round(current_round: Round) -> Round {
+        // Trong Rust, phép chia (/) giữa hai số nguyên sẽ tự động
+        // loại bỏ phần thập phân (floor division).
+        // Đây chính là công thức (n / 100) * 100.
+        (current_round / RECONFIGURE_INTERVAL) * RECONFIGURE_INTERVAL
     }
 
     async fn request_sync_chunk(&mut self, start: Round, end: Round) {
@@ -388,19 +382,6 @@ impl Core {
             }
         }
 
-        if let ReconfigurationState::Reconfiguring {
-            pending_reconfiguration,
-            ..
-        } = &mut self.reconfiguration_state
-        {
-            if certificate.round() == self.dag_round {
-                pending_reconfiguration.remove(&certificate.origin());
-                if pending_reconfiguration.is_empty() {
-                    self.finalize_reconfiguration().await;
-                }
-            }
-        }
-
         let id = certificate.header.id.clone();
         if let Err(e) = self.tx_consensus.send(certificate).await {
             warn!(
@@ -598,33 +579,6 @@ impl Core {
                 Ok(())
             }
             _ => Ok(()),
-        }
-    }
-
-    async fn start_reconfiguration(&mut self, new_committee: Committee) {
-        if let ReconfigurationState::Running = self.reconfiguration_state {
-            info!(
-                "Starting internal reconfiguration to new committee at round {}",
-                self.dag_round
-            );
-
-            let mut committee_lock = self.committee.write().await;
-            *committee_lock = new_committee;
-
-            info!("Internal committee update complete.");
-        }
-    }
-
-    async fn finalize_reconfiguration(&mut self) {
-        if let ReconfigurationState::Reconfiguring { new_committee, .. } = std::mem::replace(
-            &mut self.reconfiguration_state,
-            ReconfigurationState::Running,
-        ) {
-            info!("Finalizing reconfiguration.");
-            let mut committee_lock = self.committee.write().await;
-            *committee_lock = new_committee;
-            self.reconfiguration_state = ReconfigurationState::Running;
-            info!("Reconfiguration complete. Now operating with new committee.");
         }
     }
 

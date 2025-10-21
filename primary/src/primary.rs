@@ -189,7 +189,6 @@ impl Primary {
             rx_headers_loopback,
             rx_certificates_loopback,
             rx_proposer,
-            tx_primary_messages.clone(),
             tx_consensus,
             tx_parents,
         );
