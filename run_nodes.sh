@@ -17,7 +17,7 @@ EXECUTOR_BINARY="./go/bin/exetps"
 LOG_DIR="$BENCHMARK_DIR/logs"
 COMMITTEE_FILE="$BENCHMARK_DIR/.committee.json"
 PARAMETERS_FILE="$BENCHMARK_DIR/.parameters.json"
-UDS_SOCKET_PATH="/tmp/rust-go.sock_1"
+UDS_SOCKET_PATH="/tmp/get_validator.sock_1"
 
 # --- Dọn dẹp triệt để trước khi chạy ---
 # echo "--- 🧹 Stage 0: Cleanup ---"
