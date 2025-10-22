@@ -144,6 +144,8 @@ pub struct Authority {
     pub consensus_key: ConsensusPublicKey,
     pub primary: PrimaryAddresses,
     pub workers: HashMap<WorkerId, WorkerAddresses>,
+    // SỬA LỖI: Thêm trường p2p_address vào Authority
+    pub p2p_address: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
@@ -225,15 +227,6 @@ impl Committee {
                 worker_to_primary = placeholder_addr;
                 primary_to_worker = placeholder_addr;
                 transactions = placeholder_addr;
-                // transactions = format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
-                //     .parse()
-                //     .unwrap();
-                // worker_to_primary = format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
-                //     .parse()
-                //     .unwrap();
-                // primary_to_worker = format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
-                //     .parse()
-                //     .unwrap();
             }
             // --- KẾT THÚC LOGIC GÁN ĐỊA CHỈ ---
 
@@ -262,6 +255,8 @@ impl Committee {
                     worker_to_primary,
                 },
                 workers,
+                // SỬA LỖI: Gán giá trị p2p_address
+                p2p_address: val.p2p_address.clone(),
             };
             authorities.insert(public_key, authority);
         }

@@ -18,4 +18,6 @@ mod common;
 
 pub use crate::core::Core;
 pub use crate::messages::{Certificate, Header};
-pub use crate::primary::{Primary, PrimaryWorkerMessage, Round, WorkerPrimaryMessage};
+pub use crate::primary::{
+    Primary, PrimaryWorkerMessage, ReconfigureNotification, Round, WorkerPrimaryMessage,
+};

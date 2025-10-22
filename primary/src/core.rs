@@ -4,7 +4,8 @@
 use crate::aggregators::{CertificatesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Vote};
-use crate::primary::{PrimaryMessage, PrimaryWorkerMessage, Round};
+// SỬA ĐỔI: Thêm ReconfigureNotification
+use crate::primary::{PrimaryMessage, ReconfigureNotification, Round};
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
 use bytes::Bytes;
@@ -15,7 +16,7 @@ use log::{debug, error, info, warn};
 use network::{CancelHandler, ReliableSender};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering}; // SỬA LỖI: AtomicU4 -> AtomicU64
 use std::sync::Arc;
 use std::time::Duration;
 use store::{Store, ROUND_INDEX_CF};
@@ -43,7 +44,7 @@ pub struct Core {
     store: Store,
     synchronizer: Synchronizer,
     signature_service: SignatureService,
-    consensus_round: Arc<AtomicU64>,
+    consensus_round: Arc<AtomicU64>, // SỬA LỖI: AtomicU4 -> AtomicU64
     gc_depth: Round,
     rx_primaries: Receiver<PrimaryMessage>,
     rx_header_waiter: Receiver<Header>,
@@ -51,6 +52,8 @@ pub struct Core {
     rx_proposer: Receiver<Header>,
     tx_consensus: Sender<Certificate>,
     tx_proposer: Sender<(Vec<Digest>, Round)>,
+    // SỬA ĐỔI: Thêm kênh để thông báo cho node chính về việc tái cấu hình.
+    tx_reconfigure: Sender<ReconfigureNotification>,
     gc_round: Round,
     dag_round: Round,
     last_voted: HashMap<Round, HashSet<PublicKey>>,
@@ -72,7 +75,7 @@ impl Core {
         store: Store,
         synchronizer: Synchronizer,
         signature_service: SignatureService,
-        consensus_round: Arc<AtomicU64>,
+        consensus_round: Arc<AtomicU64>, // SỬA LỖI: AtomicU4 -> AtomicU64
         gc_depth: Round,
         rx_primaries: Receiver<PrimaryMessage>,
         rx_header_waiter: Receiver<Header>,
@@ -80,6 +83,8 @@ impl Core {
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
+        // SỬA ĐỔI: Nhận kênh tx_reconfigure.
+        tx_reconfigure: Sender<ReconfigureNotification>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -96,6 +101,7 @@ impl Core {
                 rx_proposer,
                 tx_consensus,
                 tx_proposer,
+                tx_reconfigure, // SỬA ĐỔI: Lưu trữ kênh.
                 gc_round: 0,
                 dag_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
@@ -114,9 +120,6 @@ impl Core {
     }
 
     pub fn calculate_last_reconfiguration_round(current_round: Round) -> Round {
-        // Trong Rust, phép chia (/) giữa hai số nguyên sẽ tự động
-        // loại bỏ phần thập phân (floor division).
-        // Đây chính là công thức (n / 100) * 100.
         (current_round / RECONFIGURE_INTERVAL) * RECONFIGURE_INTERVAL
     }
 
@@ -363,7 +366,6 @@ impl Core {
                 .append(certificate.clone(), &committee)?;
         }
 
-        // SỬA ĐỔI: Chuyển logic cập nhật vào đây
         if let Some(parents) = parents_option {
             let next_round = certificate.round() + 1;
 
@@ -371,7 +373,18 @@ impl Core {
                 && next_round % RECONFIGURE_INTERVAL == 0
                 && next_round > self.last_reconfigure_round
             {
-                self.trigger_reconfiguration(next_round).await;
+                // SỬA ĐỔI: Gửi tín hiệu tái cấu hình thay vì xử lý trực tiếp.
+                info!(
+                    "Round {}, signaling committee reconfiguration to main node loop.",
+                    next_round
+                );
+                let notification = ReconfigureNotification {
+                    round: next_round,
+                    committee: self.committee.read().await.clone(), // Gửi committee hiện tại
+                };
+                if let Err(e) = self.tx_reconfigure.send(notification).await {
+                    error!("Failed to send reconfiguration signal: {}", e);
+                }
             }
 
             if !syncing {
@@ -390,51 +403,6 @@ impl Core {
             );
         }
         Ok(())
-    }
-
-    // SỬA ĐỔI: Tách logic tái cấu hình ra hàm riêng
-    async fn trigger_reconfiguration(&mut self, next_round: Round) {
-        self.last_reconfigure_round = next_round;
-        info!(
-            "Round {}, triggering INTERNAL committee reconfiguration BEFORE proposing.",
-            next_round
-        );
-
-        let new_committee;
-        {
-            let committee = self.committee.read().await;
-            // Trong thực tế, bạn sẽ tải committee mới từ một file hoặc nguồn tin cậy
-            new_committee = committee.clone();
-        }
-
-        // Cập nhật committee được chia sẻ
-        {
-            let mut committee_guard = self.committee.write().await;
-            *committee_guard = new_committee.clone();
-        }
-        info!(
-            "Internal committee update complete for round {}.",
-            next_round
-        );
-
-        // Gửi tin nhắn cập nhật cho các Worker của chính node này
-        let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure(new_committee);
-        let committee = self.committee.read().await; // Đọc committee MỚI
-        match committee.our_workers(&self.name) {
-            Ok(worker_addresses) => {
-                let addresses = worker_addresses
-                    .iter()
-                    .map(|x| x.primary_to_worker)
-                    .collect();
-                let bytes = bincode::serialize(&worker_reconfigure_message)
-                    .expect("Failed to serialize worker reconfigure message");
-                self.network.broadcast(addresses, Bytes::from(bytes)).await;
-            }
-            Err(e) => warn!(
-                "Could not get our worker addresses for reconfiguring: {}",
-                e
-            ),
-        }
     }
 
     async fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
@@ -572,10 +540,9 @@ impl Core {
                 }
                 Ok(())
             }
+            // SỬA ĐỔI: Xóa bỏ logic xử lý Reconfigure cũ
             PrimaryMessage::Reconfigure(_) => {
-                // Logic này sẽ không được gọi nữa nếu chỉ cập nhật nội bộ,
-                // nhưng giữ lại để phòng trường hợp cần mở rộng.
-                info!("Received committee reconfiguration signal. Ignoring in internal-only mode.");
+                info!("Ignoring external reconfigure message.");
                 Ok(())
             }
             _ => Ok(()),
@@ -608,7 +575,6 @@ impl Core {
                 Err(e) => warn!("{}", e),
             }
 
-            // SỬA ĐỔI: Xóa bỏ logic cập nhật cũ khỏi vòng lặp chính
             if self.sync_state.is_none() {
                 let round = self.consensus_round.load(Ordering::Relaxed);
                 if round > self.gc_depth {

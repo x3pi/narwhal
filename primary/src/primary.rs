@@ -22,7 +22,7 @@ use network::{
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicU64; // SỬA LỖI: AtomicU4 -> AtomicU64
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -33,6 +33,13 @@ pub type PendingBatches = Arc<DashMap<Digest, (WorkerId, Round)>>;
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
+
+// SỬA ĐỔI: Thêm cấu trúc tin nhắn để thông báo tái cấu hình.
+#[derive(Debug)]
+pub struct ReconfigureNotification {
+    pub round: Round,
+    pub committee: Committee,
+}
 
 #[derive(Serialize, Deserialize)]
 pub enum PrimaryMessage {
@@ -50,6 +57,7 @@ pub enum PrimaryMessage {
 }
 
 impl fmt::Debug for PrimaryMessage {
+    // SỬA LỖI: Sửa chữ ký hàm fmt
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Header(h) => f.debug_tuple("Header").field(h).finish(),
@@ -84,6 +92,7 @@ pub enum PrimaryWorkerMessage {
 }
 
 impl fmt::Debug for PrimaryWorkerMessage {
+    // SỬA LỖI: Sửa chữ ký hàm fmt
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Synchronize(d, p) => f.debug_tuple("Synchronize").field(d).field(p).finish(),
@@ -102,13 +111,16 @@ pub enum WorkerPrimaryMessage {
 pub struct Primary;
 
 impl Primary {
-    pub async fn spawn(
+    #[allow(clippy::too_many_arguments)]
+    pub fn spawn(
         node_config: NodeConfig,
         initial_committee: Committee,
         parameters: Parameters,
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
+        // SỬA ĐỔI: Thêm kênh tx_reconfigure.
+        tx_reconfigure: Sender<ReconfigureNotification>,
     ) {
         let committee = Arc::new(RwLock::new(initial_committee));
 
@@ -129,119 +141,122 @@ impl Primary {
         parameters.log();
         let name = node_config.name;
         let consensus_secret = node_config.consensus_secret;
-        let consensus_round = Arc::new(AtomicU64::new(0));
+        let consensus_round = Arc::new(AtomicU64::new(0)); // SỬA LỖI: AtomicU4 -> AtomicU64
         let transport = QuicTransport::new();
 
-        // SỬA LỖI: Lock committee một lần và truyền tham chiếu/clone vào các hàm.
-        let committee_guard = committee.read().await;
+        tokio::spawn(async move {
+            let committee_guard = committee.read().await;
 
-        let primary_address = committee_guard.primary(&name).unwrap().primary_to_primary;
-        let mut listen_address = primary_address;
-        listen_address.set_ip("0.0.0.0".parse().unwrap());
-        let primary_listener = transport.listen(listen_address).await.unwrap();
-        NetworkReceiver::spawn(
-            primary_listener,
-            PrimaryReceiverHandler {
-                tx_primary_messages: tx_primary_messages.clone(),
-                tx_helper: tx_helper_requests,
-            },
-        );
-        info!(
-            "Primary {} listening to primary messages on {}",
-            name, listen_address
-        );
+            let primary_address = committee_guard.primary(&name).unwrap().primary_to_primary;
+            let mut listen_address = primary_address;
+            listen_address.set_ip("0.0.0.0".parse().unwrap());
+            let primary_listener = transport.listen(listen_address).await.unwrap();
+            NetworkReceiver::spawn(
+                primary_listener,
+                PrimaryReceiverHandler {
+                    tx_primary_messages: tx_primary_messages.clone(),
+                    tx_helper: tx_helper_requests,
+                },
+            );
+            info!(
+                "Primary {} listening to primary messages on {}",
+                name, listen_address
+            );
 
-        let worker_address = committee_guard.primary(&name).unwrap().worker_to_primary;
-        let mut listen_address = worker_address;
-        listen_address.set_ip("0.0.0.0".parse().unwrap());
-        let worker_listener = transport.listen(listen_address).await.unwrap();
-        NetworkReceiver::spawn(
-            worker_listener,
-            WorkerReceiverHandler {
-                tx_workers: tx_workers,
-            },
-        );
-        info!(
-            "Primary {} listening to workers messages on {}",
-            name, listen_address
-        );
+            let worker_address = committee_guard.primary(&name).unwrap().worker_to_primary;
+            let mut listen_address = worker_address;
+            listen_address.set_ip("0.0.0.0".parse().unwrap());
+            let worker_listener = transport.listen(listen_address).await.unwrap();
+            NetworkReceiver::spawn(
+                worker_listener,
+                WorkerReceiverHandler {
+                    tx_workers: tx_workers,
+                },
+            );
+            info!(
+                "Primary {} listening to workers messages on {}",
+                name, listen_address
+            );
 
-        let synchronizer = Synchronizer::new(
-            name,
-            &*committee_guard, // Truyền tham chiếu &Committee
-            store.clone(),
-            payload_cache.clone(),
-            tx_sync_headers,
-            tx_sync_certificates,
-        );
+            let synchronizer = Synchronizer::new(
+                name,
+                &*committee_guard,
+                store.clone(),
+                payload_cache.clone(),
+                tx_sync_headers,
+                tx_sync_certificates,
+            );
 
-        let signature_service = SignatureService::new(consensus_secret);
+            let signature_service = SignatureService::new(consensus_secret);
 
-        Core::spawn(
-            name,
-            committee.clone(), // Core cần Arc<RwLock<Committee>> để có thể thay đổi
-            store.clone(),
-            synchronizer,
-            signature_service.clone(),
-            consensus_round.clone(),
-            parameters.gc_depth,
-            rx_primary_messages,
-            rx_headers_loopback,
-            rx_certificates_loopback,
-            rx_proposer,
-            tx_consensus,
-            tx_parents,
-        );
+            Core::spawn(
+                name,
+                committee.clone(),
+                store.clone(),
+                synchronizer,
+                signature_service.clone(),
+                consensus_round.clone(),
+                parameters.gc_depth,
+                rx_primary_messages,
+                rx_headers_loopback,
+                rx_certificates_loopback,
+                rx_proposer,
+                tx_consensus,
+                tx_parents,
+                // SỬA ĐỔI: Truyền kênh tx_reconfigure vào Core.
+                tx_reconfigure,
+            );
 
-        GarbageCollector::spawn(
-            &name,
-            &*committee_guard, // Truyền tham chiếu &Committee
-            store.clone(),
-            consensus_round.clone(),
-            pending_batches.clone(),
-            rx_consensus,
-            tx_repropose,
-        );
+            GarbageCollector::spawn(
+                &name,
+                &*committee_guard,
+                store.clone(),
+                consensus_round.clone(),
+                pending_batches.clone(),
+                rx_consensus,
+                tx_repropose,
+            );
 
-        Proposer::spawn(
-            name,
-            &*committee_guard, // Truyền tham chiếu &Committee
-            signature_service,
-            store.clone(),
-            parameters.header_size,
-            parameters.max_header_delay,
-            pending_batches.clone(),
-            rx_parents,
-            rx_workers,
-            rx_repropose,
-            tx_headers,
-        );
+            Proposer::spawn(
+                name,
+                &*committee_guard,
+                signature_service,
+                store.clone(),
+                parameters.header_size,
+                parameters.max_header_delay,
+                pending_batches.clone(),
+                rx_parents,
+                rx_workers,
+                rx_repropose,
+                tx_headers,
+            );
 
-        HeaderWaiter::spawn(
-            name,
-            committee_guard.clone(), // Truyền Committee bằng value
-            store.clone(),
-            consensus_round,
-            parameters.gc_depth,
-            parameters.sync_retry_delay,
-            parameters.sync_retry_nodes,
-            rx_sync_headers,
-            tx_headers_loopback,
-        );
+            HeaderWaiter::spawn(
+                name,
+                committee_guard.clone(),
+                store.clone(),
+                consensus_round,
+                parameters.gc_depth,
+                parameters.sync_retry_delay,
+                parameters.sync_retry_nodes,
+                rx_sync_headers,
+                tx_headers_loopback,
+            );
 
-        CertificateWaiter::spawn(
-            store.clone(),
-            rx_sync_certificates,
-            tx_certificates_loopback,
-        );
+            CertificateWaiter::spawn(
+                store.clone(),
+                rx_sync_certificates,
+                tx_certificates_loopback,
+            );
 
-        Helper::spawn(committee_guard.clone(), store, rx_helper_requests); // Truyền Committee bằng value
+            Helper::spawn(committee_guard.clone(), store, rx_helper_requests);
 
-        info!(
-            "Primary {} successfully booted on {}",
-            name,
-            primary_address.ip()
-        );
+            info!(
+                "Primary {} successfully booted on {}",
+                name,
+                primary_address.ip()
+            );
+        });
     }
 }
 
