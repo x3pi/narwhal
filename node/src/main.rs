@@ -12,12 +12,13 @@ use config::{Validator, ValidatorInfo};
 use consensus::Consensus;
 use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
 use crypto::Digest;
+use crypto::Hash as _;
 use env_logger::Env;
 use log::{error, info, warn};
 use network::SimpleSender;
 use primary::{Certificate, Core, Primary, PrimaryWorkerMessage, ReconfigureNotification};
 use prost::Message;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use store::Store;
@@ -324,6 +325,28 @@ async fn run_loop(
     let mut current_role: Option<NodeRole> = None;
     let mut shutdown_trigger = tokio::sync::broadcast::channel(1).0;
 
+    let (tx_output, rx_output) = channel::<(Certificate, Committee)>(CHANNEL_CAPACITY);
+
+    if let RunMode::Primary = run_mode {
+        let temp_committee = shared_state.committee.read().await;
+        let node_id = temp_committee
+            .authorities
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+            .iter()
+            .position(|pk| pk == &shared_state.node_config.name)
+            .unwrap_or(0);
+        drop(temp_committee);
+
+        tokio::spawn(analyze(
+            rx_output,
+            node_id,
+            shared_state.store.clone(),
+            shared_state.node_config.clone(),
+        ));
+    }
+
     loop {
         tokio::select! {
             Some(notification) = rx_reconfigure.recv(), if run_mode == RunMode::Primary => {
@@ -350,7 +373,7 @@ async fn run_loop(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
 
-                info!("Shutting down current tasks for reconfiguration...");
+                info!("Shutting down current Primary & Consensus tasks for reconfiguration...");
                 let _ = shutdown_trigger.send(());
                 tokio::time::sleep(Duration::from_millis(200)).await;
 
@@ -441,19 +464,9 @@ async fn run_loop(
                     info!("Starting Validator tasks...");
                     match run_mode {
                         RunMode::Primary => {
-                            let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
                             let (tx_new_certificates, rx_new_certificates) =
                                 channel(CHANNEL_CAPACITY);
                             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-
-                            let node_id = committee
-                                .authorities
-                                .keys()
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .iter()
-                                .position(|pk| pk == my_pubkey)
-                                .unwrap_or(0);
 
                             Primary::spawn(
                                 shared_state.node_config.clone(),
@@ -471,20 +484,12 @@ async fn run_loop(
                                 shared_state.store.clone(),
                                 rx_new_certificates,
                                 tx_feedback,
-                                tx_output,
+                                tx_output.clone(),
                                 ConsensusProtocol::Bullshark(Bullshark::new(
                                     committee.clone(),
                                     shared_state.parameters.gc_depth,
                                 )),
                             );
-
-                            tokio::spawn(analyze(
-                                rx_output,
-                                node_id,
-                                shared_state.store.clone(),
-                                shared_state.node_config.clone(),
-                                shutdown_trigger.subscribe(),
-                            ));
                         }
                         RunMode::Worker(id) => {
                             Worker::spawn(
@@ -514,13 +519,13 @@ async fn run_loop(
 }
 
 async fn analyze(
-    mut rx_output: Receiver<Certificate>,
+    mut rx_output: Receiver<(Certificate, Committee)>,
     node_id: usize,
     mut store: Store,
     node_config: NodeConfig,
-    mut shutdown_receiver: tokio::sync::broadcast::Receiver<()>,
 ) {
-    let mut processed_rounds = HashSet::new();
+    let mut processed_certificates = HashSet::<Digest>::new();
+    let mut round_transactions = HashMap::<u64, Vec<comm::Transaction>>::new();
 
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
@@ -535,83 +540,133 @@ async fn analyze(
 
     if !node_config.uds_block_path.is_empty() {
         let socket_path = node_config.uds_block_path;
-        let mut stream = loop {
-            tokio::select! {
-                _ = shutdown_receiver.recv() => {
-                    info!("[ANALYZE] Shutdown signal received. Exiting.");
-                    return;
-                },
-                result = UnixStream::connect(&socket_path) => match result {
+        let mut stream_option = None;
+
+        loop {
+            if stream_option.is_none() {
+                match UnixStream::connect(&socket_path).await {
                     Ok(stream) => {
                         info!("[ANALYZE] Node ID {} connected to {}", node_id, socket_path);
-                        break stream;
+                        stream_option = Some(stream);
                     }
                     Err(e) => {
-                        warn!("[ANALYZE] Connection to {} failed: {}. Retrying...", socket_path, e);
+                        warn!(
+                            "[ANALYZE] Connection to {} failed: {}. Retrying...",
+                            socket_path, e
+                        );
                         tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                        continue;
                     }
                 }
             }
-        };
+            let stream = stream_option.as_mut().unwrap();
 
-        loop {
-            tokio::select! {
-                _ = shutdown_receiver.recv() => {
-                    info!("[ANALYZE] Shutdown signal received. Exiting loop.");
-                    break;
-                },
-                Some(certificate) = rx_output.recv() => {
-                    if !processed_rounds.insert(certificate.header.round) {
-                        warn!("[ANALYZE] Skipping duplicate certificate for round {}.", certificate.header.round);
+            match rx_output.recv().await {
+                Some((certificate, _committee)) => {
+                    if !processed_certificates.insert(certificate.digest()) {
                         continue;
                     }
 
-                    let mut all_transactions = Vec::new();
-                    let mut processed_digests = HashSet::<Digest>::new();
+                    let round = certificate.header.round;
 
+                    let mut transactions_in_cert = Vec::new();
                     for (digest, worker_id) in certificate.header.payload {
-                        if processed_digests.insert(digest.clone()) {
-                            match store.read(digest.to_vec()).await {
-                                Ok(Some(serialized_batch)) => {
-                                    match bincode::deserialize(&serialized_batch) {
-                                        Ok(WorkerMessage::Batch(batch)) => {
-                                            for tx_data in batch {
-                                                all_transactions.push(comm::Transaction {
-                                                    digest: tx_data,
-                                                    worker_id: worker_id as u32,
-                                                });
-                                            }
+                        match store.read(digest.to_vec()).await {
+                            Ok(Some(serialized_batch)) => {
+                                match bincode::deserialize(&serialized_batch) {
+                                    Ok(WorkerMessage::Batch(batch)) => {
+                                        for tx_data in batch {
+                                            transactions_in_cert.push(comm::Transaction {
+                                                digest: tx_data,
+                                                worker_id: worker_id as u32,
+                                            });
                                         }
-                                        _ => warn!("[ANALYZE] Message for digest {} is not a Batch.", digest),
                                     }
+                                    _ => warn!(
+                                        "[ANALYZE] Message for digest {} is not a Batch.",
+                                        digest
+                                    ),
                                 }
-                                Ok(None) => warn!("[ANALYZE] Batch for digest {} not found.", digest),
-                                Err(e) => error!("[ANALYZE] Failed to read batch {}: {}", digest, e),
                             }
+                            Ok(None) => warn!("[ANALYZE] Batch for digest {} not found.", digest),
+                            Err(e) => error!("[ANALYZE] Failed to read batch {}: {}", digest, e),
                         }
                     }
 
-                    let committed_block = comm::CommittedBlock {
-                        epoch: certificate.header.round,
-                        height: certificate.header.round,
-                        transactions: all_transactions,
-                    };
-                    let epoch_data = comm::CommittedEpochData { blocks: vec![committed_block] };
+                    round_transactions
+                        .entry(round)
+                        .or_default()
+                        .extend(transactions_in_cert);
 
-                    let mut proto_buf = BytesMut::new();
-                    epoch_data.encode(&mut proto_buf).expect("Protobuf serialization failed");
-                    let mut len_buf = BytesMut::new();
-                    put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+                    if round > 0 {
+                        let round_to_finalize = round - 1;
+                        if let Some(transactions) = round_transactions.remove(&round_to_finalize) {
+                            let committed_block = comm::CommittedBlock {
+                                epoch: round_to_finalize,
+                                height: round_to_finalize,
+                                transactions,
+                            };
+                            let epoch_data = comm::CommittedEpochData {
+                                blocks: vec![committed_block],
+                            };
 
-                    if let Err(e) = stream.write_all(&len_buf).await {
-                        error!("[ANALYZE] Failed to write length to socket: {}. Exiting.", e);
-                        break;
+                            let mut proto_buf = BytesMut::new();
+                            epoch_data
+                                .encode(&mut proto_buf)
+                                .expect("Protobuf serialization failed");
+                            let mut len_buf = BytesMut::new();
+                            put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
+                            if let Err(e) = stream.write_all(&len_buf).await {
+                                error!("[ANALYZE] Failed to write length to socket: {}. Reconnecting...", e);
+                                stream_option = None;
+                                continue;
+                            }
+                            if let Err(e) = stream.write_all(&proto_buf).await {
+                                error!("[ANALYZE] Failed to write payload to socket: {}. Reconnecting...", e);
+                                stream_option = None;
+                                continue;
+                            }
+                            info!(
+                                "[ANALYZE] Sent block for round {} successfully.",
+                                round_to_finalize
+                            );
+                        }
                     }
-                    if let Err(e) = stream.write_all(&proto_buf).await {
-                        error!("[ANALYZE] Failed to write payload to socket: {}. Exiting.", e);
-                        break;
+                }
+                None => {
+                    info!("[ANALYZE] Main channel closed. Sending remaining blocks.");
+                    let mut pending_rounds: Vec<_> = round_transactions.keys().cloned().collect();
+                    pending_rounds.sort_unstable();
+                    for r in pending_rounds {
+                        if let Some(transactions) = round_transactions.remove(&r) {
+                            let committed_block = comm::CommittedBlock {
+                                epoch: r,
+                                height: r,
+                                transactions,
+                            };
+                            let epoch_data = comm::CommittedEpochData {
+                                blocks: vec![committed_block],
+                            };
+                            let mut proto_buf = BytesMut::new();
+                            epoch_data
+                                .encode(&mut proto_buf)
+                                .expect("Protobuf serialization failed");
+                            let mut len_buf = BytesMut::new();
+                            put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
+                            if let Err(e) = stream.write_all(&len_buf).await {
+                                error!("[ANALYZE] Failed to write final length: {}", e);
+                                break;
+                            }
+                            if let Err(e) = stream.write_all(&proto_buf).await {
+                                error!("[ANALYZE] Failed to write final payload: {}", e);
+                                break;
+                            }
+                            info!("[ANALYZE] Sent final block for round {} successfully.", r);
+                        }
                     }
-                    info!("[ANALYZE] Sent block for round {} successfully.", certificate.header.round);
+                    break;
                 }
             }
         }

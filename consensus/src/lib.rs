@@ -1,3 +1,5 @@
+// In consensus/src/lib.rs
+
 // Copyright (c) 2021, Facebook, Inc. and its affiliates
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
@@ -574,7 +576,10 @@ pub struct Consensus {
     store: Store,
     rx_primary: Receiver<Certificate>,
     tx_primary: Sender<Certificate>,
-    tx_output: Sender<Certificate>,
+    // --- BẮT ĐẦU THAY ĐỔI ---
+    tx_output: Sender<(Certificate, Committee)>,
+    committee: Committee, // Giữ một bản sao của committee hiện tại.
+    // --- KẾT THÚC THAY ĐỔI ---
     protocol: Box<dyn ConsensusAlgorithm>,
     genesis: Vec<Certificate>,
     metrics: Arc<RwLock<ConsensusMetrics>>,
@@ -613,7 +618,9 @@ impl Consensus {
         store: Store,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
-        tx_output: Sender<Certificate>,
+        // --- BẮT ĐẦU THAY ĐỔI ---
+        tx_output: Sender<(Certificate, Committee)>,
+        // --- KẾT THÚC THAY ĐỔI ---
         protocol_selection: ConsensusProtocol,
     ) -> Arc<RwLock<ConsensusMetrics>> {
         let protocol: Box<dyn ConsensusAlgorithm> = match protocol_selection {
@@ -635,6 +642,9 @@ impl Consensus {
                 rx_primary,
                 tx_primary,
                 tx_output,
+                // --- BẮT ĐẦU THAY ĐỔI ---
+                committee: committee.clone(),
+                // --- KẾT THÚC THAY ĐỔI ---
                 protocol,
                 genesis: Certificate::genesis(&committee),
                 metrics: metrics_clone,
@@ -729,15 +739,18 @@ impl Consensus {
                             info!("Committed {} -> {:?}", certificate.header, digest);
                         }
 
-                        // Send to primary
+                        // Send to primary for garbage collection signal
                         if let Err(e) = self.tx_primary.send(certificate.clone()).await {
                             error!("Failed to send certificate to primary: {}", e);
                         }
 
-                        // Send to output
-                        if let Err(e) = self.tx_output.send(certificate).await {
+                        // --- BẮT ĐẦU THAY ĐỔI ---
+                        // Gửi certificate và committee hiện tại ra ngoài.
+                        let output_tuple = (certificate, self.committee.clone());
+                        if let Err(e) = self.tx_output.send(output_tuple).await {
                             warn!("Failed to output certificate: {}", e);
                         }
+                        // --- KẾT THÚC THAY ĐỔI ---
                     }
                 }
                 Err(e) => {
