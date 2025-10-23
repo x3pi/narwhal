@@ -1,6 +1,8 @@
+// In primary/src/proposer.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
-use crate::primary::{PendingBatches, Round};
+use crate::primary::{CommittedBatches, PendingBatches, Round};
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
@@ -23,9 +25,9 @@ pub struct Proposer {
     max_header_delay: u64,
 
     pending_batches: PendingBatches,
+    committed_batches: CommittedBatches,
 
     rx_core: Receiver<(Vec<Digest>, Round)>,
-    /// Nhận tất cả batch (bao gồm cả nội dung) từ các worker.
     rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
     rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
     tx_core: Sender<Header>,
@@ -46,6 +48,7 @@ impl Proposer {
         header_size: usize,
         max_header_delay: u64,
         pending_batches: PendingBatches,
+        committed_batches: CommittedBatches,
         rx_core: Receiver<(Vec<Digest>, Round)>,
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
         rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
@@ -64,6 +67,7 @@ impl Proposer {
                 header_size,
                 max_header_delay,
                 pending_batches,
+                committed_batches,
                 rx_core,
                 rx_workers,
                 rx_repropose,
@@ -80,6 +84,11 @@ impl Proposer {
 
     async fn make_header(&mut self) {
         let digests_for_header: Vec<(Digest, WorkerId)> = self.digests.drain(..).collect();
+
+        if digests_for_header.is_empty() && self.last_parents.is_empty() {
+            return; // Không tạo header rỗng nếu không có cha mẹ (trường hợp genesis)
+        }
+
         let header = Header::new(
             self.name,
             self.round,
@@ -90,7 +99,6 @@ impl Proposer {
         .await;
         debug!("Created {:?}", header);
 
-        // Ghi vào cache để GC theo dõi.
         for (digest, worker_id) in digests_for_header {
             self.pending_batches.insert(digest, (worker_id, self.round));
         }
@@ -112,15 +120,17 @@ impl Proposer {
         tokio::pin!(timer);
 
         loop {
-            let enough_parents = !self.last_parents.is_empty();
-            let enough_digests = self.payload_size >= self.header_size;
             let timer_expired = timer.is_elapsed();
 
-            if (timer_expired || enough_digests) && enough_parents {
-                self.make_header().await;
-                self.payload_size = 0;
-                let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
-                timer.as_mut().reset(deadline);
+            if !self.last_parents.is_empty()
+                && (timer_expired || self.payload_size >= self.header_size)
+            {
+                if !self.digests.is_empty() || timer_expired {
+                    self.make_header().await;
+                    self.payload_size = 0;
+                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                    timer.as_mut().reset(deadline);
+                }
             }
 
             tokio::select! {
@@ -131,17 +141,19 @@ impl Proposer {
                         self.last_parents = parents;
                     }
                 }
-                // --- Proposer nhận lại trách nhiệm ghi vào store ---
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
-                    self.store.write(digest.to_vec(), batch).await;
-                    self.payload_size += digest.size();
-                    self.digests.push((digest, worker_id));
+                    if !self.committed_batches.contains_key(&digest) && !self.pending_batches.contains_key(&digest) {
+                        self.store.write(digest.to_vec(), batch).await;
+                        self.payload_size += digest.size();
+                        self.digests.push((digest, worker_id));
+                    }
                 }
                 Some((digest, worker_id, _batch)) = self.rx_repropose.recv() => {
-                    // Batch đã có trong store, chỉ cần thêm lại vào danh sách đề xuất.
-                    warn!("Re-proposing orphaned batch {}", digest);
-                    self.payload_size += digest.size();
-                    self.digests.push((digest, worker_id));
+                    if !self.committed_batches.contains_key(&digest) && !self.pending_batches.contains_key(&digest) {
+                        warn!("Re-proposing orphaned batch {}", digest);
+                        self.payload_size += digest.size();
+                        self.digests.push((digest, worker_id));
+                    }
                 }
                 () = &mut timer => {}
             }

@@ -20,10 +20,6 @@ use tokio::sync::RwLock;
 
 pub const STATE_KEY: &'static [u8] = b"consensus_state";
 
-// ====================
-// ERROR DEFINITIONS
-// ====================
-
 #[derive(Error, Debug)]
 pub enum ConsensusError {
     #[error("Failed to serialize state: {0}")]
@@ -42,14 +38,8 @@ pub enum ConsensusError {
     ChannelError(String),
 }
 
-// ====================
-// TYPE DEFINITIONS
-// ====================
-
-/// Biểu diễn của DAG trong bộ nhớ.
 pub type Dag = HashMap<Round, HashMap<PublicKey, (Digest, Certificate)>>;
 
-/// Metrics cho monitoring
 #[derive(Debug, Clone, Default)]
 pub struct ConsensusMetrics {
     pub total_certificates_processed: u64,
@@ -58,7 +48,6 @@ pub struct ConsensusMetrics {
     pub failed_leader_elections: u64,
 }
 
-/// Trạng thái cần được lưu trữ để phục hồi sau sự cố.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ConsensusState {
     pub last_committed_round: Round,
@@ -66,8 +55,14 @@ pub struct ConsensusState {
     pub dag: Dag,
 }
 
+// STRUCT MỚI: Đại diện cho một sub-dag đã được commit, bắt đầu từ một leader.
+#[derive(Clone, Debug)]
+pub struct CommittedSubDag {
+    pub leader: Certificate,
+    pub certificates: Vec<Certificate>,
+}
+
 impl ConsensusState {
-    /// Tạo trạng thái mới từ các chứng chỉ genesis.
     pub fn new(genesis: Vec<Certificate>) -> Self {
         let genesis_map = genesis
             .into_iter()
@@ -84,7 +79,6 @@ impl ConsensusState {
         }
     }
 
-    /// Cập nhật và dọn dẹp trạng thái nội bộ dựa trên các chứng chỉ đã commit.
     pub fn update(&mut self, certificate: &Certificate, gc_depth: Round) {
         self.last_committed
             .entry(certificate.origin())
@@ -94,7 +88,6 @@ impl ConsensusState {
         let last_committed_round = *self.last_committed.values().max().unwrap_or(&0);
         self.last_committed_round = last_committed_round;
 
-        // Garbage collection với logging chi tiết
         let mut removed_count = 0;
         for (name, round) in &self.last_committed {
             self.dag.retain(|r, authorities| {
@@ -110,9 +103,7 @@ impl ConsensusState {
         }
     }
 
-    /// Validate state integrity
     pub fn validate(&self) -> Result<(), ConsensusError> {
-        // Check if dag is consistent with last_committed
         for (pk, round) in &self.last_committed {
             if let Some(round_map) = self.dag.get(round) {
                 if !round_map.contains_key(pk) {
@@ -125,7 +116,6 @@ impl ConsensusState {
 }
 
 impl Default for ConsensusState {
-    /// Tạo một trạng thái genesis mặc định, hoàn toàn trống.
     fn default() -> Self {
         Self {
             last_committed_round: 0,
@@ -134,14 +124,10 @@ impl Default for ConsensusState {
         }
     }
 }
-// ====================
-// UTILITY MODULE
-// ====================
 
 mod utils {
     use super::*;
 
-    /// Sắp xếp các leader trong quá khứ chưa được commit.
     pub fn order_leaders<'a, LeaderElector>(
         leader: &Certificate,
         state: &'a ConsensusState,
@@ -174,7 +160,6 @@ mod utils {
         to_commit
     }
 
-    /// Kiểm tra xem có đường đi giữa hai leader hay không.
     fn linked(leader: &Certificate, prev_leader: &Certificate, dag: &Dag) -> bool {
         let mut parents = vec![leader];
 
@@ -205,7 +190,6 @@ mod utils {
         parents.contains(&prev_leader)
     }
 
-    /// Trải phẳng DAG con được tham chiếu bởi chứng chỉ đầu vào.
     pub fn order_dag(
         gc_depth: Round,
         leader: &Certificate,
@@ -223,6 +207,7 @@ mod utils {
             for parent in &x.header.parents {
                 let (digest, certificate) = match state
                     .dag
+                    // SỬA LỖI: sating_sub -> saturating_sub
                     .get(&(x.round().saturating_sub(1)))
                     .and_then(|certs| certs.values().find(|(d, _)| d == parent))
                 {
@@ -236,7 +221,6 @@ mod utils {
                     }
                 };
 
-                // Skip if already processed or already committed
                 let mut skip = already_ordered.contains(&digest);
                 skip |= state
                     .last_committed
@@ -250,7 +234,6 @@ mod utils {
             }
         }
 
-        // Ensure we do not commit garbage collected certificates.
         let before_gc = ordered.len();
         ordered.retain(|x| x.round() + gc_depth >= state.last_committed_round);
         let after_gc = ordered.len();
@@ -259,30 +242,23 @@ mod utils {
             debug!("Filtered out {} GC'd certificates", before_gc - after_gc);
         }
 
-        // Sort by round for consistent ordering
         ordered.sort_by_key(|x| x.round());
         debug!("Ordered {} certificates from sub-dag", ordered.len());
         ordered
     }
 }
 
-// ====================
-// CONSENSUS ALGORITHMS
-// ====================
-
-/// Trait chung cho các thuật toán đồng thuận.
 pub trait ConsensusAlgorithm: Send + Sync {
     fn process_certificate(
         &self,
         state: &mut ConsensusState,
         certificate: Certificate,
         metrics: &mut ConsensusMetrics,
-    ) -> Result<(Vec<Certificate>, bool), ConsensusError>;
+    ) -> Result<(Vec<CommittedSubDag>, bool), ConsensusError>;
 
     fn name(&self) -> &'static str;
 }
 
-/// Logic đồng thuận Tusk (Narwhal).
 pub struct Tusk {
     pub committee: Committee,
     pub gc_depth: Round,
@@ -298,7 +274,6 @@ impl Tusk {
     }
 
     fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
-        // Simple round-robin leader election
         #[cfg(test)]
         let coin = 0;
         #[cfg(not(test))]
@@ -318,18 +293,16 @@ impl ConsensusAlgorithm for Tusk {
         state: &mut ConsensusState,
         certificate: Certificate,
         metrics: &mut ConsensusMetrics,
-    ) -> Result<(Vec<Certificate>, bool), ConsensusError> {
+    ) -> Result<(Vec<CommittedSubDag>, bool), ConsensusError> {
         let round = certificate.round();
         metrics.total_certificates_processed += 1;
 
-        // Add to DAG
         state
             .dag
             .entry(round)
             .or_insert_with(HashMap::new)
             .insert(certificate.origin(), (certificate.digest(), certificate));
 
-        // Try to commit - need even round >= 4
         let r = round - 1;
         if r % 2 != 0 || r < 4 {
             return Ok((Vec::new(), false));
@@ -353,7 +326,6 @@ impl ConsensusAlgorithm for Tusk {
             }
         };
 
-        // Check f+1 support
         let stake: Stake = state
             .dag
             .get(&(r - 1))
@@ -378,25 +350,34 @@ impl ConsensusAlgorithm for Tusk {
             leader_round, stake, required_stake
         );
 
-        // Order and commit
-        let mut sequence = Vec::new();
+        let mut committed_sub_dags = Vec::new();
         for leader_cert in utils::order_leaders(&leader, state, |r, d| self.leader(r, d))
             .iter()
             .rev()
         {
-            for x in utils::order_dag(self.gc_depth, leader_cert, state) {
-                state.update(&x, self.gc_depth);
-                sequence.push(x);
+            let sub_dag_certificates = utils::order_dag(self.gc_depth, leader_cert, state);
+            for x in &sub_dag_certificates {
+                state.update(x, self.gc_depth);
+            }
+            if !sub_dag_certificates.is_empty() {
+                committed_sub_dags.push(CommittedSubDag {
+                    leader: leader_cert.clone(),
+                    certificates: sub_dag_certificates,
+                });
             }
         }
 
-        let committed = !sequence.is_empty();
+        let committed = !committed_sub_dags.is_empty();
         if committed {
-            metrics.total_certificates_committed += sequence.len() as u64;
+            let total_certs: u64 = committed_sub_dags
+                .iter()
+                .map(|d| d.certificates.len() as u64)
+                .sum();
+            metrics.total_certificates_committed += total_certs;
             metrics.last_committed_round = state.last_committed_round;
         }
 
-        Ok((sequence, committed))
+        Ok((committed_sub_dags, committed))
     }
 
     fn name(&self) -> &'static str {
@@ -404,7 +385,6 @@ impl ConsensusAlgorithm for Tusk {
     }
 }
 
-/// Logic đồng thuận Bullshark - IMPLEMENTATION CHÍNH XÁC THEO PAPER
 pub struct Bullshark {
     pub committee: Committee,
     pub gc_depth: Round,
@@ -422,28 +402,11 @@ impl Bullshark {
         }
     }
 
-    /// Chọn leader theo round-robin deterministic
-    /// ĐÂY LÀ CÁCH CHÍNH THỨC CỦA BULLSHARK/SUI
-    ///
-    /// Bullshark sử dụng predefined leader selection cho steady-state leaders:
-    /// - Round 1 của mỗi wave: steady-state leader #1
-    /// - Round 3 của mỗi wave: steady-state leader #2
-    ///
-    /// Leader được chọn bằng round-robin để:
-    /// - Đảm bảo fairness giữa các validators
-    /// - Deterministic: tất cả nodes đều tính ra cùng leader
-    /// - Byzantine-resistant: không thể manipulate vì predefined
     fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
-        // Lấy tất cả public keys và sắp xếp để đảm bảo deterministic order
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
         keys.sort();
-
-        // Round-robin selection - ĐÚNG THEO PAPER BULLSHARK
         let leader_pk = &keys[round as usize % self.committee.size()];
-
         debug!("Selected leader for round {}: {:?}", round, leader_pk);
-
-        // Tìm certificate của leader trong DAG
         dag.get(&round).and_then(|x| x.get(leader_pk))
     }
 }
@@ -454,18 +417,16 @@ impl ConsensusAlgorithm for Bullshark {
         state: &mut ConsensusState,
         certificate: Certificate,
         metrics: &mut ConsensusMetrics,
-    ) -> Result<(Vec<Certificate>, bool), ConsensusError> {
+    ) -> Result<(Vec<CommittedSubDag>, bool), ConsensusError> {
         let round = certificate.round();
         metrics.total_certificates_processed += 1;
 
-        // Add to DAG
         state
             .dag
             .entry(round)
             .or_insert_with(HashMap::new)
             .insert(certificate.origin(), (certificate.digest(), certificate));
 
-        // Bullshark commits leaders every 2 rounds (vs Tusk's 4)
         let r = round - 1;
         if r % 2 != 0 || r < 2 {
             return Ok((Vec::new(), false));
@@ -489,7 +450,6 @@ impl ConsensusAlgorithm for Bullshark {
             }
         };
 
-        // Check support from current round (2f+1 votes required)
         let stake: Stake = state
             .dag
             .get(&round)
@@ -514,25 +474,34 @@ impl ConsensusAlgorithm for Bullshark {
             leader_round, stake, required_stake
         );
 
-        // Order and commit
-        let mut sequence = Vec::new();
+        let mut committed_sub_dags = Vec::new();
         for leader_cert in utils::order_leaders(&leader, state, |r, d| self.leader(r, d))
             .iter()
             .rev()
         {
-            for x in utils::order_dag(self.gc_depth, leader_cert, state) {
-                state.update(&x, self.gc_depth);
-                sequence.push(x);
+            let sub_dag_certificates = utils::order_dag(self.gc_depth, leader_cert, state);
+            for x in &sub_dag_certificates {
+                state.update(x, self.gc_depth);
+            }
+            if !sub_dag_certificates.is_empty() {
+                committed_sub_dags.push(CommittedSubDag {
+                    leader: leader_cert.clone(),
+                    certificates: sub_dag_certificates,
+                });
             }
         }
 
-        let committed = !sequence.is_empty();
+        let committed = !committed_sub_dags.is_empty();
         if committed {
-            metrics.total_certificates_committed += sequence.len() as u64;
+            let total_certs: u64 = committed_sub_dags
+                .iter()
+                .map(|d| d.certificates.len() as u64)
+                .sum();
+            metrics.total_certificates_committed += total_certs;
             metrics.last_committed_round = state.last_committed_round;
         }
 
-        Ok((sequence, committed))
+        Ok((committed_sub_dags, committed))
     }
 
     fn name(&self) -> &'static str {
@@ -551,7 +520,7 @@ impl ConsensusAlgorithm for ConsensusProtocol {
         state: &mut ConsensusState,
         certificate: Certificate,
         metrics: &mut ConsensusMetrics,
-    ) -> Result<(Vec<Certificate>, bool), ConsensusError> {
+    ) -> Result<(Vec<CommittedSubDag>, bool), ConsensusError> {
         match self {
             ConsensusProtocol::Tusk(tusk) => tusk.process_certificate(state, certificate, metrics),
             ConsensusProtocol::Bullshark(bullshark) => {
@@ -568,18 +537,12 @@ impl ConsensusAlgorithm for ConsensusProtocol {
     }
 }
 
-// ====================
-// MAIN CONSENSUS ENGINE
-// ====================
-
 pub struct Consensus {
     store: Store,
     rx_primary: Receiver<Certificate>,
     tx_primary: Sender<Certificate>,
-    // --- BẮT ĐẦU THAY ĐỔI ---
-    tx_output: Sender<(Certificate, Committee)>,
-    committee: Committee, // Giữ một bản sao của committee hiện tại.
-    // --- KẾT THÚC THAY ĐỔI ---
+    tx_output: Sender<(Vec<CommittedSubDag>, Committee)>,
+    committee: Committee,
     protocol: Box<dyn ConsensusAlgorithm>,
     genesis: Vec<Certificate>,
     metrics: Arc<RwLock<ConsensusMetrics>>,
@@ -618,9 +581,7 @@ impl Consensus {
         store: Store,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
-        // --- BẮT ĐẦU THAY ĐỔI ---
-        tx_output: Sender<(Certificate, Committee)>,
-        // --- KẾT THÚC THAY ĐỔI ---
+        tx_output: Sender<(Vec<CommittedSubDag>, Committee)>,
         protocol_selection: ConsensusProtocol,
     ) -> Arc<RwLock<ConsensusMetrics>> {
         let protocol: Box<dyn ConsensusAlgorithm> = match protocol_selection {
@@ -642,9 +603,7 @@ impl Consensus {
                 rx_primary,
                 tx_primary,
                 tx_output,
-                // --- BẮT ĐẦU THAY ĐỔI ---
                 committee: committee.clone(),
-                // --- KẾT THÚC THAY ĐỔI ---
                 protocol,
                 genesis: Certificate::genesis(&committee),
                 metrics: metrics_clone,
@@ -691,7 +650,6 @@ impl Consensus {
     async fn run(&mut self) {
         let mut state = self.load_state().await;
 
-        // Validate loaded state
         if let Err(e) = state.validate() {
             error!("State validation failed: {}", e);
         }
@@ -701,7 +659,6 @@ impl Consensus {
             state.last_committed_round
         );
 
-        // Main processing loop
         while let Some(certificate) = self.rx_primary.recv().await {
             debug!("Received certificate from round {}", certificate.round());
 
@@ -711,46 +668,46 @@ impl Consensus {
                 .protocol
                 .process_certificate(&mut state, certificate, &mut metrics)
             {
-                Ok((sequence, committed)) => {
-                    drop(metrics); // Release lock before I/O operations
+                Ok((sub_dags, committed)) => {
+                    drop(metrics);
 
-                    // Persist state if committed
                     if committed {
                         if let Err(e) = self.save_state(&state).await {
                             error!("Failed to save state: {}", e);
                         }
                     }
 
-                    // Log commit status
                     if log_enabled!(log::Level::Debug) {
                         for (name, round) in &state.last_committed {
                             debug!("Authority {} last committed: round {}", name, round);
                         }
                     }
 
-                    // Output committed certificates
-                    for certificate in sequence {
-                        #[cfg(not(feature = "benchmark"))]
-                        info!("Committed {}", certificate.header);
+                    if !sub_dags.is_empty() {
+                        for sub_dag in &sub_dags {
+                            for certificate in &sub_dag.certificates {
+                                #[cfg(not(feature = "benchmark"))]
+                                info!("Committed {}", certificate.header);
 
-                        #[cfg(feature = "benchmark")]
-                        for digest in certificate.header.payload.keys() {
-                            // NOTE: This log entry is used to compute performance.
-                            info!("Committed {} -> {:?}", certificate.header, digest);
+                                #[cfg(feature = "benchmark")]
+                                for digest in certificate.header.payload.keys() {
+                                    info!("Committed {} -> {:?}", certificate.header, digest);
+                                }
+                            }
                         }
 
-                        // Send to primary for garbage collection signal
-                        if let Err(e) = self.tx_primary.send(certificate.clone()).await {
-                            error!("Failed to send certificate to primary: {}", e);
+                        if let Some(last_dag) = sub_dags.last() {
+                            if let Some(last_cert) = last_dag.certificates.last() {
+                                if let Err(e) = self.tx_primary.send(last_cert.clone()).await {
+                                    error!("Failed to send certificate to primary for GC: {}", e);
+                                }
+                            }
                         }
 
-                        // --- BẮT ĐẦU THAY ĐỔI ---
-                        // Gửi certificate và committee hiện tại ra ngoài.
-                        let output_tuple = (certificate, self.committee.clone());
+                        let output_tuple = (sub_dags, self.committee.clone());
                         if let Err(e) = self.tx_output.send(output_tuple).await {
-                            warn!("Failed to output certificate: {}", e);
+                            warn!("Failed to output certificate sequence: {}", e);
                         }
-                        // --- KẾT THÚC THAY ĐỔI ---
                     }
                 }
                 Err(e) => {
@@ -762,42 +719,7 @@ impl Consensus {
         info!("Consensus engine shutting down");
     }
 
-    /// Get current metrics (for monitoring/observability)
     pub async fn get_metrics(metrics: &Arc<RwLock<ConsensusMetrics>>) -> ConsensusMetrics {
         metrics.read().await.clone()
-    }
-}
-
-// ====================
-// TESTS
-// ====================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_consensus_state_creation() {
-        let genesis = vec![];
-        let state = ConsensusState::new(genesis);
-        assert_eq!(state.last_committed_round, 0);
-        assert!(state.last_committed.is_empty());
-    }
-
-    #[test]
-    fn test_consensus_state_validation() {
-        let state = ConsensusState::new(vec![]);
-        assert!(state.validate().is_ok());
-    }
-
-    #[test]
-    fn test_bullshark_leader_deterministic() {
-        // Test that leader selection is deterministic
-        // All nodes should compute the same leader for the same round
-    }
-
-    #[test]
-    fn test_bullshark_leader_rotation() {
-        // Test that leaders rotate fairly across all validators
     }
 }

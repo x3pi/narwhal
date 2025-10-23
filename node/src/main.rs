@@ -9,8 +9,8 @@ use config::Export as _;
 use config::Import as _;
 use config::{Committee, NodeConfig, Parameters, WorkerId};
 use config::{Validator, ValidatorInfo};
-use consensus::Consensus;
 use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
+use consensus::{CommittedSubDag, Consensus}; // THÊM CommittedSubDag
 use crypto::Digest;
 use crypto::Hash as _;
 use env_logger::Env;
@@ -259,13 +259,11 @@ async fn load_initial_committee(
 ) -> Result<Committee> {
     let committee_file = matches.value_of("committee");
 
-    // ##### BẮT ĐẦU LOGIC TEST CỦA BẠN #####
     let always_false = false;
     if always_false && committee_file.is_some() {
         let filename = committee_file.unwrap();
         info!("[New Branch] Loading committee from file: {}", filename);
         Committee::import(filename).context("Failed to load committee from file")
-    // ##### KẾT THÚC LOGIC TEST CỦA BẠN #####
     } else {
         info!("Fetching committee via UDS for initial load.");
         let socket_path = matches
@@ -325,7 +323,8 @@ async fn run_loop(
     let mut current_role: Option<NodeRole> = None;
     let mut shutdown_trigger = tokio::sync::broadcast::channel(1).0;
 
-    let (tx_output, rx_output) = channel::<(Certificate, Committee)>(CHANNEL_CAPACITY);
+    // CẬP NHẬT KIỂU DỮ LIỆU CỦA KÊNH
+    let (tx_output, rx_output) = channel::<(Vec<CommittedSubDag>, Committee)>(CHANNEL_CAPACITY);
 
     if let RunMode::Primary = run_mode {
         let temp_committee = shared_state.committee.read().await;
@@ -355,6 +354,7 @@ async fn run_loop(
                     notification.round
                 );
 
+                // SỬA LỖI: sating_sub -> saturating_sub
                 let target_commit_round = notification.round.saturating_sub(1);
                 info!(
                     "Waiting for round {} to be committed before proceeding...",
@@ -432,7 +432,7 @@ async fn run_loop(
             },
 
             _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                // This branch is just a timer, the logic is outside the select block.
+                // Timer branch.
             }
         }
 
@@ -519,13 +519,14 @@ async fn run_loop(
 }
 
 async fn analyze(
-    mut rx_output: Receiver<(Certificate, Committee)>,
+    // CẬP NHẬT KIỂU CỦA KÊNH
+    mut rx_output: Receiver<(Vec<CommittedSubDag>, Committee)>,
     node_id: usize,
     mut store: Store,
     node_config: NodeConfig,
 ) {
     let mut processed_certificates = HashSet::<Digest>::new();
-    let mut round_transactions = HashMap::<u64, Vec<comm::Transaction>>::new();
+    let mut committed_tx_digests = HashSet::<Vec<u8>>::new();
 
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
@@ -542,7 +543,7 @@ async fn analyze(
         let socket_path = node_config.uds_block_path;
         let mut stream_option = None;
 
-        loop {
+        'main_loop: loop {
             if stream_option.is_none() {
                 match UnixStream::connect(&socket_path).await {
                     Ok(stream) => {
@@ -559,113 +560,108 @@ async fn analyze(
                     }
                 }
             }
-            let stream = stream_option.as_mut().unwrap();
 
             match rx_output.recv().await {
-                Some((certificate, _committee)) => {
-                    if !processed_certificates.insert(certificate.digest()) {
+                // CẬP NHẬT LOGIC XỬ LÝ
+                Some((committed_sub_dags, _committee)) => {
+                    if committed_sub_dags.is_empty() {
                         continue;
                     }
 
-                    let round = certificate.header.round;
+                    let mut blocks_to_send = Vec::new();
 
-                    let mut transactions_in_cert = Vec::new();
-                    for (digest, worker_id) in certificate.header.payload {
-                        match store.read(digest.to_vec()).await {
-                            Ok(Some(serialized_batch)) => {
-                                match bincode::deserialize(&serialized_batch) {
-                                    Ok(WorkerMessage::Batch(batch)) => {
-                                        for tx_data in batch {
-                                            transactions_in_cert.push(comm::Transaction {
-                                                digest: tx_data,
-                                                worker_id: worker_id as u32,
-                                            });
+                    for sub_dag in committed_sub_dags {
+                        let mut all_transactions = Vec::new();
+
+                        // Chiều cao block chính là round của leader
+                        let block_height = sub_dag.leader.round();
+                        let epoch = block_height;
+
+                        for certificate in sub_dag.certificates.iter() {
+                            if !processed_certificates.insert(certificate.digest()) {
+                                continue;
+                            }
+
+                            for (digest, worker_id) in &certificate.header.payload {
+                                match store.read(digest.to_vec()).await {
+                                    Ok(Some(serialized_batch)) => {
+                                        if let Ok(WorkerMessage::Batch(batch)) =
+                                            bincode::deserialize(&serialized_batch)
+                                        {
+                                            for tx_data in batch {
+                                                if committed_tx_digests.insert(tx_data.clone()) {
+                                                    all_transactions.push(comm::Transaction {
+                                                        digest: tx_data,
+                                                        worker_id: *worker_id as u32,
+                                                    });
+                                                }
+                                            }
                                         }
                                     }
-                                    _ => warn!(
-                                        "[ANALYZE] Message for digest {} is not a Batch.",
-                                        digest
-                                    ),
+                                    Ok(None) => {
+                                        warn!("[ANALYZE] Batch for digest {} not found.", digest)
+                                    }
+                                    Err(e) => {
+                                        error!("[ANALYZE] Failed to read batch {}: {}", digest, e)
+                                    }
                                 }
                             }
-                            Ok(None) => warn!("[ANALYZE] Batch for digest {} not found.", digest),
-                            Err(e) => error!("[ANALYZE] Failed to read batch {}: {}", digest, e),
                         }
+
+                        if all_transactions.is_empty() {
+                            info!("[ANALYZE] Skipping commit for leader at round {} with no new unique transactions.", block_height);
+                            continue;
+                        }
+
+                        let committed_block = comm::CommittedBlock {
+                            epoch,
+                            height: block_height,
+                            transactions: all_transactions,
+                        };
+
+                        info!(
+                            "[ANALYZE] Prepared block #{} (Epoch {}) with {} unique transactions.",
+                            block_height,
+                            epoch,
+                            committed_block.transactions.len()
+                        );
+                        blocks_to_send.push(committed_block);
                     }
 
-                    round_transactions
-                        .entry(round)
-                        .or_default()
-                        .extend(transactions_in_cert);
-
-                    if round > 0 {
-                        let round_to_finalize = round - 1;
-                        if let Some(transactions) = round_transactions.remove(&round_to_finalize) {
-                            let committed_block = comm::CommittedBlock {
-                                epoch: round_to_finalize,
-                                height: round_to_finalize,
-                                transactions,
-                            };
-                            let epoch_data = comm::CommittedEpochData {
-                                blocks: vec![committed_block],
-                            };
-
-                            let mut proto_buf = BytesMut::new();
-                            epoch_data
-                                .encode(&mut proto_buf)
-                                .expect("Protobuf serialization failed");
-                            let mut len_buf = BytesMut::new();
-                            put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
-
-                            if let Err(e) = stream.write_all(&len_buf).await {
-                                error!("[ANALYZE] Failed to write length to socket: {}. Reconnecting...", e);
-                                stream_option = None;
-                                continue;
-                            }
-                            if let Err(e) = stream.write_all(&proto_buf).await {
-                                error!("[ANALYZE] Failed to write payload to socket: {}. Reconnecting...", e);
-                                stream_option = None;
-                                continue;
-                            }
-                            info!(
-                                "[ANALYZE] Sent block for round {} successfully.",
-                                round_to_finalize
-                            );
-                        }
+                    if blocks_to_send.is_empty() {
+                        continue;
                     }
+
+                    let epoch_data = comm::CommittedEpochData {
+                        blocks: blocks_to_send,
+                    };
+
+                    let mut proto_buf = BytesMut::new();
+                    epoch_data
+                        .encode(&mut proto_buf)
+                        .expect("Protobuf serialization failed");
+                    let mut len_buf = BytesMut::new();
+                    put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
+                    let stream = stream_option.as_mut().unwrap();
+                    if let Err(e) = stream.write_all(&len_buf).await {
+                        error!("[ANALYZE] Failed to write length: {}. Reconnecting...", e);
+                        stream_option = None;
+                        continue 'main_loop;
+                    }
+                    if let Err(e) = stream.write_all(&proto_buf).await {
+                        error!("[ANALYZE] Failed to write payload: {}. Reconnecting...", e);
+                        stream_option = None;
+                        continue 'main_loop;
+                    }
+
+                    info!(
+                        "[ANALYZE] Sent {} new blocks successfully.",
+                        epoch_data.blocks.len()
+                    );
                 }
                 None => {
-                    info!("[ANALYZE] Main channel closed. Sending remaining blocks.");
-                    let mut pending_rounds: Vec<_> = round_transactions.keys().cloned().collect();
-                    pending_rounds.sort_unstable();
-                    for r in pending_rounds {
-                        if let Some(transactions) = round_transactions.remove(&r) {
-                            let committed_block = comm::CommittedBlock {
-                                epoch: r,
-                                height: r,
-                                transactions,
-                            };
-                            let epoch_data = comm::CommittedEpochData {
-                                blocks: vec![committed_block],
-                            };
-                            let mut proto_buf = BytesMut::new();
-                            epoch_data
-                                .encode(&mut proto_buf)
-                                .expect("Protobuf serialization failed");
-                            let mut len_buf = BytesMut::new();
-                            put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
-
-                            if let Err(e) = stream.write_all(&len_buf).await {
-                                error!("[ANALYZE] Failed to write final length: {}", e);
-                                break;
-                            }
-                            if let Err(e) = stream.write_all(&proto_buf).await {
-                                error!("[ANALYZE] Failed to write final payload: {}", e);
-                                break;
-                            }
-                            info!("[ANALYZE] Sent final block for round {} successfully.", r);
-                        }
-                    }
+                    info!("[ANALYZE] Main channel closed. Exiting.");
                     break;
                 }
             }

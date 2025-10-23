@@ -22,7 +22,7 @@ use network::{
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::AtomicU64; // SỬA LỖI: AtomicU4 -> AtomicU64
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -30,11 +30,11 @@ use tokio::sync::RwLock;
 
 pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 pub type PendingBatches = Arc<DashMap<Digest, (WorkerId, Round)>>;
+pub type CommittedBatches = Arc<DashMap<Digest, Round>>;
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
 
-// SỬA ĐỔI: Thêm cấu trúc tin nhắn để thông báo tái cấu hình.
 #[derive(Debug)]
 pub struct ReconfigureNotification {
     pub round: Round,
@@ -57,7 +57,6 @@ pub enum PrimaryMessage {
 }
 
 impl fmt::Debug for PrimaryMessage {
-    // SỬA LỖI: Sửa chữ ký hàm fmt
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Header(h) => f.debug_tuple("Header").field(h).finish(),
@@ -92,7 +91,6 @@ pub enum PrimaryWorkerMessage {
 }
 
 impl fmt::Debug for PrimaryWorkerMessage {
-    // SỬA LỖI: Sửa chữ ký hàm fmt
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Synchronize(d, p) => f.debug_tuple("Synchronize").field(d).field(p).finish(),
@@ -119,13 +117,13 @@ impl Primary {
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
-        // SỬA ĐỔI: Thêm kênh tx_reconfigure.
         tx_reconfigure: Sender<ReconfigureNotification>,
     ) {
         let committee = Arc::new(RwLock::new(initial_committee));
 
         let payload_cache: PayloadCache = Arc::new(DashMap::new());
         let pending_batches: PendingBatches = Arc::new(DashMap::new());
+        let committed_batches: CommittedBatches = Arc::new(DashMap::new());
 
         let (tx_workers, rx_workers) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
         let (tx_repropose, rx_repropose) = channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
@@ -141,7 +139,7 @@ impl Primary {
         parameters.log();
         let name = node_config.name;
         let consensus_secret = node_config.consensus_secret;
-        let consensus_round = Arc::new(AtomicU64::new(0)); // SỬA LỖI: AtomicU4 -> AtomicU64
+        let consensus_round = Arc::new(AtomicU64::new(0));
         let transport = QuicTransport::new();
 
         tokio::spawn(async move {
@@ -203,7 +201,6 @@ impl Primary {
                 rx_proposer,
                 tx_consensus,
                 tx_parents,
-                // SỬA ĐỔI: Truyền kênh tx_reconfigure vào Core.
                 tx_reconfigure,
             );
 
@@ -212,7 +209,9 @@ impl Primary {
                 &*committee_guard,
                 store.clone(),
                 consensus_round.clone(),
+                parameters.gc_depth,
                 pending_batches.clone(),
+                committed_batches.clone(),
                 rx_consensus,
                 tx_repropose,
             );
@@ -225,6 +224,7 @@ impl Primary {
                 parameters.header_size,
                 parameters.max_header_delay,
                 pending_batches.clone(),
+                committed_batches.clone(),
                 rx_parents,
                 rx_workers,
                 rx_repropose,
