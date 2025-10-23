@@ -16,12 +16,14 @@ use log::{debug, error, info, warn};
 use network::{CancelHandler, ReliableSender};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicU64, Ordering}; // SỬA LỖI: AtomicU4 -> AtomicU64
+// SỬA ĐỔI: Thêm các import cần thiết
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use store::{Store, ROUND_INDEX_CF};
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
+use tokio::time::sleep; // Thêm sleep
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
@@ -44,7 +46,7 @@ pub struct Core {
     store: Store,
     synchronizer: Synchronizer,
     signature_service: SignatureService,
-    consensus_round: Arc<AtomicU64>, // SỬA LỖI: AtomicU4 -> AtomicU64
+    consensus_round: Arc<AtomicU64>,
     gc_depth: Round,
     rx_primaries: Receiver<PrimaryMessage>,
     rx_header_waiter: Receiver<Header>,
@@ -65,6 +67,8 @@ pub struct Core {
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
     sync_state: Option<SyncState>,
     last_reconfigure_round: Round,
+    // SỬA ĐỔI: Thêm cờ reconfiguring
+    reconfiguring: Arc<AtomicBool>,
 }
 
 impl Core {
@@ -75,7 +79,7 @@ impl Core {
         store: Store,
         synchronizer: Synchronizer,
         signature_service: SignatureService,
-        consensus_round: Arc<AtomicU64>, // SỬA LỖI: AtomicU4 -> AtomicU64
+        consensus_round: Arc<AtomicU64>,
         gc_depth: Round,
         rx_primaries: Receiver<PrimaryMessage>,
         rx_header_waiter: Receiver<Header>,
@@ -85,6 +89,8 @@ impl Core {
         tx_proposer: Sender<(Vec<Digest>, Round)>,
         // SỬA ĐỔI: Nhận kênh tx_reconfigure.
         tx_reconfigure: Sender<ReconfigureNotification>,
+        // SỬA ĐỔI: Thêm tham số mới
+        reconfiguring: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -113,6 +119,7 @@ impl Core {
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 sync_state: None,
                 last_reconfigure_round: 0,
+                reconfiguring, // Khởi tạo trường mới
             }
             .run()
             .await;
@@ -378,6 +385,7 @@ impl Core {
                     "Round {}, signaling committee reconfiguration to main node loop.",
                     next_round
                 );
+                self.last_reconfigure_round = next_round;
                 let notification = ReconfigureNotification {
                     round: next_round,
                     committee: self.committee.read().await.clone(), // Gửi committee hiện tại
@@ -554,6 +562,14 @@ impl Core {
         sync_retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            // SỬA ĐỔI: Thêm logic kiểm tra cờ reconfiguring
+            if self.reconfiguring.load(Ordering::Relaxed) {
+                // Khi đang tái cấu hình, chỉ sleep để tránh busy-looping.
+                // Không xử lý bất kỳ message nào.
+                sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+
             let result = tokio::select! {
                 Some(message) = self.rx_primaries.recv() => self.handle_message(message).await,
                 Some(header) = self.rx_header_waiter.recv(), if self.sync_state.is_none() => self.process_header(&header, false).await,
@@ -565,6 +581,7 @@ impl Core {
                     Ok(())
                 },
             };
+
             match result {
                 Ok(()) => (),
                 Err(DagError::StoreError(e)) => {

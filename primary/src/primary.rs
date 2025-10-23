@@ -22,7 +22,8 @@ use network::{
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
-use std::sync::atomic::AtomicU64;
+// SỬA ĐỔI: Thêm các import cần thiết
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
@@ -121,6 +122,8 @@ impl Primary {
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
         tx_reconfigure: Sender<ReconfigureNotification>,
+        // SỬA ĐỔI: Thêm cờ reconfiguring
+        reconfiguring: Arc<AtomicBool>,
     ) {
         // Bỏ dòng `let committee = Arc::new(RwLock::new(initial_committee));`
 
@@ -179,6 +182,9 @@ impl Primary {
                 name, listen_address
             );
 
+            // Giải phóng lock sớm
+            drop(committee_guard);
+
             let synchronizer = Synchronizer::new(
                 name,
                 committee.clone(), // Truyền Arc
@@ -190,6 +196,7 @@ impl Primary {
 
             let signature_service = SignatureService::new(consensus_secret);
 
+            // SỬA ĐỔI: Truyền cờ `reconfiguring` vào Core
             Core::spawn(
                 name,
                 committee.clone(),
@@ -205,6 +212,7 @@ impl Primary {
                 tx_consensus,
                 tx_parents,
                 tx_reconfigure,
+                reconfiguring, // Truyền vào đây
             );
 
             GarbageCollector::spawn(

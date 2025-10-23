@@ -139,21 +139,48 @@ mod utils {
         let mut to_commit = vec![leader.clone()];
         let mut current_leader = leader;
 
-        for r in (state.last_committed_round + 2..current_leader.round())
+        if leader.round() % 2 != 0 {
+            warn!(
+                "[BUG_TRACE] order_leaders initiated with an ODD-numbered leader: round {}",
+                leader.round()
+            );
+        } else {
+            debug!(
+                "[BUG_TRACE] order_leaders initiated with leader at round {}",
+                leader.round()
+            );
+        }
+
+        // --- START FIX ---
+        // The previous loop `(..).rev().step_by(2)` was buggy and iterated on odd numbers.
+        // This new loop correctly iterates backwards over even-numbered rounds only.
+        for r in (state.last_committed_round + 1..current_leader.round())
             .rev()
-            .step_by(2)
+            .filter(|r| r % 2 == 0)
+        // --- END FIX ---
         {
             if let Some((_, prev_leader)) = get_leader(r, &state.dag) {
                 if linked(current_leader, prev_leader, &state.dag) {
-                    debug!("Found linked leader at round {}", r);
+                    if prev_leader.round() % 2 != 0 {
+                        warn!(
+                            "[BUG_TRACE] Found ODD-numbered previous leader at round {} linked to current leader at round {}",
+                            prev_leader.round(),
+                            current_leader.round()
+                        );
+                    } else {
+                        debug!(
+                            "[BUG_TRACE] Found linked leader at round {}",
+                            prev_leader.round()
+                        );
+                    }
                     to_commit.push(prev_leader.clone());
                     current_leader = prev_leader;
                 } else {
-                    debug!("Leader at round {} is not linked, stopping", r);
+                    debug!("[BUG_TRACE] Leader at round {} is not linked, stopping", r);
                     break;
                 }
             } else {
-                debug!("No leader found at round {}, stopping", r);
+                debug!("[BUG_TRACE] No leader found at round {}, stopping", r);
                 break;
             }
         }
@@ -438,6 +465,11 @@ impl ConsensusAlgorithm for Bullshark {
         let round = certificate.round();
         metrics.total_certificates_processed += 1;
 
+        debug!(
+            "[BUG_TRACE] Bullshark processing certificate from round {}",
+            round
+        );
+
         state
             .dag
             .entry(round)
@@ -445,24 +477,39 @@ impl ConsensusAlgorithm for Bullshark {
             .insert(certificate.origin(), (certificate.digest(), certificate));
 
         let r = round - 1;
+
+        debug!("[BUG_TRACE] Calculated potential leader round r = {}", r);
         if r % 2 != 0 || r < 2 {
+            debug!(
+                "[BUG_TRACE] Skipping commit check: r is odd or too small. r%2={}, r<2={}",
+                r % 2,
+                r < 2
+            );
             return Ok((Vec::new(), false));
         }
 
         let leader_round = r;
         if leader_round <= state.last_committed_round {
+            debug!(
+                "[BUG_TRACE] Skipping commit check: leader_round {} <= last_committed_round {}",
+                leader_round, state.last_committed_round
+            );
             return Ok((Vec::new(), false));
         }
 
-        debug!("Checking for leader at round {}", leader_round);
+        debug!("[BUG_TRACE] Checking for leader at round {}", leader_round);
         let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
             Some(x) => {
-                debug!("Found leader {:?} at round {}", x.1.digest(), leader_round);
+                debug!(
+                    "[BUG_TRACE] Found leader {:?} at round {}",
+                    x.1.digest(),
+                    leader_round
+                );
                 x.clone()
             }
             None => {
                 metrics.failed_leader_elections += 1;
-                debug!("No leader found at round {}", leader_round);
+                debug!("[BUG_TRACE] No leader found at round {}", leader_round);
                 return Ok((Vec::new(), false));
             }
         };
@@ -480,23 +527,29 @@ impl ConsensusAlgorithm for Bullshark {
 
         if stake < required_stake {
             debug!(
-                "Leader at round {} has insufficient stake ({}/{})",
+                "[BUG_TRACE] Leader at round {} has insufficient stake ({}/{})",
                 leader_round, stake, required_stake
             );
             return Ok((Vec::new(), false));
         }
 
-        info!(
-            "Committing leader at round {} with stake {}/{}",
+        warn!(
+            "[BUG_TRACE] Leader at round {} has ENOUGH stake ({}/{}) to be committed.",
             leader_round, stake, required_stake
         );
 
         let mut committed_sub_dags = Vec::new();
-        for leader_cert in utils::order_leaders(&leader, state, |r, d| self.leader(r, d))
-            .iter()
-            .rev()
-        {
-            let sub_dag_certificates = utils::order_dag(self.gc_depth, leader_cert, state);
+        let ordered_leaders = utils::order_leaders(&leader, state, |r, d| self.leader(r, d));
+
+        // SỬA ĐỔI: Chỉ commit leader cũ nhất trong chuỗi để tránh "nhảy vòng".
+        if let Some(oldest_leader_to_commit) = ordered_leaders.last() {
+            let leader_cert = oldest_leader_to_commit.clone();
+
+            if leader_cert.round() % 2 != 0 {
+                warn!("[BUG_TRACE] CRITICAL: An ODD-numbered leader (round {}) is about to be committed!", leader_cert.round());
+            }
+
+            let sub_dag_certificates = utils::order_dag(self.gc_depth, &leader_cert, state);
             for x in &sub_dag_certificates {
                 state.update(x, self.gc_depth);
             }
@@ -621,7 +674,6 @@ impl Consensus {
         );
 
         tokio::spawn(async move {
-            // SỬA ĐỔI: Dereference a RwLockReadGuard to get a &Committee.
             let genesis = Certificate::genesis(&*committee.read().await);
 
             Self {
@@ -714,6 +766,11 @@ impl Consensus {
 
                             if !sub_dags.is_empty() {
                                 for sub_dag in &sub_dags {
+
+                                    if sub_dag.leader.round() % 2 != 0 {
+                                        warn!("[BUG_TRACE] About to send a committed sub-dag with an ODD-numbered leader (height {}) to the analyze function.", sub_dag.leader.round());
+                                    }
+
                                     for certificate in &sub_dag.certificates {
                                         #[cfg(not(feature = "benchmark"))]
                                         info!("Committed {}", certificate.header);
