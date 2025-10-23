@@ -204,18 +204,23 @@ mod utils {
         while let Some(x) = buffer.pop() {
             ordered.push(x.clone());
 
-            for parent in &x.header.parents {
+            if x.round() == 0 {
+                continue;
+            }
+
+            let parent_round = x.round() - 1;
+
+            for parent_digest in &x.header.parents {
                 let (digest, certificate) = match state
                     .dag
-                    // SỬA LỖI: sating_sub -> saturating_sub
-                    .get(&(x.round().saturating_sub(1)))
-                    .and_then(|certs| certs.values().find(|(d, _)| d == parent))
+                    .get(&parent_round)
+                    .and_then(|certs| certs.values().find(|(d, _)| d == parent_digest))
                 {
                     Some(x) => x,
                     None => {
                         debug!(
                             "Parent {} not found in DAG (already GC'd or not yet received)",
-                            parent
+                            parent_digest
                         );
                         continue;
                     }
