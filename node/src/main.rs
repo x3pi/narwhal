@@ -10,7 +10,7 @@ use config::Import as _;
 use config::{Committee, NodeConfig, Parameters, WorkerId};
 use config::{Validator, ValidatorInfo};
 use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
-use consensus::{CommittedSubDag, Consensus}; // THÊM CommittedSubDag
+use consensus::{CommittedSubDag, Consensus};
 use crypto::Digest;
 use crypto::Hash as _;
 use env_logger::Env;
@@ -61,6 +61,7 @@ struct SharedNodeState {
     parameters: Parameters,
 }
 
+// ... (các hàm fetch_validators_via_uds, load_consensus_state, main, run, load_initial_committee, fetch_committee_from_uds không đổi) ...
 async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Result<ValidatorInfo> {
     log::info!(
         "Attempting to fetch validator list for block {} from UDS: {}",
@@ -155,6 +156,7 @@ async fn load_consensus_state(store: &mut Store) -> ConsensusState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // ... (hàm main không đổi) ...
     let matches = App::new(crate_name!())
         .version(crate_version!())
         .about("A research implementation of Narwhal and Tusk.")
@@ -206,6 +208,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
+    // ... (hàm run không đổi) ...
     let key_file = matches.value_of("keys").unwrap();
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();
@@ -257,6 +260,7 @@ async fn load_initial_committee(
     store: &mut Store,
     node_config: &NodeConfig,
 ) -> Result<Committee> {
+    // ... (hàm load_initial_committee không đổi) ...
     let committee_file = matches.value_of("committee");
 
     let always_false = false;
@@ -323,7 +327,6 @@ async fn run_loop(
     let mut current_role: Option<NodeRole> = None;
     let mut shutdown_trigger = tokio::sync::broadcast::channel(1).0;
 
-    // CẬP NHẬT KIỂU DỮ LIỆU CỦA KÊNH
     let (tx_output, rx_output) = channel::<(Vec<CommittedSubDag>, Committee)>(CHANNEL_CAPACITY);
 
     if let RunMode::Primary = run_mode {
@@ -346,6 +349,73 @@ async fn run_loop(
         ));
     }
 
+    let committee = shared_state.committee.read().await;
+    let my_pubkey = &shared_state.node_config.name;
+    let is_in_committee = committee.authorities.contains_key(my_pubkey);
+    let initial_role = if is_in_committee {
+        NodeRole::Validator
+    } else {
+        NodeRole::Follower
+    };
+    current_role = Some(initial_role);
+
+    match initial_role {
+        NodeRole::Validator => {
+            info!("Starting Validator tasks...");
+            match run_mode {
+                RunMode::Primary => {
+                    let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
+                    let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+
+                    Primary::spawn(
+                        shared_state.node_config.clone(),
+                        shared_state.committee.clone(),
+                        shared_state.parameters.clone(),
+                        shared_state.store.clone(),
+                        tx_new_certificates,
+                        rx_feedback,
+                        tx_reconfigure.clone(),
+                    );
+
+                    // SỬA ĐỔI: Lấy committee hiện tại để khởi tạo Bullshark
+                    let initial_committee_for_bullshark = committee.clone();
+                    Consensus::spawn(
+                        shared_state.committee.clone(),
+                        shared_state.parameters.gc_depth,
+                        shared_state.store.clone(),
+                        rx_new_certificates,
+                        tx_feedback,
+                        tx_output.clone(),
+                        ConsensusProtocol::Bullshark(Bullshark::new(
+                            initial_committee_for_bullshark, // Dùng bản sao
+                            shared_state.parameters.gc_depth,
+                        )),
+                    );
+                }
+                RunMode::Worker(id) => {
+                    Worker::spawn(
+                        shared_state.node_config.name,
+                        id,
+                        committee.clone(),
+                        shared_state.parameters.clone(),
+                        shared_state.store.clone(),
+                    )
+                    .await;
+                }
+            }
+        }
+        NodeRole::Follower => {
+            info!("Starting Follower (StateSyncer) tasks...");
+            StateSyncer::spawn(
+                shared_state.node_config.name,
+                shared_state.committee.clone(),
+                shared_state.store.clone(),
+                shutdown_trigger.subscribe(),
+            );
+        }
+    }
+    drop(committee);
+
     loop {
         tokio::select! {
             Some(notification) = rx_reconfigure.recv(), if run_mode == RunMode::Primary => {
@@ -354,7 +424,6 @@ async fn run_loop(
                     notification.round
                 );
 
-                // SỬA LỖI: sating_sub -> saturating_sub
                 let target_commit_round = notification.round.saturating_sub(1);
                 info!(
                     "Waiting for round {} to be committed before proceeding...",
@@ -373,9 +442,7 @@ async fn run_loop(
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
 
-                info!("Shutting down current Primary & Consensus tasks for reconfiguration...");
-                let _ = shutdown_trigger.send(());
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                info!("Hot-reloading committee...");
 
                 let new_committee = if let Some(socket_path) = matches.value_of("uds-socket") {
                     info!("Fetching new committee for round {} from UDS.", notification.round);
@@ -390,15 +457,6 @@ async fn run_loop(
                             continue;
                         }
                     }
-                } else if let Some(committee_file) = matches.value_of("committee") {
-                    info!("Reloading committee from file: {}", committee_file);
-                    match Committee::import(committee_file) {
-                        Ok(c) => c,
-                        Err(e) => {
-                            error!("Failed to reload committee from file: {}", e);
-                            continue;
-                        }
-                    }
                 } else {
                     error!("No committee source specified for reconfiguration.");
                     continue;
@@ -410,116 +468,31 @@ async fn run_loop(
                 }
                 info!("Shared committee state updated successfully.");
 
-                if let RunMode::Primary = run_mode {
-                    let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure(new_committee);
-                    let bytes = bincode::serialize(&worker_reconfigure_message)
-                        .expect("Failed to serialize worker reconfigure message");
+                let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure(new_committee);
+                let bytes = bincode::serialize(&worker_reconfigure_message)
+                    .expect("Failed to serialize worker reconfigure message");
 
-                    let committee_guard = shared_state.committee.read().await;
-                    match committee_guard.our_workers(&shared_state.node_config.name) {
-                        Ok(worker_addresses) => {
-                            let addresses: Vec<_> = worker_addresses.iter().map(|x| x.primary_to_worker).collect();
-                            if !addresses.is_empty() {
-                                info!("Broadcasting Reconfigure message to own workers at {:?}", addresses);
-                                SimpleSender::new().broadcast(addresses, bytes.into()).await;
-                            }
+                let committee_guard = shared_state.committee.read().await;
+                match committee_guard.our_workers(&shared_state.node_config.name) {
+                    Ok(worker_addresses) => {
+                        let addresses: Vec<_> = worker_addresses.iter().map(|x| x.primary_to_worker).collect();
+                        if !addresses.is_empty() {
+                            info!("Broadcasting Reconfigure message to own workers at {:?}", addresses);
+                            SimpleSender::new().broadcast(addresses, bytes.into()).await;
                         }
-                        Err(e) => warn!("Could not get our worker addresses for reconfiguring: {}", e),
                     }
+                    Err(e) => warn!("Could not get our worker addresses for reconfiguring: {}", e),
                 }
-
-                current_role = None;
             },
-
-            _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                // Timer branch.
+            else => {
+                tokio::time::sleep(Duration::from_secs(1)).await;
             }
-        }
-
-        let committee = shared_state.committee.read().await;
-        let my_pubkey = &shared_state.node_config.name;
-        let is_in_committee = committee.authorities.contains_key(my_pubkey);
-        let new_role = if is_in_committee {
-            NodeRole::Validator
-        } else {
-            NodeRole::Follower
-        };
-
-        if current_role != Some(new_role) {
-            info!(
-                "Node role changing from {:?} to {:?}",
-                current_role, new_role
-            );
-
-            if current_role.is_some() {
-                info!("Shutting down current tasks due to role change...");
-                let _ = shutdown_trigger.send(());
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-
-            shutdown_trigger = tokio::sync::broadcast::channel(1).0;
-
-            match new_role {
-                NodeRole::Validator => {
-                    info!("Starting Validator tasks...");
-                    match run_mode {
-                        RunMode::Primary => {
-                            let (tx_new_certificates, rx_new_certificates) =
-                                channel(CHANNEL_CAPACITY);
-                            let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-
-                            Primary::spawn(
-                                shared_state.node_config.clone(),
-                                committee.clone(),
-                                shared_state.parameters.clone(),
-                                shared_state.store.clone(),
-                                tx_new_certificates,
-                                rx_feedback,
-                                tx_reconfigure.clone(),
-                            );
-
-                            Consensus::spawn(
-                                committee.clone(),
-                                shared_state.parameters.gc_depth,
-                                shared_state.store.clone(),
-                                rx_new_certificates,
-                                tx_feedback,
-                                tx_output.clone(),
-                                ConsensusProtocol::Bullshark(Bullshark::new(
-                                    committee.clone(),
-                                    shared_state.parameters.gc_depth,
-                                )),
-                            );
-                        }
-                        RunMode::Worker(id) => {
-                            Worker::spawn(
-                                shared_state.node_config.name,
-                                id,
-                                committee.clone(),
-                                shared_state.parameters.clone(),
-                                shared_state.store.clone(),
-                            )
-                            .await;
-                        }
-                    }
-                }
-                NodeRole::Follower => {
-                    info!("Starting Follower (StateSyncer) tasks...");
-                    StateSyncer::spawn(
-                        shared_state.node_config.name,
-                        shared_state.committee.clone(),
-                        shared_state.store.clone(),
-                        shutdown_trigger.subscribe(),
-                    );
-                }
-            }
-            current_role = Some(new_role);
         }
     }
 }
 
 async fn analyze(
-    // CẬP NHẬT KIỂU CỦA KÊNH
+    // ... (hàm analyze không đổi) ...
     mut rx_output: Receiver<(Vec<CommittedSubDag>, Committee)>,
     node_id: usize,
     mut store: Store,
@@ -562,7 +535,6 @@ async fn analyze(
             }
 
             match rx_output.recv().await {
-                // CẬP NHẬT LOGIC XỬ LÝ
                 Some((committed_sub_dags, _committee)) => {
                     if committed_sub_dags.is_empty() {
                         continue;
@@ -573,7 +545,6 @@ async fn analyze(
                     for sub_dag in committed_sub_dags {
                         let mut all_transactions = Vec::new();
 
-                        // Chiều cao block chính là round của leader
                         let block_height = sub_dag.leader.round();
                         let epoch = block_height;
 

@@ -28,6 +28,8 @@ use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::RwLock;
 
+// SỬA ĐỔI: Không cần JoinHandle nữa
+
 pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 pub type PendingBatches = Arc<DashMap<Digest, (WorkerId, Round)>>;
 pub type CommittedBatches = Arc<DashMap<Digest, Round>>;
@@ -112,14 +114,15 @@ impl Primary {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         node_config: NodeConfig,
-        initial_committee: Committee,
+        // SỬA ĐỔI: Nhận Arc<RwLock<Committee>>
+        committee: Arc<RwLock<Committee>>,
         parameters: Parameters,
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
         tx_reconfigure: Sender<ReconfigureNotification>,
     ) {
-        let committee = Arc::new(RwLock::new(initial_committee));
+        // Bỏ dòng `let committee = Arc::new(RwLock::new(initial_committee));`
 
         let payload_cache: PayloadCache = Arc::new(DashMap::new());
         let pending_batches: PendingBatches = Arc::new(DashMap::new());
@@ -178,7 +181,7 @@ impl Primary {
 
             let synchronizer = Synchronizer::new(
                 name,
-                &*committee_guard,
+                committee.clone(), // Truyền Arc
                 store.clone(),
                 payload_cache.clone(),
                 tx_sync_headers,
@@ -205,8 +208,8 @@ impl Primary {
             );
 
             GarbageCollector::spawn(
-                &name,
-                &*committee_guard,
+                name,
+                committee.clone(), // Truyền Arc
                 store.clone(),
                 consensus_round.clone(),
                 parameters.gc_depth,
@@ -218,7 +221,7 @@ impl Primary {
 
             Proposer::spawn(
                 name,
-                &*committee_guard,
+                committee.clone(), // Truyền Arc
                 signature_service,
                 store.clone(),
                 parameters.header_size,
@@ -233,7 +236,7 @@ impl Primary {
 
             HeaderWaiter::spawn(
                 name,
-                committee_guard.clone(),
+                committee.clone(), // Truyền Arc
                 store.clone(),
                 consensus_round,
                 parameters.gc_depth,
@@ -249,7 +252,7 @@ impl Primary {
                 tx_certificates_loopback,
             );
 
-            Helper::spawn(committee_guard.clone(), store, rx_helper_requests);
+            Helper::spawn(committee.clone(), store, rx_helper_requests); // Truyền Arc
 
             info!(
                 "Primary {} successfully booted on {}",
@@ -260,6 +263,7 @@ impl Primary {
     }
 }
 
+// ... (PrimaryReceiverHandler, WorkerReceiverHandler không đổi) ...
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,

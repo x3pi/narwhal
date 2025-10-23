@@ -3,14 +3,16 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
 use crate::primary::{CommittedBatches, PendingBatches, Round};
-use config::{Committee, WorkerId};
+use config::{Committee, WorkerId}; // SỬA ĐỔI: WorkerId được import từ config
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::{debug, warn};
+use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration, Instant};
 
 #[cfg(test)]
@@ -19,6 +21,7 @@ pub mod proposer_tests;
 
 pub struct Proposer {
     name: PublicKey,
+    committee: Arc<RwLock<Committee>>,
     signature_service: SignatureService,
     store: Store,
     header_size: usize,
@@ -42,7 +45,7 @@ impl Proposer {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
-        committee: &Committee,
+        committee: Arc<RwLock<Committee>>,
         signature_service: SignatureService,
         store: Store,
         header_size: usize,
@@ -54,14 +57,18 @@ impl Proposer {
         rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
         tx_core: Sender<Header>,
     ) {
-        let genesis = Certificate::genesis(committee)
-            .iter()
-            .map(|x| x.digest())
-            .collect();
+        // Lấy committee một lần để tạo genesis
+        let genesis = tokio::task::block_in_place(|| {
+            Certificate::genesis(&committee.blocking_read())
+                .iter()
+                .map(|x| x.digest())
+                .collect()
+        });
 
         tokio::spawn(async move {
             Self {
                 name,
+                committee,
                 signature_service,
                 store,
                 header_size,
@@ -86,7 +93,7 @@ impl Proposer {
         let digests_for_header: Vec<(Digest, WorkerId)> = self.digests.drain(..).collect();
 
         if digests_for_header.is_empty() && self.last_parents.is_empty() {
-            return; // Không tạo header rỗng nếu không có cha mẹ (trường hợp genesis)
+            return;
         }
 
         let header = Header::new(

@@ -17,6 +17,7 @@ use store::Store;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
+use tokio::task::JoinHandle;
 
 pub const STATE_KEY: &'static [u8] = b"consensus_state";
 
@@ -55,7 +56,6 @@ pub struct ConsensusState {
     pub dag: Dag,
 }
 
-// STRUCT MỚI: Đại diện cho một sub-dag đã được commit, bắt đầu từ một leader.
 #[derive(Clone, Debug)]
 pub struct CommittedSubDag {
     pub leader: Certificate,
@@ -254,6 +254,8 @@ mod utils {
 }
 
 pub trait ConsensusAlgorithm: Send + Sync {
+    fn update_committee(&mut self, new_committee: Committee);
+
     fn process_certificate(
         &self,
         state: &mut ConsensusState,
@@ -293,6 +295,11 @@ impl Tusk {
 }
 
 impl ConsensusAlgorithm for Tusk {
+    fn update_committee(&mut self, new_committee: Committee) {
+        self.committee = new_committee;
+        info!("[Tusk] Committee updated");
+    }
+
     fn process_certificate(
         &self,
         state: &mut ConsensusState,
@@ -417,6 +424,11 @@ impl Bullshark {
 }
 
 impl ConsensusAlgorithm for Bullshark {
+    fn update_committee(&mut self, new_committee: Committee) {
+        self.committee = new_committee;
+        info!("[Bullshark] Committee updated");
+    }
+
     fn process_certificate(
         &self,
         state: &mut ConsensusState,
@@ -520,6 +532,13 @@ pub enum ConsensusProtocol {
 }
 
 impl ConsensusAlgorithm for ConsensusProtocol {
+    fn update_committee(&mut self, new_committee: Committee) {
+        match self {
+            ConsensusProtocol::Tusk(t) => t.update_committee(new_committee),
+            ConsensusProtocol::Bullshark(b) => b.update_committee(new_committee),
+        }
+    }
+
     fn process_certificate(
         &self,
         state: &mut ConsensusState,
@@ -547,7 +566,7 @@ pub struct Consensus {
     rx_primary: Receiver<Certificate>,
     tx_primary: Sender<Certificate>,
     tx_output: Sender<(Vec<CommittedSubDag>, Committee)>,
-    committee: Committee,
+    committee: Arc<RwLock<Committee>>,
     protocol: Box<dyn ConsensusAlgorithm>,
     genesis: Vec<Certificate>,
     metrics: Arc<RwLock<ConsensusMetrics>>,
@@ -581,21 +600,20 @@ impl Consensus {
     }
 
     pub fn spawn(
-        committee: Committee,
+        committee: Arc<RwLock<Committee>>,
         _gc_depth: Round,
         store: Store,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
         tx_output: Sender<(Vec<CommittedSubDag>, Committee)>,
         protocol_selection: ConsensusProtocol,
-    ) -> Arc<RwLock<ConsensusMetrics>> {
+    ) {
         let protocol: Box<dyn ConsensusAlgorithm> = match protocol_selection {
             ConsensusProtocol::Tusk(tusk) => Box::new(tusk),
             ConsensusProtocol::Bullshark(bullshark) => Box::new(bullshark),
         };
 
         let metrics = Arc::new(RwLock::new(ConsensusMetrics::default()));
-        let metrics_clone = metrics.clone();
 
         info!(
             "Starting consensus engine with {} protocol",
@@ -603,21 +621,22 @@ impl Consensus {
         );
 
         tokio::spawn(async move {
+            // SỬA ĐỔI: Dereference a RwLockReadGuard to get a &Committee.
+            let genesis = Certificate::genesis(&*committee.read().await);
+
             Self {
                 store,
                 rx_primary,
                 tx_primary,
                 tx_output,
-                committee: committee.clone(),
+                committee,
                 protocol,
-                genesis: Certificate::genesis(&committee),
-                metrics: metrics_clone,
+                genesis,
+                metrics,
             }
             .run()
             .await;
         });
-
-        metrics
     }
 
     async fn load_state(&mut self) -> ConsensusState {
@@ -664,59 +683,69 @@ impl Consensus {
             state.last_committed_round
         );
 
-        while let Some(certificate) = self.rx_primary.recv().await {
-            debug!("Received certificate from round {}", certificate.round());
+        loop {
+            let committee = self.committee.read().await.clone();
+            self.protocol.update_committee(committee.clone());
 
-            let mut metrics = self.metrics.write().await;
+            tokio::select! {
+                Some(certificate) = self.rx_primary.recv() => {
+                    debug!("Received certificate from round {}", certificate.round());
 
-            match self
-                .protocol
-                .process_certificate(&mut state, certificate, &mut metrics)
-            {
-                Ok((sub_dags, committed)) => {
-                    drop(metrics);
+                    let mut metrics_guard = self.metrics.write().await;
 
-                    if committed {
-                        if let Err(e) = self.save_state(&state).await {
-                            error!("Failed to save state: {}", e);
-                        }
-                    }
+                    match self
+                        .protocol
+                        .process_certificate(&mut state, certificate, &mut metrics_guard)
+                    {
+                        Ok((sub_dags, committed)) => {
+                            drop(metrics_guard);
 
-                    if log_enabled!(log::Level::Debug) {
-                        for (name, round) in &state.last_committed {
-                            debug!("Authority {} last committed: round {}", name, round);
-                        }
-                    }
+                            if committed {
+                                if let Err(e) = self.save_state(&state).await {
+                                    error!("Failed to save state: {}", e);
+                                }
+                            }
 
-                    if !sub_dags.is_empty() {
-                        for sub_dag in &sub_dags {
-                            for certificate in &sub_dag.certificates {
-                                #[cfg(not(feature = "benchmark"))]
-                                info!("Committed {}", certificate.header);
+                            if log_enabled!(log::Level::Debug) {
+                                for (name, round) in &state.last_committed {
+                                    debug!("Authority {} last committed: round {}", name, round);
+                                }
+                            }
 
-                                #[cfg(feature = "benchmark")]
-                                for digest in certificate.header.payload.keys() {
-                                    info!("Committed {} -> {:?}", certificate.header, digest);
+                            if !sub_dags.is_empty() {
+                                for sub_dag in &sub_dags {
+                                    for certificate in &sub_dag.certificates {
+                                        #[cfg(not(feature = "benchmark"))]
+                                        info!("Committed {}", certificate.header);
+
+                                        #[cfg(feature = "benchmark")]
+                                        for digest in certificate.header.payload.keys() {
+                                            info!("Committed {} -> {:?}", certificate.header, digest);
+                                        }
+                                    }
+                                }
+
+                                if let Some(last_dag) = sub_dags.last() {
+                                    if let Some(last_cert) = last_dag.certificates.last() {
+                                        if let Err(e) = self.tx_primary.send(last_cert.clone()).await {
+                                            error!("Failed to send certificate to primary for GC: {}", e);
+                                        }
+                                    }
+                                }
+
+                                let output_tuple = (sub_dags, committee.clone());
+                                if let Err(e) = self.tx_output.send(output_tuple).await {
+                                    warn!("Failed to output certificate sequence: {}", e);
                                 }
                             }
                         }
-
-                        if let Some(last_dag) = sub_dags.last() {
-                            if let Some(last_cert) = last_dag.certificates.last() {
-                                if let Err(e) = self.tx_primary.send(last_cert.clone()).await {
-                                    error!("Failed to send certificate to primary for GC: {}", e);
-                                }
-                            }
-                        }
-
-                        let output_tuple = (sub_dags, self.committee.clone());
-                        if let Err(e) = self.tx_output.send(output_tuple).await {
-                            warn!("Failed to output certificate sequence: {}", e);
+                        Err(e) => {
+                            error!("Error processing certificate: {}", e);
                         }
                     }
-                }
-                Err(e) => {
-                    error!("Error processing certificate: {}", e);
+                },
+                else => {
+                    break;
                 }
             }
         }

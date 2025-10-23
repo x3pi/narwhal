@@ -8,20 +8,26 @@ use config::Committee;
 use crypto::Digest;
 use log::{debug, error, warn};
 use network::SimpleSender;
+use std::sync::Arc;
 use store::{Store, ROUND_INDEX_CF};
 use tokio::sync::mpsc::Receiver;
+use tokio::sync::RwLock;
 
 const MAX_BUNDLE_SIZE: usize = 60_000;
 
 pub struct Helper {
-    committee: Committee,
+    committee: Arc<RwLock<Committee>>, // SỬA ĐỔI
     store: Store,
     rx_helper: Receiver<PrimaryMessage>,
     network: SimpleSender,
 }
 
 impl Helper {
-    pub fn spawn(committee: Committee, store: Store, rx_helper: Receiver<PrimaryMessage>) {
+    pub fn spawn(
+        committee: Arc<RwLock<Committee>>, // SỬA ĐỔI
+        store: Store,
+        rx_helper: Receiver<PrimaryMessage>,
+    ) {
         tokio::spawn(async move {
             Self {
                 committee,
@@ -36,12 +42,13 @@ impl Helper {
 
     async fn run(&mut self) {
         while let Some(message) = self.rx_helper.recv().await {
+            // SỬA ĐỔI: Khóa committee để đọc
+            let committee = self.committee.read().await;
+
             let (requestor, address) = match &message {
-                PrimaryMessage::CertificatesRequest(_, pk) => {
-                    (pk.clone(), self.committee.primary(pk))
-                }
+                PrimaryMessage::CertificatesRequest(_, pk) => (pk.clone(), committee.primary(pk)),
                 PrimaryMessage::CertificateRangeRequest { requestor, .. } => {
-                    (requestor.clone(), self.committee.primary(requestor))
+                    (requestor.clone(), committee.primary(requestor))
                 }
                 _ => continue,
             };
@@ -53,6 +60,9 @@ impl Helper {
                     continue;
                 }
             };
+
+            // Giải phóng lock sớm
+            drop(committee);
 
             match message {
                 PrimaryMessage::CertificatesRequest(digests, _) => {
@@ -71,7 +81,7 @@ impl Helper {
                 PrimaryMessage::CertificateRangeRequest {
                     start_round,
                     end_round,
-                    ..
+                    requestor,
                 } => {
                     debug!(
                         "Received certificate range request from {} for rounds {} to {}",

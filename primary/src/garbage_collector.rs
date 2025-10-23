@@ -13,19 +13,21 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
 
 const GC_TIMER_MS: u64 = 5_000;
 const ORPHAN_BATCH_THRESHOLD_ROUNDS: Round = 10;
 
 pub struct GarbageCollector {
+    name: PublicKey,                   // Thêm trường name
+    committee: Arc<RwLock<Committee>>, // SỬA ĐỔI
     consensus_round: Arc<AtomicU64>,
     gc_depth: Round,
     pending_batches: PendingBatches,
     committed_batches: CommittedBatches,
     rx_consensus: Receiver<Certificate>,
     tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
-    worker_addresses: Vec<SocketAddr>,
     network: SimpleSender,
     store: Store,
 }
@@ -33,8 +35,8 @@ pub struct GarbageCollector {
 impl GarbageCollector {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
-        name: &PublicKey,
-        committee: &Committee,
+        name: PublicKey,
+        committee: Arc<RwLock<Committee>>, // SỬA ĐỔI
         store: Store,
         consensus_round: Arc<AtomicU64>,
         gc_depth: Round,
@@ -43,22 +45,16 @@ impl GarbageCollector {
         rx_consensus: Receiver<Certificate>,
         tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
     ) {
-        let worker_addresses = committee
-            .our_workers(name)
-            .expect("Our public key or worker id is not in the committee")
-            .iter()
-            .map(|x| x.primary_to_worker)
-            .collect();
-
         tokio::spawn(async move {
             Self {
+                name,      // Thêm khởi tạo
+                committee, // SỬA ĐỔI
                 consensus_round,
                 gc_depth,
                 pending_batches,
                 committed_batches,
                 rx_consensus,
                 tx_repropose,
-                worker_addresses,
                 network: SimpleSender::new(),
                 store,
             }
@@ -72,38 +68,39 @@ impl GarbageCollector {
 
         loop {
             tokio::select! {
-                // Lắng nghe các certificate đã được chốt số từ Consensus.
                 Some(certificate) = self.rx_consensus.recv() => {
                     let round = certificate.round();
-
-                    // Cập nhật round đồng thuận.
                     let _ = self.consensus_round.fetch_max(round, Ordering::Relaxed);
 
                     for (digest, _) in certificate.header.payload.iter() {
-                        // Xóa khỏi danh sách chờ.
                         self.pending_batches.remove(digest);
-                        // Thêm vào "trí nhớ ngắn hạn".
                         self.committed_batches.insert(digest.clone(), round);
                     }
 
-                    // Gửi tín hiệu dọn dẹp cho các worker.
+                    // Lấy worker addresses từ committee được chia sẻ
+                    let committee = self.committee.read().await;
+                    let worker_addresses: Vec<SocketAddr> = committee
+                        .our_workers(&self.name)
+                        .expect("Our public key or worker id is not in the committee")
+                        .iter()
+                        .map(|x| x.primary_to_worker)
+                        .collect();
+                    drop(committee);
+
                     let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
                         .expect("Failed to serialize Cleanup message");
-                    self.network.broadcast(self.worker_addresses.clone(), Bytes::from(bytes)).await;
+                    self.network.broadcast(worker_addresses, Bytes::from(bytes)).await;
                 },
 
-                // Chạy các tác vụ dọn dẹp và giải cứu định kỳ.
                 _ = gc_timer.tick() => {
                     let current_round = self.consensus_round.load(Ordering::Relaxed);
 
-                    // 1. Dọn dẹp "trí nhớ ngắn hạn" (`committed_batches`)
                     if current_round > self.gc_depth {
                         let cleanup_round = current_round - self.gc_depth;
                         self.committed_batches.retain(|_, r| *r > cleanup_round);
                          debug!("[GC] Pruned committed batches cache, {} items remaining", self.committed_batches.len());
                     }
 
-                    // 2. Tìm và giải cứu các batch mồ côi
                     let orphan_round_threshold = current_round.saturating_sub(ORPHAN_BATCH_THRESHOLD_ROUNDS);
 
                     let mut orphaned_digests = Vec::new();
@@ -115,15 +112,13 @@ impl GarbageCollector {
                     }
 
                     for digest in orphaned_digests {
-                        // Kiểm tra lại lần cuối xem nó đã được commit chưa, phòng race condition.
                         if self.committed_batches.contains_key(&digest) {
                             self.pending_batches.remove(&digest);
                             continue;
                         }
 
-                        // --- SỬA LỖI: Thay đổi cách lấy giá trị từ DashMap ---
                         if let Some(entry) = self.pending_batches.get(&digest) {
-                            let (worker_id, round) = *entry.value(); // Giải tham chiếu để lấy giá trị (value)
+                            let (worker_id, round) = *entry.value();
                              if let Ok(Some(batch_data)) = self.store.read(digest.to_vec()).await {
                                 warn!("[GC] Found orphaned batch {} from round {}, re-proposing.", digest, round);
                                 let _ = self.tx_repropose.send((digest.clone(), worker_id, batch_data)).await;
