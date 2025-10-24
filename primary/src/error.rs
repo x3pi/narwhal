@@ -1,5 +1,7 @@
+// In primary/src/error.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::primary::Round;
+use crate::Round;
 use crypto::{CryptoError, Digest, PublicKey};
 use store::StoreError;
 use thiserror::Error;
@@ -32,6 +34,9 @@ pub enum DagError {
 
     #[error("Serialization error: {0}")]
     SerializationError(#[from] Box<bincode::ErrorKind>),
+
+    #[error("Message is from an invalid epoch")]
+    InvalidEpoch, // BỔ SUNG LỖI MỚI
 
     #[error("Invalid header id")]
     InvalidHeaderId,

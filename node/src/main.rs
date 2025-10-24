@@ -11,12 +11,10 @@ use config::{Committee, NodeConfig, Parameters, WorkerId};
 use config::{Validator, ValidatorInfo};
 use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
 use consensus::{CommittedSubDag, Consensus};
-use crypto::Digest;
 use crypto::Hash as _;
 use env_logger::Env;
-use log::{error, info, log_enabled, warn};
-use network::SimpleSender;
-use primary::{Certificate, Core, Primary, PrimaryWorkerMessage, ReconfigureNotification};
+use log::{error, info, warn};
+use primary::{Core, Primary, ReconfigureNotification, Round};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,10 +23,10 @@ use std::time::Duration;
 use store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::broadcast;
+use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
-// FIX: Thêm import cho Worker và WorkerMessage
 use worker::{Worker, WorkerMessage};
 
 mod state_syncer;
@@ -43,6 +41,12 @@ pub mod comm {
 }
 
 pub const CHANNEL_CAPACITY: usize = 10_000;
+
+#[derive(Clone, Debug)]
+enum Shutdown {
+    Now,
+    Finalize(u64), // u64 là epoch cần được chốt sổ
+}
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum NodeRole {
@@ -221,7 +225,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         None => Parameters::default(),
     };
     let store = Store::new(store_path).context("Failed to create a store")?;
-    let reconfiguring = Arc::new(AtomicBool::new(false));
+    let epoch_transitioning = Arc::new(AtomicBool::new(false));
 
     let (run_mode, shared_state) = match matches.subcommand() {
         ("primary", _) => {
@@ -253,7 +257,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
         _ => unreachable!(),
     };
 
-    run_loop(shared_state, matches, run_mode, reconfiguring).await
+    run_loop(shared_state, matches, run_mode, epoch_transitioning).await
 }
 
 async fn load_initial_committee(
@@ -267,8 +271,23 @@ async fn load_initial_committee(
     if always_false && committee_file.is_some() {
         let filename = committee_file.unwrap();
         info!("[New Branch] Loading committee from file: {}", filename);
-        Committee::import(filename).context("Failed to load committee from file")
+        let mut committee =
+            Committee::import(filename).context("Failed to load committee from file")?;
+        if committee.epoch == 0 {
+            committee.epoch = 1;
+        }
+        Ok(committee)
     } else {
+        // if let Some(filename) = committee_file {
+        //     info!("[New Branch] Loading committee from file: {}", filename);
+        //     let mut committee =
+        //         Committee::import(filename).context("Failed to load committee from file")?;
+        //     if committee.epoch == 0 {
+        //         committee.epoch = 1;
+        //     }
+        //     return Ok(committee);
+        // }
+
         info!("Fetching committee via UDS for initial load.");
         let socket_path = matches
             .value_of("uds-socket")
@@ -288,7 +307,8 @@ async fn load_initial_committee(
             0
         };
 
-        fetch_committee_from_uds(socket_path, block_number, node_config).await
+        let epoch = block_number + 1;
+        fetch_committee_from_uds(socket_path, block_number, node_config, epoch).await
     }
 }
 
@@ -296,6 +316,7 @@ async fn fetch_committee_from_uds(
     socket_path: &str,
     block_number: u64,
     node_config: &NodeConfig,
+    epoch: u64,
 ) -> Result<Committee> {
     const RETRY_DELAY_MS: u64 = 5000;
 
@@ -309,9 +330,13 @@ async fn fetch_committee_from_uds(
                 match Committee::from_validator_info(
                     validator_info,
                     &node_config.name.to_eth_address(),
+                    epoch,
                 ) {
                     Ok(committee) => {
-                        info!("Successfully parsed new committee from fetched data.");
+                        info!(
+                            "Successfully parsed new committee for epoch {} from fetched data.",
+                            epoch
+                        );
                         return Ok(committee);
                     }
                     Err(e) => {
@@ -335,363 +360,375 @@ async fn fetch_committee_from_uds(
 }
 
 async fn run_loop(
-    shared_state: SharedNodeState,
+    mut shared_state: SharedNodeState,
     matches: &ArgMatches<'_>,
     run_mode: RunMode,
-    reconfiguring: Arc<AtomicBool>,
+    epoch_transitioning: Arc<AtomicBool>,
 ) -> Result<()> {
-    let (tx_reconfigure, mut rx_reconfigure) = channel::<ReconfigureNotification>(CHANNEL_CAPACITY);
-    let mut _current_role: Option<NodeRole> = None;
-    let shutdown_trigger = tokio::sync::broadcast::channel(1).0;
+    let mut current_committee = shared_state.committee.read().await.clone();
 
-    let (tx_output, rx_output) = channel::<(Vec<CommittedSubDag>, Committee)>(CHANNEL_CAPACITY);
+    'epoch_loop: loop {
+        let (tx_reconfigure, mut rx_reconfigure) = channel::<ReconfigureNotification>(1);
+        let (tx_shutdown, _) = broadcast::channel::<Shutdown>(1);
+        let (tx_output, rx_output) =
+            channel::<(Vec<CommittedSubDag>, Committee, Option<Round>)>(CHANNEL_CAPACITY);
 
-    if let RunMode::Primary = run_mode {
-        let temp_committee = shared_state.committee.read().await;
-        let node_id = temp_committee
-            .authorities
-            .keys()
-            .cloned()
-            .collect::<Vec<_>>()
-            .iter()
-            .position(|pk| pk == &shared_state.node_config.name)
-            .unwrap_or(0);
-        drop(temp_committee);
-
-        tokio::spawn(analyze(
-            rx_output,
-            node_id,
-            shared_state.store.clone(),
-            shared_state.node_config.clone(),
-        ));
-    }
-
-    let committee = shared_state.committee.read().await;
-    let my_pubkey = &shared_state.node_config.name;
-    let is_in_committee = committee.authorities.contains_key(my_pubkey);
-    let initial_role = if is_in_committee {
-        NodeRole::Validator
-    } else {
-        NodeRole::Follower
-    };
-    _current_role = Some(initial_role);
-
-    match initial_role {
-        NodeRole::Validator => {
-            info!("Starting Validator tasks...");
-            match run_mode {
-                RunMode::Primary => {
-                    let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
-                    let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
-
-                    Primary::spawn(
-                        shared_state.node_config.clone(),
-                        shared_state.committee.clone(),
-                        shared_state.parameters.clone(),
-                        shared_state.store.clone(),
-                        tx_new_certificates,
-                        rx_feedback,
-                        tx_reconfigure.clone(),
-                        reconfiguring.clone(),
-                    );
-
-                    let initial_committee_for_bullshark = committee.clone();
-                    Consensus::spawn(
-                        shared_state.committee.clone(),
-                        shared_state.parameters.gc_depth,
-                        shared_state.store.clone(),
-                        rx_new_certificates,
-                        tx_feedback,
-                        tx_output.clone(),
-                        ConsensusProtocol::Bullshark(Bullshark::new(
-                            initial_committee_for_bullshark,
-                            shared_state.parameters.gc_depth,
-                        )),
-                    );
-                }
-                RunMode::Worker(id) => {
-                    Worker::spawn(
-                        shared_state.node_config.name,
-                        id,
-                        committee.clone(),
-                        shared_state.parameters.clone(),
-                        shared_state.store.clone(),
-                    )
-                    .await;
-                }
-            }
+        if let RunMode::Primary = run_mode {
+            tokio::spawn(analyze(
+                rx_output,
+                shared_state.store.clone(),
+                shared_state.node_config.clone(),
+                tx_shutdown.subscribe(),
+            ));
         }
-        NodeRole::Follower => {
-            info!("Starting Follower (StateSyncer) tasks...");
+
+        let is_in_committee = current_committee
+            .authorities
+            .contains_key(&shared_state.node_config.name);
+        let role = if is_in_committee {
+            NodeRole::Validator
+        } else {
+            NodeRole::Follower
+        };
+
+        if role == NodeRole::Validator {
+            info!(
+                "Starting Validator tasks for epoch {}...",
+                current_committee.epoch
+            );
+            if let RunMode::Primary = run_mode {
+                let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
+                let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+
+                shared_state.store.write(STATE_KEY.to_vec(), vec![]).await;
+
+                Primary::spawn(
+                    shared_state.node_config.clone(),
+                    shared_state.committee.clone(),
+                    shared_state.parameters.clone(),
+                    shared_state.store.clone(),
+                    tx_new_certificates,
+                    rx_feedback,
+                    tx_reconfigure.clone(),
+                    epoch_transitioning.clone(),
+                );
+
+                Consensus::spawn(
+                    shared_state.committee.clone(),
+                    shared_state.parameters.gc_depth,
+                    shared_state.store.clone(),
+                    rx_new_certificates,
+                    tx_feedback,
+                    tx_output.clone(),
+                    ConsensusProtocol::Bullshark(Bullshark::new(
+                        current_committee.clone(),
+                        shared_state.parameters.gc_depth,
+                    )),
+                );
+            } else if let RunMode::Worker(id) = run_mode {
+                Worker::spawn(
+                    shared_state.node_config.name,
+                    id,
+                    current_committee.clone(),
+                    shared_state.parameters.clone(),
+                    shared_state.store.clone(),
+                )
+                .await;
+            }
+        } else {
+            info!(
+                "Starting Follower (StateSyncer) tasks for epoch {}...",
+                current_committee.epoch
+            );
             StateSyncer::spawn(
                 shared_state.node_config.name,
                 shared_state.committee.clone(),
                 shared_state.store.clone(),
-                shutdown_trigger.subscribe(),
+                tx_shutdown.subscribe(),
             );
+
+            let mut rx_shutdown = tx_shutdown.subscribe();
+            if let Ok(Shutdown::Now) = rx_shutdown.recv().await {}
+            break 'epoch_loop;
         }
-    }
-    drop(committee);
 
-    if run_mode == RunMode::Primary {
-        loop {
-            let notification = match rx_reconfigure.recv().await {
-                Some(n) => n,
-                None => {
-                    info!("Reconfiguration channel closed, shutting down reconfiguration loop.");
-                    break;
-                }
-            };
+        if run_mode == RunMode::Primary {
+            let notification = rx_reconfigure.recv().await.unwrap();
+            let old_epoch = notification.committee.epoch;
 
             info!(
-                "Received reconfigure notification for round {}. System will pause until committee is updated.",
-                notification.round
+                "Received reconfigure notification for end of epoch {} (at round {}). Entering wind-down period.",
+                old_epoch, notification.round
             );
-            reconfiguring.store(true, Ordering::SeqCst);
+            epoch_transitioning.store(true, Ordering::SeqCst);
 
-            // SỬA ĐỔI: Chờ round chẵn cuối cùng của epoch trước đó (e.g., 98 for epoch 100)
-            let target_commit_round = notification.round.saturating_sub(2);
+            // SỬA ĐỔI: Logic chờ một round rỗng được commit sau round 100.
             info!(
-                "Waiting for round {} to be committed before proceeding...",
-                target_commit_round
+                "Winding down epoch {}: Waiting for an empty round >= {} to be committed...",
+                old_epoch, notification.round
             );
             loop {
                 let consensus_state = load_consensus_state(&mut shared_state.store.clone()).await;
-                if consensus_state.last_committed_round >= target_commit_round {
-                    info!(
-                        "Round {} is committed (current last committed: {}). Proceeding with committee fetch.",
-                        target_commit_round, consensus_state.last_committed_round
-                    );
-                    break;
+                if consensus_state.last_committed_round >= notification.round {
+                    let committed_round = consensus_state.last_committed_round;
+                    if let Some(certs_in_round) = consensus_state.dag.get(&committed_round) {
+                        let is_payload_empty = certs_in_round
+                            .values()
+                            .all(|(_, cert)| cert.header.payload.is_empty());
+                        if is_payload_empty {
+                            info!(
+                                 "Epoch {} successfully wound down. Detected empty commit at round {}.",
+                                 old_epoch, committed_round
+                             );
+                            break;
+                        }
+                    }
                 }
                 sleep(Duration::from_millis(500)).await;
             }
+            // KẾT THÚC SỬA ĐỔI
 
-            info!("Hot-reloading committee...");
+            info!("[ANALYZE] Sending Finalize signal for epoch {}.", old_epoch);
+            if tx_shutdown.send(Shutdown::Finalize(old_epoch)).is_err() {
+                warn!("[ANALYZE] Failed to send Finalize signal: No active receivers.");
+            }
 
+            drop(tx_output);
+
+            sleep(Duration::from_millis(2000)).await;
+
+            info!("Starting transition to new epoch...");
+            let new_epoch = old_epoch + 1;
             let block_number_to_fetch = (notification.round / 2) - 1;
 
             let new_committee = fetch_committee_from_uds(
                 matches.value_of("uds-socket").unwrap(),
                 block_number_to_fetch,
                 &shared_state.node_config,
+                new_epoch,
             )
             .await?;
 
-            let new_committee_is_empty = new_committee.authorities.is_empty();
+            if new_committee.authorities.is_empty()
+                || !new_committee
+                    .authorities
+                    .contains_key(&shared_state.node_config.name)
+            {
+                warn!(
+                    "Node is no longer in the committee for epoch {}. Shutting down.",
+                    new_epoch
+                );
+                let _ = tx_shutdown.send(Shutdown::Now);
+                break 'epoch_loop;
+            }
 
             {
                 let mut committee_guard = shared_state.committee.write().await;
                 *committee_guard = new_committee.clone();
             }
-            info!("Shared committee state updated successfully.");
+            current_committee = new_committee;
 
-            if new_committee_is_empty {
-                warn!("Fetched an empty committee. The node might be removed. Shutting down primary tasks.");
-                reconfiguring.store(false, Ordering::SeqCst);
-                break;
+            epoch_transitioning.store(false, Ordering::SeqCst);
+            info!(
+                "Transition complete. Restarting components for new epoch {}.",
+                current_committee.epoch
+            );
+        } else {
+            let mut rx_shutdown = tx_shutdown.subscribe();
+            if let Ok(_) = rx_shutdown.recv().await {
+                info!("Worker received shutdown signal. Restarting for new epoch.");
             }
-
-            let committee_guard = shared_state.committee.read().await;
-            if !committee_guard
-                .authorities
-                .contains_key(&shared_state.node_config.name)
-            {
-                warn!(
-                    "Node {} is no longer in the committee! Shutting down primary tasks.",
-                    shared_state.node_config.name
-                );
-                reconfiguring.store(false, Ordering::SeqCst);
-                break;
-            }
-
-            let worker_reconfigure_message = PrimaryWorkerMessage::Reconfigure(new_committee);
-            let bytes = bincode::serialize(&worker_reconfigure_message)
-                .expect("Failed to serialize worker reconfigure message");
-
-            match committee_guard.our_workers(&shared_state.node_config.name) {
-                Ok(worker_addresses) => {
-                    let addresses: Vec<_> = worker_addresses
-                        .iter()
-                        .map(|x| x.primary_to_worker)
-                        .collect();
-                    if !addresses.is_empty() {
-                        info!(
-                            "Broadcasting Reconfigure message to own workers at {:?}",
-                            addresses
-                        );
-                        SimpleSender::new().broadcast(addresses, bytes.into()).await;
-                    }
-                }
-                Err(e) => warn!(
-                    "Could not get our worker addresses for reconfiguring: {}",
-                    e
-                ),
-            }
-
-            info!("Reconfiguration complete. Resuming Core.");
-            reconfiguring.store(false, Ordering::SeqCst);
         }
-
-        warn!("Primary tasks terminated. Switching to Follower mode.");
-        StateSyncer::spawn(
-            shared_state.node_config.name,
-            shared_state.committee.clone(),
-            shared_state.store.clone(),
-            shutdown_trigger.subscribe(),
-        );
-        _current_role = Some(NodeRole::Follower);
     }
-
-    std::future::pending::<()>().await;
-
     Ok(())
 }
 
 async fn analyze(
-    mut rx_output: Receiver<(Vec<CommittedSubDag>, Committee)>,
-    node_id: usize,
+    mut rx_output: Receiver<(Vec<CommittedSubDag>, Committee, Option<Round>)>,
     mut store: Store,
     node_config: NodeConfig,
+    mut rx_shutdown: broadcast::Receiver<Shutdown>,
 ) {
-    let mut processed_certificates = HashSet::<Digest>::new();
-    let mut committed_tx_digests = HashSet::<Vec<u8>>::new();
-
-    fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
-        loop {
-            if value < 0x80 {
-                buf.put_u8(value as u8);
-                break;
-            }
-            buf.put_u8(((value & 0x7F) | 0x80) as u8);
-            value >>= 7;
-        }
-    }
+    let mut epoch_buffers: HashMap<u64, Vec<CommittedSubDag>> = HashMap::new();
 
     if node_config.uds_block_path.is_empty() {
         warn!("[ANALYZE] uds_block_path is not configured. Committed blocks will be discarded.");
-        while (rx_output.recv().await).is_some() {}
-        info!("[ANALYZE] Main channel closed. Exiting discard loop.");
+        let _ = rx_shutdown.recv().await;
         return;
     }
+    let socket_path = node_config.uds_block_path.clone();
 
-    let socket_path = node_config.uds_block_path;
-    let mut stream_option = None;
-
-    'main_loop: loop {
-        if stream_option.is_none() {
-            match UnixStream::connect(&socket_path).await {
-                Ok(stream) => {
-                    info!("[ANALYZE] Node ID {} connected to {}", node_id, socket_path);
-                    stream_option = Some(stream);
-                }
-                Err(e) => {
-                    warn!(
-                        "[ANALYZE] Connection to {} failed: {}. Retrying...",
-                        socket_path, e
-                    );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-                    continue;
-                }
-            }
-        }
-
-        match rx_output.recv().await {
-            Some((committed_sub_dags, _committee)) => {
-                if committed_sub_dags.is_empty() {
-                    continue;
-                }
-
-                let mut blocks_to_send = Vec::new();
-
-                for sub_dag in committed_sub_dags {
-                    let mut all_transactions = Vec::new();
-                    let block_height = sub_dag.leader.round();
-                    let epoch = block_height;
-
-                    for certificate in sub_dag.certificates.iter() {
-                        if !processed_certificates.insert(certificate.digest()) {
-                            continue;
-                        }
-
-                        for (digest, worker_id) in &certificate.header.payload {
-                            match store.read(digest.to_vec()).await {
-                                Ok(Some(serialized_batch)) => {
-                                    if let Ok(WorkerMessage::Batch(batch)) =
-                                        bincode::deserialize(&serialized_batch)
-                                    {
-                                        for tx_data in batch {
-                                            if committed_tx_digests.insert(tx_data.clone()) {
-                                                all_transactions.push(comm::Transaction {
-                                                    digest: tx_data,
-                                                    worker_id: *worker_id as u32,
-                                                });
-                                            }
-                                        }
-                                    }
-                                }
-                                Ok(None) => {
-                                    warn!("[ANALYZE] Batch for digest {} not found.", digest)
-                                }
-                                Err(e) => {
-                                    error!("[ANALYZE] Failed to read batch {}: {}", digest, e)
-                                }
-                            }
-                        }
-                    }
-
-                    let committed_block = comm::CommittedBlock {
-                        epoch,
-                        height: block_height,
-                        transactions: all_transactions,
-                    };
-
+    loop {
+        tokio::select! {
+            Some((dags, committee, skipped_round_option)) = rx_output.recv() => {
+                 if let Some(skipped_round) = skipped_round_option {
                     info!(
-                        "[ANALYZE] Prepared block #{} (Epoch {}) with {} transactions.",
-                        block_height,
-                        epoch,
-                        committed_block.transactions.len()
+                        "[ANALYZE] Sending empty block for skipped epoch {} at height {}.",
+                        committee.epoch, skipped_round
                     );
-                    blocks_to_send.push(committed_block);
+                    let empty_block = comm::CommittedBlock {
+                        epoch: committee.epoch,
+                        height: skipped_round,
+                        transactions: Vec::new(),
+                    };
+                    let epoch_data = comm::CommittedEpochData {
+                        blocks: vec![empty_block],
+                    };
+                    send_to_uds(epoch_data, &socket_path).await;
+                } else if !dags.is_empty() {
+                    epoch_buffers
+                        .entry(committee.epoch)
+                        .or_default()
+                        .extend(dags);
                 }
-
-                if blocks_to_send.is_empty() {
-                    continue;
+            },
+            Ok(shutdown_signal) = rx_shutdown.recv() => {
+                match shutdown_signal {
+                    Shutdown::Finalize(epoch_to_finalize) => {
+                        info!("[ANALYZE] Received Finalize signal for epoch {}. Processing final block.", epoch_to_finalize);
+                        if let Some(dags) = epoch_buffers.remove(&epoch_to_finalize) {
+                            finalize_and_send_epoch(epoch_to_finalize, dags, &mut store, &socket_path).await;
+                        } else {
+                             warn!("[ANALYZE] No committed dags found in buffer for epoch {} to finalize.", epoch_to_finalize);
+                             finalize_and_send_epoch(epoch_to_finalize, Vec::new(), &mut store, &socket_path).await;
+                        }
+                    },
+                    Shutdown::Now => {
+                        info!("[ANALYZE] Received Shutdown::Now signal. Exiting.");
+                        break;
+                    }
                 }
-
-                let epoch_data = comm::CommittedEpochData {
-                    blocks: blocks_to_send,
-                };
-
-                let mut proto_buf = BytesMut::new();
-                epoch_data
-                    .encode(&mut proto_buf)
-                    .expect("Protobuf serialization failed");
-                let mut len_buf = BytesMut::new();
-                put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
-
-                let stream = stream_option.as_mut().unwrap();
-                if let Err(e) = stream.write_all(&len_buf).await {
-                    error!("[ANALYZE] Failed to write length: {}. Reconnecting...", e);
-                    stream_option = None;
-                    continue 'main_loop;
+            },
+            else => {
+                info!("[ANALYZE] Channel closed. Finalizing any remaining buffers and exiting.");
+                for (epoch, dags) in epoch_buffers.drain() {
+                    warn!("[ANALYZE] Finalizing epoch {} from buffer due to channel close.", epoch);
+                    finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
                 }
-                if let Err(e) = stream.write_all(&proto_buf).await {
-                    error!("[ANALYZE] Failed to write payload: {}. Reconnecting...", e);
-                    stream_option = None;
-                    continue 'main_loop;
-                }
-
-                info!(
-                    "[ANALYZE] Sent {} new blocks successfully.",
-                    epoch_data.blocks.len()
-                );
-            }
-            None => {
-                info!("[ANALYZE] Main channel closed. Exiting.");
                 break;
             }
         }
     }
-    info!("[ANALYZE] Task finished.");
+}
+
+async fn finalize_and_send_epoch(
+    epoch: u64,
+    dags: Vec<CommittedSubDag>,
+    store: &mut Store,
+    socket_path: &str,
+) {
+    if dags.is_empty() {
+        info!("[ANALYZE] No dags to process for final block of epoch {}. Sending an empty final block.", epoch);
+        let final_block = comm::CommittedBlock {
+            epoch,
+            height: 100,
+            transactions: Vec::new(),
+        };
+        let epoch_data = comm::CommittedEpochData {
+            blocks: vec![final_block],
+        };
+        send_to_uds(epoch_data, socket_path).await;
+        return;
+    }
+
+    info!(
+        "[ANALYZE] Finalizing epoch {}. Aggregating all transactions into a single final block.",
+        epoch
+    );
+
+    let mut all_transactions = Vec::new();
+    let mut processed_certificates = HashSet::new();
+    let mut committed_tx_digests = HashSet::new();
+
+    let final_height = dags
+        .iter()
+        .flat_map(|dag| &dag.certificates)
+        .map(|cert| cert.round())
+        .max()
+        .unwrap_or(100);
+
+    for sub_dag in dags {
+        for certificate in sub_dag.certificates {
+            if certificate.epoch() != epoch {
+                continue;
+            }
+
+            if !processed_certificates.insert(certificate.digest()) {
+                continue;
+            }
+
+            for (digest, worker_id) in &certificate.header.payload {
+                if let Ok(Some(serialized_batch)) = store.read(digest.to_vec()).await {
+                    if let Ok(WorkerMessage::Batch(batch)) = bincode::deserialize(&serialized_batch)
+                    {
+                        for tx_data in batch {
+                            if committed_tx_digests.insert(tx_data.clone()) {
+                                all_transactions.push(comm::Transaction {
+                                    digest: tx_data,
+                                    worker_id: *worker_id as u32,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let final_block = comm::CommittedBlock {
+        epoch,
+        height: final_height,
+        transactions: all_transactions,
+    };
+
+    info!(
+        "[ANALYZE] Created final block for epoch {} at height {} with {} total transactions.",
+        epoch,
+        final_height,
+        final_block.transactions.len()
+    );
+
+    let epoch_data = comm::CommittedEpochData {
+        blocks: vec![final_block],
+    };
+
+    send_to_uds(epoch_data, socket_path).await;
+}
+
+async fn send_to_uds(epoch_data: comm::CommittedEpochData, socket_path: &str) {
+    match UnixStream::connect(socket_path).await {
+        Ok(mut stream) => {
+            let mut proto_buf = BytesMut::new();
+            epoch_data
+                .encode(&mut proto_buf)
+                .expect("Protobuf serialization failed");
+
+            let mut len_buf = BytesMut::new();
+            fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
+                loop {
+                    if value < 0x80 {
+                        buf.put_u8(value as u8);
+                        break;
+                    }
+                    buf.put_u8(((value & 0x7F) | 0x80) as u8);
+                    value >>= 7;
+                }
+            }
+            put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
+            if let Err(e) = stream.write_all(&len_buf).await {
+                error!("[ANALYZE] UDS: Failed to write length: {}", e);
+                return;
+            }
+            if let Err(e) = stream.write_all(&proto_buf).await {
+                error!("[ANALYZE] UDS: Failed to write payload: {}", e);
+                return;
+            }
+            info!(
+                "[ANALYZE] Successfully sent epoch data for epoch {} to UDS.",
+                epoch_data.blocks.first().map(|b| b.epoch).unwrap_or(0)
+            );
+        }
+        Err(e) => error!("[ANALYZE] UDS: Connection to {} failed: {}", socket_path, e),
+    }
 }

@@ -6,7 +6,7 @@ use crypto::{
     ConsensusSecretKey, PublicKey, SecretKey,
 };
 use log::info;
-use rand::SeedableRng; // <-- Thêm RngCore
+use rand::SeedableRng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -34,7 +34,6 @@ pub enum ConfigError {
     ParseError(String),
 }
 
-// SỬA ĐỔI: Thêm Serialize và Deserialize để có thể import/export
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Validator {
     pub address: String,
@@ -46,7 +45,6 @@ pub struct Validator {
     pub pubkey_secp: String,
 }
 
-/// Struct wrapper containing a list of validators.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ValidatorInfo {
     pub validators: Vec<Validator>,
@@ -144,20 +142,24 @@ pub struct Authority {
     pub consensus_key: ConsensusPublicKey,
     pub primary: PrimaryAddresses,
     pub workers: HashMap<WorkerId, WorkerAddresses>,
-    // SỬA LỖI: Thêm trường p2p_address vào Authority
     pub p2p_address: String,
 }
 
 #[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
+    pub epoch: u64,
 }
 
+// SỬA LỖI: Thêm dòng này để fix lỗi biên dịch
+impl Import for Committee {}
+impl Export for Committee {}
+
 impl Committee {
-    // Thêm tham số `self_address` để xác định node hiện tại.
     pub fn from_validator_info(
         mut validator_info: ValidatorInfo,
         self_address: &str,
+        epoch: u64,
     ) -> Result<Self, ConfigError> {
         const BASE_PRIMARY_TO_WORKER_PORT: u16 = 10000;
         const BASE_WORKER_TO_PRIMARY_PORT: u16 = 11000;
@@ -169,7 +171,6 @@ impl Committee {
 
         let mut authorities = BTreeMap::new();
         for (i, val) in validator_info.validators.iter().enumerate() {
-            // Parse a validator's secp256k1 public key.
             let base64_address = crypto::hex_to_base64(&val.pubkey_secp).map_err(|e| {
                 ConfigError::ParseError(format!("Failed to convert hex address to base64: {}", e))
             })?;
@@ -180,7 +181,6 @@ impl Committee {
                 ))
             })?;
 
-            // Parse the consensus public key (bls).
             let base64_bls_key = crypto::hex_to_base64(&val.pubkey_bls).map_err(|e| {
                 ConfigError::ParseError(format!("Failed to convert BLS hex key to base64: {}", e))
             })?;
@@ -192,7 +192,6 @@ impl Committee {
                     ))
                 })?;
 
-            // Parse other validator info.
             let stake: Stake = val.total_staked_amount.parse().unwrap_or(1);
             let primary_to_primary: SocketAddr = val.primary_address.parse().map_err(|e| {
                 ConfigError::ParseError(format!(
@@ -201,37 +200,30 @@ impl Committee {
                 ))
             })?;
 
-            // --- LOGIC GÁN ĐỊA CHỈ NỘI BỘ ---
-            let worker_to_primary: SocketAddr;
-            let primary_to_worker: SocketAddr;
-            let transactions: SocketAddr;
-
-            if val.address.to_lowercase() == self_address.to_lowercase() {
-                // Nếu ĐÚNG, tự động gán cổng tuần tự cho chính nó.
-                info!(
-                    "Assigning sequential internal ports for self (address: {}).",
-                    self_address
-                );
-                worker_to_primary = format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
-                    .parse()
-                    .unwrap();
-                primary_to_worker = format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
-                    .parse()
-                    .unwrap();
-                transactions = format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
-                    .parse()
-                    .unwrap();
-            } else {
-                // Nếu KHÔNG, gán địa chỉ placeholder "0.0.0.0:0" vì không cần thiết.
-                let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                worker_to_primary = placeholder_addr;
-                primary_to_worker = placeholder_addr;
-                transactions = placeholder_addr;
-            }
-            // --- KẾT THÚC LOGIC GÁN ĐỊA CHỈ ---
+            let (worker_to_primary, primary_to_worker, transactions) =
+                if val.address.to_lowercase() == self_address.to_lowercase() {
+                    info!(
+                        "Assigning sequential internal ports for self (address: {}).",
+                        self_address
+                    );
+                    (
+                        format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
+                            .parse()
+                            .unwrap(),
+                        format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
+                            .parse()
+                            .unwrap(),
+                        format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
+                            .parse()
+                            .unwrap(),
+                    )
+                } else {
+                    let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                    (placeholder_addr, placeholder_addr, placeholder_addr)
+                };
 
             let workers = [(
-                0, // Giả sử mỗi validator chỉ có một worker với id = 0.
+                0,
                 WorkerAddresses {
                     primary_to_worker,
                     transactions,
@@ -255,19 +247,14 @@ impl Committee {
                     worker_to_primary,
                 },
                 workers,
-                // SỬA LỖI: Gán giá trị p2p_address
                 p2p_address: val.p2p_address.clone(),
             };
             authorities.insert(public_key, authority);
         }
-        Ok(Committee { authorities })
+        Ok(Committee { authorities, epoch })
     }
-}
 
-impl Import for Committee {}
-impl Export for Committee {}
-
-impl Committee {
+    // ... (các hàm còn lại của Committee giữ nguyên) ...
     pub fn size(&self) -> usize {
         self.authorities.len()
     }
@@ -358,23 +345,20 @@ impl Committee {
     }
 }
 
-// ... existing code ...
-#[derive(Clone, Serialize, Deserialize, Debug)] // Thêm Debug để dễ dàng in ra thông tin cấu hình
+#[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct NodeConfig {
-    // Đổi tên KeyPair thành NodeConfig
     pub name: PublicKey,
     pub secret: SecretKey,
     pub consensus_key: ConsensusPublicKey,
     pub consensus_secret: ConsensusSecretKey,
-    pub uds_get_validators_path: String, // Trường mới
-    pub uds_block_path: String,          // Trường mới
+    pub uds_get_validators_path: String,
+    pub uds_block_path: String,
 }
 
-impl Import for NodeConfig {} // Cập nhật Import cho NodeConfig
-impl Export for NodeConfig {} // Cập nhật Export cho NodeConfig
+impl Import for NodeConfig {}
+impl Export for NodeConfig {}
 
 impl NodeConfig {
-    // Cập nhật impl cho NodeConfig
     pub fn new() -> Self {
         let (name, secret) = generate_production_keypair();
         let mut rng = rand::rngs::StdRng::from_entropy();
@@ -384,14 +368,13 @@ impl NodeConfig {
             secret,
             consensus_key,
             consensus_secret,
-            uds_get_validators_path: "/tmp/get_validator.sock_1".to_string(), // Giá trị mặc định
-            uds_block_path: "/tmp/block.sock_1".to_string(),                  // Giá trị mặc định
+            uds_get_validators_path: "/tmp/get_validator.sock_1".to_string(),
+            uds_block_path: "/tmp/block.sock_1".to_string(),
         }
     }
 }
 
 impl Default for NodeConfig {
-    // Cập nhật Default cho NodeConfig
     fn default() -> Self {
         Self::new()
     }

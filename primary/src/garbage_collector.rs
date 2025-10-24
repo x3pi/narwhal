@@ -2,7 +2,8 @@
 
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::Certificate;
-use crate::primary::{CommittedBatches, PendingBatches, PrimaryWorkerMessage, Round};
+use crate::primary::{CommittedBatches, PendingBatches, PrimaryWorkerMessage};
+use crate::Round;
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};

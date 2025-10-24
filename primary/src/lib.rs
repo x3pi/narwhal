@@ -1,3 +1,5 @@
+// In primary/src/lib.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 #[macro_use]
 mod error;
@@ -19,5 +21,9 @@ mod common;
 pub use crate::core::Core;
 pub use crate::messages::{Certificate, Header};
 pub use crate::primary::{
-    Primary, PrimaryWorkerMessage, ReconfigureNotification, Round, WorkerPrimaryMessage,
+    Primary, PrimaryWorkerMessage, ReconfigureNotification, WorkerPrimaryMessage,
 };
+
+// ĐỊNH NGHĨA: Thêm các type alias cho rõ ràng
+pub type Round = u64;
+pub type Epoch = u64;

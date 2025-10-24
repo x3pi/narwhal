@@ -10,6 +10,7 @@ use crate::helper::Helper;
 use crate::messages::{Certificate, Header, Vote};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
+use crate::Round; // SỬA LỖI: Xóa 'Epoch' không sử dụng
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, NodeConfig, Parameters, WorkerId};
@@ -22,21 +23,16 @@ use network::{
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use std::fmt;
-// SỬA ĐỔI: Thêm các import cần thiết
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::RwLock;
-
-// SỬA ĐỔI: Không cần JoinHandle nữa
-
+use tokio::sync::RwLock; // SỬA LỖI: Thay đổi đường dẫn import
 pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 pub type PendingBatches = Arc<DashMap<Digest, (WorkerId, Round)>>;
 pub type CommittedBatches = Arc<DashMap<Digest, Round>>;
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
-pub type Round = u64;
 
 #[derive(Debug)]
 pub struct ReconfigureNotification {
@@ -115,18 +111,14 @@ impl Primary {
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         node_config: NodeConfig,
-        // SỬA ĐỔI: Nhận Arc<RwLock<Committee>>
         committee: Arc<RwLock<Committee>>,
         parameters: Parameters,
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
         tx_reconfigure: Sender<ReconfigureNotification>,
-        // SỬA ĐỔI: Thêm cờ reconfiguring
-        reconfiguring: Arc<AtomicBool>,
+        epoch_transitioning: Arc<AtomicBool>,
     ) {
-        // Bỏ dòng `let committee = Arc::new(RwLock::new(initial_committee));`
-
         let payload_cache: PayloadCache = Arc::new(DashMap::new());
         let pending_batches: PendingBatches = Arc::new(DashMap::new());
         let committed_batches: CommittedBatches = Arc::new(DashMap::new());
@@ -171,23 +163,17 @@ impl Primary {
             let mut listen_address = worker_address;
             listen_address.set_ip("0.0.0.0".parse().unwrap());
             let worker_listener = transport.listen(listen_address).await.unwrap();
-            NetworkReceiver::spawn(
-                worker_listener,
-                WorkerReceiverHandler {
-                    tx_workers: tx_workers,
-                },
-            );
+            NetworkReceiver::spawn(worker_listener, WorkerReceiverHandler { tx_workers });
             info!(
                 "Primary {} listening to workers messages on {}",
                 name, listen_address
             );
 
-            // Giải phóng lock sớm
             drop(committee_guard);
 
             let synchronizer = Synchronizer::new(
                 name,
-                committee.clone(), // Truyền Arc
+                committee.clone(),
                 store.clone(),
                 payload_cache.clone(),
                 tx_sync_headers,
@@ -196,7 +182,6 @@ impl Primary {
 
             let signature_service = SignatureService::new(consensus_secret);
 
-            // SỬA ĐỔI: Truyền cờ `reconfiguring` vào Core
             Core::spawn(
                 name,
                 committee.clone(),
@@ -212,12 +197,12 @@ impl Primary {
                 tx_consensus,
                 tx_parents,
                 tx_reconfigure,
-                reconfiguring, // Truyền vào đây
+                epoch_transitioning.clone(), // Truyền cờ vào Core
             );
 
             GarbageCollector::spawn(
                 name,
-                committee.clone(), // Truyền Arc
+                committee.clone(),
                 store.clone(),
                 consensus_round.clone(),
                 parameters.gc_depth,
@@ -229,13 +214,14 @@ impl Primary {
 
             Proposer::spawn(
                 name,
-                committee.clone(), // Truyền Arc
+                committee.clone(),
                 signature_service,
                 store.clone(),
                 parameters.header_size,
                 parameters.max_header_delay,
                 pending_batches.clone(),
                 committed_batches.clone(),
+                epoch_transitioning.clone(), // Truyền cờ vào Proposer
                 rx_parents,
                 rx_workers,
                 rx_repropose,
@@ -244,7 +230,7 @@ impl Primary {
 
             HeaderWaiter::spawn(
                 name,
-                committee.clone(), // Truyền Arc
+                committee.clone(),
                 store.clone(),
                 consensus_round,
                 parameters.gc_depth,
@@ -260,7 +246,7 @@ impl Primary {
                 tx_certificates_loopback,
             );
 
-            Helper::spawn(committee.clone(), store, rx_helper_requests); // Truyền Arc
+            Helper::spawn(committee.clone(), store, rx_helper_requests);
 
             info!(
                 "Primary {} successfully booted on {}",
@@ -271,7 +257,6 @@ impl Primary {
     }
 }
 
-// ... (PrimaryReceiverHandler, WorkerReceiverHandler không đổi) ...
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,

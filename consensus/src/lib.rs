@@ -17,7 +17,6 @@ use store::Store;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
 
 pub const STATE_KEY: &'static [u8] = b"consensus_state";
 
@@ -152,8 +151,8 @@ mod utils {
         }
 
         // --- START FIX ---
-        // The previous loop `(..).rev().step_by(2)` was buggy and iterated on odd numbers.
-        // This new loop correctly iterates backwards over even-numbered rounds only.
+        // Vòng lặp `(..).rev().step_by(2)` trước đó bị lỗi và chỉ duyệt qua các số lẻ.
+        // Vòng lặp mới này duyệt lùi một cách chính xác qua các vòng có số chẵn.
         for r in (state.last_committed_round + 1..current_leader.round())
             .rev()
             .filter(|r| r % 2 == 0)
@@ -618,7 +617,8 @@ pub struct Consensus {
     store: Store,
     rx_primary: Receiver<Certificate>,
     tx_primary: Sender<Certificate>,
-    tx_output: Sender<(Vec<CommittedSubDag>, Committee)>,
+    // SỬA ĐỔI: Kiểu dữ liệu của channel output được thay đổi
+    tx_output: Sender<(Vec<CommittedSubDag>, Committee, Option<Round>)>,
     committee: Arc<RwLock<Committee>>,
     protocol: Box<dyn ConsensusAlgorithm>,
     genesis: Vec<Certificate>,
@@ -658,7 +658,8 @@ impl Consensus {
         store: Store,
         rx_primary: Receiver<Certificate>,
         tx_primary: Sender<Certificate>,
-        tx_output: Sender<(Vec<CommittedSubDag>, Committee)>,
+        // SỬA ĐỔI: Kiểu dữ liệu của channel output được thay đổi
+        tx_output: Sender<(Vec<CommittedSubDag>, Committee, Option<Round>)>,
         protocol_selection: ConsensusProtocol,
     ) {
         let protocol: Box<dyn ConsensusAlgorithm> = match protocol_selection {
@@ -744,6 +745,7 @@ impl Consensus {
                     debug!("Received certificate from round {}", certificate.round());
 
                     let mut metrics_guard = self.metrics.write().await;
+                    let leader_round_to_check = certificate.round().saturating_sub(1);
 
                     match self
                         .protocol
@@ -764,13 +766,13 @@ impl Consensus {
                                 }
                             }
 
+                            // SỬA ĐỔI: Logic gửi output cho `analyze`
                             if !sub_dags.is_empty() {
+                                // Gửi các sub-dag đã được commit
                                 for sub_dag in &sub_dags {
-
                                     if sub_dag.leader.round() % 2 != 0 {
                                         warn!("[BUG_TRACE] About to send a committed sub-dag with an ODD-numbered leader (height {}) to the analyze function.", sub_dag.leader.round());
                                     }
-
                                     for certificate in &sub_dag.certificates {
                                         #[cfg(not(feature = "benchmark"))]
                                         info!("Committed {}", certificate.header);
@@ -782,6 +784,11 @@ impl Consensus {
                                     }
                                 }
 
+                                let output_tuple = (sub_dags.clone(), committee.clone(), None);
+                                if self.tx_output.send(output_tuple).await.is_err() {
+                                    warn!("Failed to output committed dags sequence");
+                                }
+
                                 if let Some(last_dag) = sub_dags.last() {
                                     if let Some(last_cert) = last_dag.certificates.last() {
                                         if let Err(e) = self.tx_primary.send(last_cert.clone()).await {
@@ -789,10 +796,11 @@ impl Consensus {
                                         }
                                     }
                                 }
-
-                                let output_tuple = (sub_dags, committee.clone());
-                                if let Err(e) = self.tx_output.send(output_tuple).await {
-                                    warn!("Failed to output certificate sequence: {}", e);
+                            } else if leader_round_to_check > state.last_committed_round && leader_round_to_check % 2 == 0 {
+                                // Gửi thông báo về round bị bỏ qua (không commit được)
+                                let output_tuple = (Vec::new(), committee.clone(), Some(leader_round_to_check));
+                                 if self.tx_output.send(output_tuple).await.is_err() {
+                                    warn!("Failed to output skipped round notification");
                                 }
                             }
                         }

@@ -2,13 +2,15 @@
 
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
-use crate::primary::{CommittedBatches, PendingBatches, Round};
-use config::{Committee, WorkerId}; // SỬA ĐỔI: WorkerId được import từ config
+use crate::primary::{CommittedBatches, PendingBatches};
+use crate::Round;
+use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -21,7 +23,7 @@ pub mod proposer_tests;
 
 pub struct Proposer {
     name: PublicKey,
-    committee: Arc<RwLock<Committee>>,
+    committee: Arc<RwLock<Committee>>, // BỔ SUNG: Giữ lại committee để lấy epoch
     signature_service: SignatureService,
     store: Store,
     header_size: usize,
@@ -29,6 +31,7 @@ pub struct Proposer {
 
     pending_batches: PendingBatches,
     committed_batches: CommittedBatches,
+    epoch_transitioning: Arc<AtomicBool>,
 
     rx_core: Receiver<(Vec<Digest>, Round)>,
     rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
@@ -52,34 +55,34 @@ impl Proposer {
         max_header_delay: u64,
         pending_batches: PendingBatches,
         committed_batches: CommittedBatches,
+        epoch_transitioning: Arc<AtomicBool>,
         rx_core: Receiver<(Vec<Digest>, Round)>,
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
         rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
         tx_core: Sender<Header>,
     ) {
-        // Lấy committee một lần để tạo genesis
-        let genesis = tokio::task::block_in_place(|| {
-            Certificate::genesis(&committee.blocking_read())
+        tokio::spawn(async move {
+            // SỬA LỖI: Dereference committee read guard
+            let genesis = Certificate::genesis(&*committee.read().await)
                 .iter()
                 .map(|x| x.digest())
-                .collect()
-        });
+                .collect();
 
-        tokio::spawn(async move {
             Self {
                 name,
-                committee,
+                committee, // BỔ SUNG
                 signature_service,
                 store,
                 header_size,
                 max_header_delay,
                 pending_batches,
                 committed_batches,
+                epoch_transitioning,
                 rx_core,
                 rx_workers,
                 rx_repropose,
                 tx_core,
-                round: 1,
+                round: 1, // Bắt đầu từ Round 1 cho mỗi epoch
                 last_parents: genesis,
                 digests: Vec::with_capacity(2 * header_size),
                 payload_size: 0,
@@ -90,15 +93,30 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) {
-        let digests_for_header: Vec<(Digest, WorkerId)> = self.digests.drain(..).collect();
+        let is_transitioning = self.epoch_transitioning.load(Ordering::Relaxed);
+        let digests_for_header = if is_transitioning {
+            self.digests.clear();
+            self.payload_size = 0;
+            warn!(
+                "Epoch transition: Proposing an empty header for round {}",
+                self.round
+            );
+            Vec::new()
+        } else {
+            self.digests.drain(..).collect()
+        };
 
-        if digests_for_header.is_empty() && self.last_parents.is_empty() {
+        if self.last_parents.is_empty() {
             return;
         }
+
+        // Lấy epoch hiện tại từ committee
+        let current_epoch = self.committee.read().await.epoch;
 
         let header = Header::new(
             self.name,
             self.round,
+            current_epoch, // BỔ SUNG: Truyền epoch vào
             digests_for_header.iter().cloned().collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,
@@ -128,11 +146,12 @@ impl Proposer {
 
         loop {
             let timer_expired = timer.is_elapsed();
+            let is_transitioning = self.epoch_transitioning.load(Ordering::Relaxed);
 
             if !self.last_parents.is_empty()
-                && (timer_expired || self.payload_size >= self.header_size)
+                && (timer_expired || self.payload_size >= self.header_size || is_transitioning)
             {
-                if !self.digests.is_empty() || timer_expired {
+                if is_transitioning || !self.digests.is_empty() || timer_expired {
                     self.make_header().await;
                     self.payload_size = 0;
                     let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
@@ -148,14 +167,14 @@ impl Proposer {
                         self.last_parents = parents;
                     }
                 }
-                Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
+                Some((digest, worker_id, batch)) = self.rx_workers.recv(), if !is_transitioning => {
                     if !self.committed_batches.contains_key(&digest) && !self.pending_batches.contains_key(&digest) {
                         self.store.write(digest.to_vec(), batch).await;
                         self.payload_size += digest.size();
                         self.digests.push((digest, worker_id));
                     }
                 }
-                Some((digest, worker_id, _batch)) = self.rx_repropose.recv() => {
+                Some((digest, worker_id, _batch)) = self.rx_repropose.recv(), if !is_transitioning => {
                     if !self.committed_batches.contains_key(&digest) && !self.pending_batches.contains_key(&digest) {
                         warn!("Re-proposing orphaned batch {}", digest);
                         self.payload_size += digest.size();

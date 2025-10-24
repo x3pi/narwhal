@@ -1,6 +1,8 @@
+// In primary/src/messages.rs
+
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
-use crate::primary::Round;
+use crate::{Epoch, Round};
 use config::{Committee, WorkerId};
 use crypto::{ConsensusPublicKey, Digest, Hash, PublicKey, Signature, SignatureService};
 use serde::{Deserialize, Serialize};
@@ -14,6 +16,7 @@ use std::fmt;
 pub struct Header {
     pub author: PublicKey,
     pub round: Round,
+    pub epoch: Epoch, // BỔ SUNG: Thêm trường epoch
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parents: BTreeSet<Digest>,
     pub id: Digest,
@@ -25,6 +28,7 @@ impl Default for Header {
         Self {
             author: PublicKey::default(),
             round: 0,
+            epoch: 0, // BỔ SUNG
             payload: BTreeMap::new(),
             parents: BTreeSet::new(),
             id: Digest::default(),
@@ -37,6 +41,7 @@ impl Header {
     pub async fn new(
         author: PublicKey,
         round: Round,
+        epoch: Epoch, // BỔ SUNG
         payload: BTreeMap<Digest, WorkerId>,
         parents: BTreeSet<Digest>,
         signature_service: &mut SignatureService,
@@ -44,6 +49,7 @@ impl Header {
         let header = Self {
             author,
             round,
+            epoch, // BỔ SUNG
             payload,
             parents,
             id: Digest::default(),
@@ -59,6 +65,9 @@ impl Header {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
+        // Đảm bảo header đến từ đúng kỷ nguyên.
+        ensure!(self.epoch == committee.epoch, DagError::InvalidEpoch);
+
         ensure!(self.digest() == self.id, DagError::InvalidHeaderId);
 
         let voting_rights = committee.stake(&self.author);
@@ -87,6 +96,7 @@ impl Hash for Header {
         let mut hasher = Sha512::new();
         hasher.update(self.author.as_ref());
         hasher.update(self.round.to_le_bytes());
+        hasher.update(self.epoch.to_le_bytes()); // BỔ SUNG: Hash cả epoch
         for (x, y) in &self.payload {
             hasher.update(x.as_ref());
             hasher.update(y.to_le_bytes());
@@ -102,8 +112,9 @@ impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: B{}({}, {})",
+            "{}: E{}B{}({}, {})", // BỔ SUNG: Thêm Epoch vào format
             self.id,
+            self.epoch,
             self.round,
             self.author,
             self.payload.keys().map(|x| x.size()).sum::<usize>(),
@@ -113,7 +124,7 @@ impl fmt::Debug for Header {
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "B{}({})", self.round, self.author)
+        write!(f, "E{}B{}({})", self.epoch, self.round, self.author)
     }
 }
 
@@ -121,6 +132,7 @@ impl fmt::Display for Header {
 pub struct Vote {
     pub id: Digest,
     pub round: Round,
+    pub epoch: Epoch, // BỔ SUNG
     pub origin: PublicKey,
     pub author: PublicKey,
     pub signature: Signature,
@@ -135,6 +147,7 @@ impl Vote {
         let vote = Self {
             id: header.id.clone(),
             round: header.round,
+            epoch: header.epoch, // BỔ SUNG: Lấy epoch từ header
             origin: header.author.clone(),
             author: author.clone(),
             signature: Signature::default(),
@@ -144,6 +157,8 @@ impl Vote {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
+        ensure!(self.epoch == committee.epoch, DagError::InvalidEpoch);
+
         ensure!(
             committee.stake(&self.author) > 0,
             DagError::UnknownAuthority(self.author.clone())
@@ -163,6 +178,7 @@ impl Hash for Vote {
         let mut hasher = Sha512::new();
         hasher.update(self.id.as_ref());
         hasher.update(self.round.to_le_bytes());
+        hasher.update(self.epoch.to_le_bytes()); // BỔ SUNG
         hasher.update(self.origin.as_ref());
         Digest((&hasher.finalize()[..32]).try_into().unwrap())
     }
@@ -172,8 +188,9 @@ impl fmt::Debug for Vote {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: V{}({}, {})",
+            "{}: V-E{}B{}({}, {})", // BỔ SUNG
             self.digest(),
+            self.epoch,
             self.round,
             self.author,
             self.id
@@ -195,6 +212,7 @@ impl Certificate {
             .map(|name| Self {
                 header: Header {
                     author: name.clone(),
+                    epoch: committee.epoch, // BỔ SUNG: Genesis certificate phải có epoch
                     ..Header::default()
                 },
                 ..Self::default()
@@ -203,7 +221,10 @@ impl Certificate {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
-        if Self::genesis(committee).contains(self) {
+        // Genesis certs không cần verify đầy đủ.
+        if self.header.round == 0 {
+            // SỬA LỖI: Gọi epoch() như một phương thức
+            ensure!(self.epoch() == committee.epoch, DagError::InvalidEpoch);
             return Ok(());
         }
 
@@ -234,11 +255,26 @@ impl Certificate {
             })
             .collect();
 
-        Signature::verify_batch(&self.digest(), &votes_to_verify?).map_err(DagError::from)
+        // Sử dụng digest của Vote, đã bao gồm epoch
+        let vote_digest = Vote {
+            id: self.header.id.clone(),
+            round: self.round(),
+            epoch: self.epoch(),
+            origin: self.origin(),
+            author: PublicKey::default(), // Author không quan trọng khi chỉ cần digest
+            signature: Signature::default(),
+        }
+        .digest();
+
+        Signature::verify_batch(&vote_digest, &votes_to_verify?).map_err(DagError::from)
     }
 
     pub fn round(&self) -> Round {
         self.header.round
+    }
+
+    pub fn epoch(&self) -> Epoch {
+        self.header.epoch
     }
 
     pub fn origin(&self) -> PublicKey {
@@ -251,6 +287,7 @@ impl Hash for Certificate {
         let mut hasher = Sha512::new();
         hasher.update(self.header.id.as_ref());
         hasher.update(self.round().to_le_bytes());
+        hasher.update(self.epoch().to_le_bytes()); // BỔ SUNG
         hasher.update(self.origin().as_ref());
         Digest((&hasher.finalize()[..32]).try_into().unwrap())
     }
@@ -260,8 +297,9 @@ impl fmt::Debug for Certificate {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: C{}({}, {})",
+            "{}: C-E{}B{}({}, {})", // BỔ SUNG
             self.digest(),
+            self.epoch(),
             self.round(),
             self.origin(),
             self.header.id
@@ -271,9 +309,6 @@ impl fmt::Debug for Certificate {
 
 impl PartialEq for Certificate {
     fn eq(&self, other: &Self) -> bool {
-        let mut ret = self.header.id == other.header.id;
-        ret &= self.round() == other.round();
-        ret &= self.origin() == other.origin();
-        ret
+        self.digest() == other.digest()
     }
 }
