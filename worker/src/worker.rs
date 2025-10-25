@@ -11,13 +11,15 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{error, info, warn};
+// *** SỬA LỖI: Thêm import này ***
 use network::{
-    quic::QuicTransport, transport::Transport, MessageHandler, Receiver, SimpleSender, Writer,
+    quic::QuicTransport, transport::Transport, MessageHandler, Receiver as NetworkReceiver,
+    SimpleSender, Writer,
 };
-use primary::PrimaryWorkerMessage;
+use primary::{Epoch, PrimaryWorkerMessage as PrimaryToWorkerMessage}; // <-- Đổi tên để tránh xung đột
 use serde::{Deserialize, Serialize};
-use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
-use std::convert::TryInto;
+// *** SỬA LỖI: Xóa import không dùng ***
+// use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
 use std::error::Error;
 use std::sync::Arc;
 use store::Store;
@@ -31,10 +33,21 @@ pub mod worker_tests;
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
 
+// *** THAY ĐỔI: Sử dụng tên đã đổi ở trên và thêm ResetEpoch ***
+// Đổi tên enum để tránh xung đột với primary::PrimaryWorkerMessage
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub enum PrimaryWorkerMessage {
+    Synchronize(Vec<Digest>, PublicKey),
+    Cleanup(Round),
+    Reconfigure(Committee),
+    ResetEpoch(Epoch), // <-- Thêm thông điệp mới
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
     Batch(Batch),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
+    // BatchResponse(Digest, Batch), // Cân nhắc thêm loại này cho Helper
 }
 
 pub struct Worker {
@@ -53,11 +66,12 @@ impl Worker {
         parameters: Parameters,
         store: Store,
     ) {
+        // *** THAY ĐỔI: Khởi tạo committee là Arc<RwLock<...>> ***
         let committee = Arc::new(RwLock::new(initial_committee));
         let worker = Self {
             name,
             id,
-            committee,
+            committee, // Bây giờ là Arc<RwLock<Committee>>
             parameters,
             store,
         };
@@ -68,6 +82,7 @@ impl Worker {
         worker.handle_clients_transactions(&transport).await;
         worker.handle_workers_messages(&transport).await;
 
+        // Đọc committee từ Arc để lấy worker_info
         let committee_reader = worker.committee.read().await;
         let worker_info = committee_reader
             .worker(&worker.name, &worker.id)
@@ -83,13 +98,13 @@ impl Worker {
     async fn handle_primary_messages(&self, transport: &QuicTransport) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
-        let mut address = self
-            .committee
-            .read()
-            .await
+        // Đọc committee từ Arc để lấy địa chỉ
+        let committee_reader = self.committee.read().await;
+        let mut address = committee_reader
             .worker(&self.name, &self.id)
             .expect("Our public key or worker id is not in the committee")
             .primary_to_worker;
+        drop(committee_reader); // Giải phóng lock sớm
         address.set_ip("0.0.0.0".parse().unwrap());
 
         let listener = transport
@@ -97,10 +112,12 @@ impl Worker {
             .await
             .expect("Failed to create primary message listener");
 
-        Receiver::spawn(
+        NetworkReceiver::spawn(
+            // <--- Sử dụng tên đã import
             listener,
             PrimaryReceiverHandler {
                 tx_synchronizer,
+                // *** THAY ĐỔI: Clone Arc thay vì committee ***
                 committee: self.committee.clone(),
             },
         );
@@ -108,12 +125,13 @@ impl Worker {
         Synchronizer::spawn(
             self.name,
             self.id,
+            // *** THAY ĐỔI: Clone Arc ***
             self.committee.clone(),
             self.store.clone(),
             self.parameters.gc_depth,
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
-            rx_synchronizer,
+            rx_synchronizer, // rx_message của Synchronizer nhận PrimaryWorkerMessage
         );
 
         info!(
@@ -127,8 +145,9 @@ impl Worker {
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
-        let committee = self.committee.read().await;
-        let mut address = committee
+        // Đọc committee từ Arc
+        let committee_reader = self.committee.read().await;
+        let mut address = committee_reader
             .worker(&self.name, &self.id)
             .expect("Our public key or worker id is not in the committee")
             .transactions;
@@ -138,25 +157,25 @@ impl Worker {
             .listen(address)
             .await
             .expect("Failed to create transaction listener");
-        Receiver::spawn(listener, TxReceiverHandler { tx_batch_maker });
+        NetworkReceiver::spawn(listener, TxReceiverHandler { tx_batch_maker }); // <--- Sử dụng tên đã import
 
-        let primary_address = committee
+        let primary_address = committee_reader
             .primary(&self.name)
             .expect("Our public key is not in the committee")
             .worker_to_primary;
 
-        let others_workers = committee
+        let others_workers: Vec<_> = committee_reader // <-- Đảm bảo kiểu dữ liệu rõ ràng
             .others_workers(&self.name, &self.id)
             .iter()
             .map(|(name, addresses)| (*name, addresses.worker_to_worker))
             .collect();
 
-        // SỬA LỖI: Lấy stake của chính worker này
-        let stake = committee.stake(&self.name);
+        // Lấy stake của chính worker này từ committee đang lock
+        // let my_stake = committee_reader.stake(&self.name);
 
-        // SỬA LỖI: Clone committee để truyền vào QuorumWaiter
-        let committee_clone_for_quorum = committee.clone();
-        drop(committee); // Release lock
+        // *** THAY ĐỔI: Clone Arc để truyền vào QuorumWaiter ***
+        let committee_clone_for_quorum = self.committee.clone();
+        drop(committee_reader); // Release lock
 
         BatchMaker::spawn(
             self.parameters.batch_size,
@@ -166,10 +185,11 @@ impl Worker {
             others_workers,
         );
 
-        // SỬA LỖI: Truyền đủ 4 tham số
+        // *** THAY ĐỔI: Truyền Arc committee và name vào QuorumWaiter::spawn ***
         QuorumWaiter::spawn(
+            self.name, // <-- Thêm name
             committee_clone_for_quorum,
-            stake,
+            // my_stake, // Loại bỏ stake cố định
             rx_quorum_waiter,
             tx_processor,
         );
@@ -180,7 +200,7 @@ impl Worker {
             rx_processor,
             SimpleSender::new(),
             primary_address,
-            true,
+            /* own_digest */ true, // Tạo digest cho batch của chính mình
         );
 
         info!(
@@ -193,8 +213,9 @@ impl Worker {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
-        let committee = self.committee.read().await;
-        let mut address = committee
+        // Đọc committee từ Arc
+        let committee_reader = self.committee.read().await;
+        let mut address = committee_reader
             .worker(&self.name, &self.id)
             .expect("Our public key or worker id is not in the committee")
             .worker_to_worker;
@@ -204,7 +225,8 @@ impl Worker {
             .listen(address)
             .await
             .expect("Failed to create worker message listener");
-        Receiver::spawn(
+        NetworkReceiver::spawn(
+            // <--- Sử dụng tên đã import
             listener,
             WorkerReceiverHandler {
                 tx_helper,
@@ -212,16 +234,16 @@ impl Worker {
             },
         );
 
-        // SỬA LỖI: Clone committee để truyền vào Helper
-        let committee_clone_for_helper = committee.clone();
+        // *** THAY ĐỔI: Clone Arc committee để truyền vào Helper ***
+        let committee_clone_for_helper = self.committee.clone();
 
-        let primary_address = committee
+        let primary_address = committee_reader
             .primary(&self.name)
             .expect("Our public key is not in the committee")
             .worker_to_primary;
-        drop(committee); // Release lock
+        drop(committee_reader); // Release lock
 
-        // SỬA LỖI: Truyền committee đã clone
+        // *** THAY ĐỔI: Truyền Arc committee đã clone vào Helper::spawn ***
         Helper::spawn(
             self.id,
             committee_clone_for_helper,
@@ -235,7 +257,8 @@ impl Worker {
             rx_processor,
             SimpleSender::new(),
             primary_address,
-            false,
+            /* own_digest */
+            false, // Không tạo digest cho batch của người khác
         );
 
         info!(
@@ -253,13 +276,18 @@ struct TxReceiverHandler {
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
-        let payload = &message;
-        info!(target: "payload_logger", "{}", hex::encode(payload));
+        // The message contains a string identifying the transaction (its digest).
+        // It is safe to assume that this is correct since it comes from our own batch maker.
+        let tx = message.to_vec(); // message is Vec<u8> (Transaction)
+        if tx.is_empty() {
+            warn!("Received empty transaction!");
+            return Ok(());
+        }
+        info!(target: "payload_logger", "{}", hex::encode(&tx));
         self.tx_batch_maker
-            .send(payload.to_vec())
+            .send(tx)
             .await
-            .expect("Failed to send transaction payload");
-
+            .expect("Failed to send transaction");
         Ok(())
     }
 }
@@ -273,16 +301,22 @@ struct WorkerReceiverHandler {
 #[async_trait]
 impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
+        // Reply with an ACK.
         let _ = writer.send(Bytes::from("Ack")).await;
+
+        // Deserialize the message.
         match bincode::deserialize(&serialized) {
             Ok(WorkerMessage::Batch(batch)) => {
-                let message = WorkerMessage::Batch(batch);
-                let serialized =
-                    bincode::serialize(&message).expect("Failed to serialize our own batch");
-                let digest = Digest(Sha512::digest(&serialized)[..32].try_into().unwrap());
-                info!("WorkerMessage Batch {:?} ", digest);
+                // Đây là batch nhận được từ worker khác.
+                // Chúng ta cần serialize lại *toàn bộ* WorkerMessage::Batch(batch)
+                // để Processor tính digest và lưu trữ đúng cách.
+                let message_to_process = WorkerMessage::Batch(batch);
+                // Serialize lại để gửi cho Processor
+                let serialized_for_processor = bincode::serialize(&message_to_process)
+                    .expect("Failed to serialize received batch message");
+
                 self.tx_processor
-                    .send(serialized.to_vec())
+                    .send(serialized_for_processor)
                     .await
                     .expect("Failed to send batch")
             }
@@ -291,6 +325,7 @@ impl MessageHandler for WorkerReceiverHandler {
                 .send((missing, requestor))
                 .await
                 .expect("Failed to send batch request"),
+            // Ok(WorkerMessage::BatchResponse(..)) => { /* Xử lý nếu cần */ }
             Err(e) => warn!("Serialization error: {}", e),
         }
         Ok(())
@@ -299,7 +334,8 @@ impl MessageHandler for WorkerReceiverHandler {
 
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
-    tx_synchronizer: Sender<PrimaryWorkerMessage>,
+    tx_synchronizer: Sender<PrimaryWorkerMessage>, // <-- Kiểu dữ liệu đúng
+    // *** THAY ĐỔI: Sử dụng Arc<RwLock<Committee>> ***
     committee: Arc<RwLock<Committee>>,
 }
 
@@ -310,21 +346,65 @@ impl MessageHandler for PrimaryReceiverHandler {
         _writer: &mut Writer,
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
-        match bincode::deserialize(&serialized) {
-            Err(e) => error!("Failed to deserialize primary message: {}", e),
-            Ok(message) => {
-                if let PrimaryWorkerMessage::Reconfigure(new_committee) = &message {
-                    info!("Worker received reconfigure signal from primary.");
-                    let mut committee_lock = self.committee.write().await;
-                    *committee_lock = new_committee.clone();
-                    info!("Worker committee updated.");
-                }
-                self.tx_synchronizer
-                    .send(message)
-                    .await
-                    .expect("Failed to send message to synchronizer")
+        // Deserialize the message using the *correct* enum type from primary
+        let message: PrimaryToWorkerMessage = match bincode::deserialize(&serialized) {
+            Ok(msg) => msg,
+            Err(e) => {
+                error!("Failed to deserialize primary message: {}", e);
+                // Không gửi message lỗi đi đâu cả, chỉ log lỗi
+                return Ok(()); // Trả về Ok để không đóng kết nối
             }
-        }
+        };
+
+        // Chuyển đổi sang kiểu enum cục bộ của worker nếu cần (hoặc dùng trực tiếp nếu trùng)
+        // Hiện tại cấu trúc gần giống nhau, chỉ cần khớp tên variant
+        let worker_internal_message = match message {
+            PrimaryToWorkerMessage::Synchronize(d, p) => PrimaryWorkerMessage::Synchronize(d, p),
+            PrimaryToWorkerMessage::Cleanup(r) => PrimaryWorkerMessage::Cleanup(r),
+            PrimaryToWorkerMessage::Reconfigure(new_committee) => {
+                info!(
+                    "Worker received reconfigure signal from primary for epoch {}.",
+                    new_committee.epoch
+                );
+                let new_epoch = new_committee.epoch; // Lấy epoch mới trước khi move committee
+
+                // *** THAY ĐỔI: Lock và cập nhật committee trong Arc ***
+                {
+                    // Tạo scope riêng cho write lock
+                    let mut committee_lock = self.committee.write().await;
+                    *committee_lock = new_committee.clone(); // Cập nhật committee dùng chung
+                    info!(
+                        "Worker committee updated to epoch {}.",
+                        committee_lock.epoch
+                    );
+                } // Lock được giải phóng ở đây
+
+                // Gửi message Reconfigure gốc đến Synchronizer
+                self.tx_synchronizer
+                    .send(PrimaryWorkerMessage::Reconfigure(new_committee)) // Gửi Reconfigure trước
+                    .await
+                    .expect("Failed to send Reconfigure message to synchronizer");
+
+                // *** THAY ĐỔI: Gửi thêm message ResetEpoch ***
+                info!(
+                    "Sending ResetEpoch signal for epoch {} to synchronizer.",
+                    new_epoch
+                );
+                self.tx_synchronizer
+                    .send(PrimaryWorkerMessage::ResetEpoch(new_epoch)) // Gửi ResetEpoch sau
+                    .await
+                    .expect("Failed to send ResetEpoch message to synchronizer");
+
+                return Ok(()); // Kết thúc sớm vì đã xử lý và gửi message cần thiết
+            }
+        };
+
+        // Gửi các message khác (Synchronize, Cleanup) đến Synchronizer
+        self.tx_synchronizer
+            .send(worker_internal_message)
+            .await
+            .expect("Failed to send message to synchronizer");
+
         Ok(())
     }
 }

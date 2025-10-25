@@ -10,7 +10,7 @@ use crate::helper::Helper;
 use crate::messages::{Certificate, Header, Vote};
 use crate::proposer::Proposer;
 use crate::synchronizer::Synchronizer;
-use crate::Round; // SỬA LỖI: Xóa 'Epoch' không sử dụng
+use crate::Round;
 use async_trait::async_trait;
 use bytes::Bytes;
 use config::{Committee, NodeConfig, Parameters, WorkerId};
@@ -26,15 +26,17 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use store::Store;
+// THAY ĐỔI: Dùng broadcast::Sender cho reconfigure
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
-use tokio::sync::RwLock; // SỬA LỖI: Thay đổi đường dẫn import
+use tokio::sync::RwLock;
 pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 pub type PendingBatches = Arc<DashMap<Digest, (WorkerId, Round)>>;
 pub type CommittedBatches = Arc<DashMap<Digest, Round>>;
 
 pub const CHANNEL_CAPACITY: usize = 1_000;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)] // THAY ĐỔI: Thêm Clone
 pub struct ReconfigureNotification {
     pub round: Round,
     pub committee: Committee,
@@ -116,7 +118,8 @@ impl Primary {
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
-        tx_reconfigure: Sender<ReconfigureNotification>,
+        // THAY ĐỔI: Nhận broadcast::Sender
+        tx_reconfigure: broadcast::Sender<ReconfigureNotification>,
         epoch_transitioning: Arc<AtomicBool>,
     ) {
         let payload_cache: PayloadCache = Arc::new(DashMap::new());
@@ -140,12 +143,22 @@ impl Primary {
         let consensus_round = Arc::new(AtomicU64::new(0));
         let transport = QuicTransport::new();
 
+        // *** THAY ĐỔI BẮT ĐẦU: Tạo các subscription cho tất cả component ***
+        let rx_reconfigure_for_core = tx_reconfigure.subscribe();
+        let rx_reconfigure_for_gc = tx_reconfigure.subscribe();
+        let rx_reconfigure_for_proposer = tx_reconfigure.subscribe();
+        let rx_reconfigure_for_hw = tx_reconfigure.subscribe();
+        let rx_reconfigure_for_cw = tx_reconfigure.subscribe();
+        let rx_reconfigure_for_helper = tx_reconfigure.subscribe();
+        // *** THAY ĐỔI KẾT THÚC ***
+
         tokio::spawn(async move {
             let committee_guard = committee.read().await;
 
             let primary_address = committee_guard.primary(&name).unwrap().primary_to_primary;
             let mut listen_address = primary_address;
             listen_address.set_ip("0.0.0.0".parse().unwrap());
+            // Lỗi "AddrInUse" xảy ra ở đây
             let primary_listener = transport.listen(listen_address).await.unwrap();
             NetworkReceiver::spawn(
                 primary_listener,
@@ -182,6 +195,7 @@ impl Primary {
 
             let signature_service = SignatureService::new(consensus_secret);
 
+            // *** THAY ĐỔI BẮT ĐẦU: Truyền Receiver vào Core::spawn ***
             Core::spawn(
                 name,
                 committee.clone(),
@@ -196,10 +210,13 @@ impl Primary {
                 rx_proposer,
                 tx_consensus,
                 tx_parents,
-                tx_reconfigure,
-                epoch_transitioning.clone(), // Truyền cờ vào Core
+                tx_reconfigure,          // THAY ĐỔI: Truyền broadcast::Sender
+                rx_reconfigure_for_core, // <-- THAM SỐ MỚI
+                epoch_transitioning.clone(),
             );
+            // *** THAY ĐỔI KẾT THÚC ***
 
+            // *** THAY ĐỔI BẮT ĐẦU: Truyền Receiver vào GarbageCollector::spawn ***
             GarbageCollector::spawn(
                 name,
                 committee.clone(),
@@ -210,8 +227,11 @@ impl Primary {
                 committed_batches.clone(),
                 rx_consensus,
                 tx_repropose,
+                rx_reconfigure_for_gc, // <-- THAM SỐ MỚI
             );
+            // *** THAY ĐỔI KẾT THÚC ***
 
+            // *** THAY ĐỔI BẮT ĐẦU: Truyền Receiver vào Proposer::spawn ***
             Proposer::spawn(
                 name,
                 committee.clone(),
@@ -221,13 +241,16 @@ impl Primary {
                 parameters.max_header_delay,
                 pending_batches.clone(),
                 committed_batches.clone(),
-                epoch_transitioning.clone(), // Truyền cờ vào Proposer
+                epoch_transitioning.clone(),
                 rx_parents,
                 rx_workers,
                 rx_repropose,
                 tx_headers,
+                rx_reconfigure_for_proposer, // <-- THAM SỐ MỚI
             );
+            // *** THAY ĐỔI KẾT THÚC ***
 
+            // *** THAY ĐỔI BẮT ĐẦU: Truyền Receiver vào HeaderWaiter::spawn ***
             HeaderWaiter::spawn(
                 name,
                 committee.clone(),
@@ -238,15 +261,27 @@ impl Primary {
                 parameters.sync_retry_nodes,
                 rx_sync_headers,
                 tx_headers_loopback,
+                rx_reconfigure_for_hw, // <-- THAM SỐ MỚI
             );
+            // *** THAY ĐỔI KẾT THÚC ***
 
+            // *** THAY ĐỔI BẮT ĐẦU: Truyền Receiver vào CertificateWaiter::spawn ***
             CertificateWaiter::spawn(
                 store.clone(),
                 rx_sync_certificates,
                 tx_certificates_loopback,
+                rx_reconfigure_for_cw, // <-- THAM SỐ MỚI
             );
+            // *** THAY ĐỔI KẾT THÚC ***
 
-            Helper::spawn(committee.clone(), store, rx_helper_requests);
+            // *** THAY ĐỔI BẮT ĐẦU: Truyền Receiver vào Helper::spawn ***
+            Helper::spawn(
+                committee.clone(),
+                store,
+                rx_helper_requests,
+                rx_reconfigure_for_helper, // <-- THAM SỐ MỚI
+            );
+            // *** THAY ĐỔI KẾT THÚC ***
 
             info!(
                 "Primary {} successfully booted on {}",

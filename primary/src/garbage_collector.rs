@@ -2,17 +2,20 @@
 
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::Certificate;
-use crate::primary::{CommittedBatches, PendingBatches, PrimaryWorkerMessage};
+use crate::primary::{
+    CommittedBatches, PendingBatches, PrimaryWorkerMessage, ReconfigureNotification,
+}; // <-- THÊM ReconfigureNotification
 use crate::Round;
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
-use log::{debug, warn};
+use log::{debug, info, warn}; // <-- THÊM info
 use network::SimpleSender;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use store::Store;
+use tokio::sync::broadcast; // <-- THÊM
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
 use tokio::time::{interval, Duration};
@@ -29,6 +32,8 @@ pub struct GarbageCollector {
     committed_batches: CommittedBatches,
     rx_consensus: Receiver<Certificate>,
     tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
+    // *** THAY ĐỔI: Thêm Receiver ***
+    rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     network: SimpleSender,
     store: Store,
 }
@@ -45,6 +50,8 @@ impl GarbageCollector {
         committed_batches: CommittedBatches,
         rx_consensus: Receiver<Certificate>,
         tx_repropose: Sender<(Digest, WorkerId, Vec<u8>)>,
+        // *** THAY ĐỔI: Thêm tham số mới ***
+        rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -56,6 +63,8 @@ impl GarbageCollector {
                 committed_batches,
                 rx_consensus,
                 tx_repropose,
+                // *** THAY ĐỔI: Khởi tạo trường mới ***
+                rx_reconfigure,
                 network: SimpleSender::new(),
                 store,
             }
@@ -80,17 +89,21 @@ impl GarbageCollector {
 
                     // Lấy worker addresses từ committee được chia sẻ
                     let committee = self.committee.read().await;
-                    let worker_addresses: Vec<SocketAddr> = committee
-                        .our_workers(&self.name)
-                        .expect("Our public key or worker id is not in the committee")
-                        .iter()
-                        .map(|x| x.primary_to_worker)
-                        .collect();
-                    drop(committee);
 
-                    let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
-                        .expect("Failed to serialize Cleanup message");
-                    self.network.broadcast(worker_addresses, Bytes::from(bytes)).await;
+                    // *** THAY ĐỔI: Chỉ gửi Cleanup nếu epoch khớp ***
+                    if certificate.epoch() == committee.epoch {
+                        let worker_addresses: Vec<SocketAddr> = committee
+                            .our_workers(&self.name)
+                            .expect("Our public key or worker id is not in the committee")
+                            .iter()
+                            .map(|x| x.primary_to_worker)
+                            .collect();
+
+                        let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
+                            .expect("Failed to serialize Cleanup message");
+                        self.network.broadcast(worker_addresses, Bytes::from(bytes)).await;
+                    }
+                    drop(committee); // Giải phóng lock
                 },
 
                 _ = gc_timer.tick() => {
@@ -126,7 +139,30 @@ impl GarbageCollector {
                             }
                         }
                     }
+                },
+
+                // *** SỬA ĐỔI BẮT ĐẦU: Sửa nhánh reconfigure ***
+                result = self.rx_reconfigure.recv() => {
+                    match result {
+                        Ok(_notification) => {
+                            // Đọc ủy ban MỚI NHẤT từ Arc để log
+                            let new_committee = self.committee.read().await;
+                            let new_epoch = new_committee.epoch;
+                            drop(new_committee);
+
+                            info!("GarbageCollector received reconfigure for epoch {}. Clearing batch caches.", new_epoch);
+                            self.pending_batches.clear();
+                            self.committed_batches.clear();
+                        },
+                        Err(e) => {
+                            warn!("Reconfigure channel error in GarbageCollector: {}", e);
+                             if e == broadcast::error::RecvError::Closed {
+                                break; // Thoát vòng lặp nếu kênh bị đóng
+                            }
+                        }
+                    }
                 }
+                // *** SỬA ĐỔI KẾT THÚC ***
             }
         }
     }

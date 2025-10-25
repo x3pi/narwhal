@@ -9,12 +9,15 @@ use config::Export as _;
 use config::Import as _;
 use config::{Committee, NodeConfig, Parameters, WorkerId};
 use config::{Validator, ValidatorInfo};
-use consensus::{Bullshark, ConsensusProtocol, ConsensusState, STATE_KEY};
-use consensus::{CommittedSubDag, Consensus};
+use consensus::CommittedSubDag;
+use consensus::{Consensus, ConsensusState, STATE_KEY};
 use crypto::Hash as _;
 use env_logger::Env;
-use log::{error, info, warn};
-use primary::{Core, Primary, ReconfigureNotification, Round};
+// THAY ĐỔI: Xóa `trace` không dùng
+use log::{debug, error, info, warn};
+use network::SimpleSender;
+use primary::PrimaryWorkerMessage;
+use primary::{core::RECONFIGURE_INTERVAL, Core, Primary, ReconfigureNotification, Round};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,7 +27,6 @@ use store::Store;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::sync::broadcast;
-use tokio::sync::mpsc::{channel, Receiver};
 use tokio::sync::RwLock;
 use tokio::time::sleep;
 use worker::{Worker, WorkerMessage};
@@ -45,7 +47,6 @@ pub const CHANNEL_CAPACITY: usize = 10_000;
 #[derive(Clone, Debug)]
 enum Shutdown {
     Now,
-    Finalize(u64), // u64 là epoch cần được chốt sổ
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -68,6 +69,7 @@ struct SharedNodeState {
     parameters: Parameters,
 }
 
+// --- Các hàm fetch_validators_via_uds, load_consensus_state giữ nguyên ---
 async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Result<ValidatorInfo> {
     log::info!(
         "Attempting to fetch validator list for block {} from UDS: {}",
@@ -162,6 +164,7 @@ async fn load_consensus_state(store: &mut Store) -> ConsensusState {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // --- Phần parse arguments giữ nguyên ---
     let matches = App::new(crate_name!())
         .version(crate_version!())
         .about("A research implementation of Narwhal and Tusk.")
@@ -206,13 +209,14 @@ async fn main() -> Result<()> {
         ("generate_keys", Some(sub_matches)) => NodeConfig::new()
             .export(sub_matches.value_of("filename").unwrap())
             .context("Failed to generate key pair")?,
-        ("run", Some(sub_matches)) => run(sub_matches).await?,
+        ("run", Some(sub_matches)) => setup_and_run(sub_matches).await?,
         _ => unreachable!(),
     }
     Ok(())
 }
 
-async fn run(matches: &ArgMatches<'_>) -> Result<()> {
+async fn setup_and_run(matches: &ArgMatches<'_>) -> Result<()> {
+    // --- Phần khởi tạo config, store giữ nguyên ---
     let key_file = matches.value_of("keys").unwrap();
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();
@@ -227,39 +231,33 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let store = Store::new(store_path).context("Failed to create a store")?;
     let epoch_transitioning = Arc::new(AtomicBool::new(false));
 
-    let (run_mode, shared_state) = match matches.subcommand() {
-        ("primary", _) => {
-            let initial_committee =
-                load_initial_committee(matches, &mut store.clone(), &node_config).await?;
-            let state = SharedNodeState {
-                committee: Arc::new(RwLock::new(initial_committee)),
-                store,
-                node_config,
-                parameters,
-            };
-            (RunMode::Primary, state)
-        }
+    // --- Tải committee ban đầu ---
+    let initial_committee =
+        load_initial_committee(matches, &mut store.clone(), &node_config).await?;
+    let shared_state = SharedNodeState {
+        committee: Arc::new(RwLock::new(initial_committee)),
+        store,
+        node_config,
+        parameters,
+    };
+
+    // Xác định RunMode
+    let run_mode = match matches.subcommand() {
+        ("primary", _) => RunMode::Primary,
         ("worker", Some(sub_matches)) => {
             let id_str = sub_matches.value_of("id").unwrap();
             let id = id_str
                 .parse::<WorkerId>()
                 .context(format!("'{}' is not a valid worker id", id_str))?;
-            let initial_committee =
-                load_initial_committee(matches, &mut store.clone(), &node_config).await?;
-            let state = SharedNodeState {
-                committee: Arc::new(RwLock::new(initial_committee)),
-                store,
-                node_config,
-                parameters,
-            };
-            (RunMode::Worker(id), state)
+            RunMode::Worker(id)
         }
         _ => unreachable!(),
     };
 
-    run_loop(shared_state, matches, run_mode, epoch_transitioning).await
+    run_hot_swap(shared_state, matches, run_mode, epoch_transitioning).await
 }
 
+// --- Hàm load_initial_committee và fetch_committee_from_uds giữ nguyên ---
 async fn load_initial_committee(
     matches: &ArgMatches<'_>,
     store: &mut Store,
@@ -275,19 +273,10 @@ async fn load_initial_committee(
             Committee::import(filename).context("Failed to load committee from file")?;
         if committee.epoch == 0 {
             committee.epoch = 1;
+            info!("Committee file has epoch 0, setting to 1.");
         }
         Ok(committee)
     } else {
-        // if let Some(filename) = committee_file {
-        //     info!("[New Branch] Loading committee from file: {}", filename);
-        //     let mut committee =
-        //         Committee::import(filename).context("Failed to load committee from file")?;
-        //     if committee.epoch == 0 {
-        //         committee.epoch = 1;
-        //     }
-        //     return Ok(committee);
-        // }
-
         info!("Fetching committee via UDS for initial load.");
         let socket_path = matches
             .value_of("uds-socket")
@@ -301,14 +290,24 @@ async fn load_initial_committee(
 
         let current_epoch_start_round =
             Core::calculate_last_reconfiguration_round(consensus_state.last_committed_round);
-        let block_number = if current_epoch_start_round > 0 {
-            (current_epoch_start_round / 2) - 1
+        let block_number_to_fetch = if current_epoch_start_round > 0 {
+            current_epoch_start_round / 2
         } else {
             0
         };
+        let epoch_to_load = block_number_to_fetch + 1;
 
-        let epoch = block_number + 1;
-        fetch_committee_from_uds(socket_path, block_number, node_config, epoch).await
+        info!(
+            "Fetching committee for epoch {} (based on block number {})",
+            epoch_to_load, block_number_to_fetch
+        );
+        fetch_committee_from_uds(
+            socket_path,
+            block_number_to_fetch,
+            node_config,
+            epoch_to_load,
+        )
+        .await
     }
 }
 
@@ -341,8 +340,8 @@ async fn fetch_committee_from_uds(
                     }
                     Err(e) => {
                         error!(
-                            "Failed to parse committee data for block {}: {}. Retrying in {} ms...",
-                            block_number, e, RETRY_DELAY_MS
+                            "Failed to parse committee data for epoch {} (block {}): {}. Retrying in {} ms...",
+                           epoch, block_number, e, RETRY_DELAY_MS
                         );
                         sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
                     }
@@ -359,258 +358,350 @@ async fn fetch_committee_from_uds(
     }
 }
 
-async fn run_loop(
-    mut shared_state: SharedNodeState,
+// ########################################################################
+// #                      HÀM `run_hot_swap`                             #
+// ########################################################################
+async fn run_hot_swap(
+    shared_state: SharedNodeState,
     matches: &ArgMatches<'_>,
     run_mode: RunMode,
     epoch_transitioning: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut current_committee = shared_state.committee.read().await.clone();
+    // --- Tạo các kênh giao tiếp vĩnh viễn ---
+    let (tx_reconfigure, mut rx_reconfigure_main) =
+        broadcast::channel::<ReconfigureNotification>(1);
+    // THAY ĐỔI: Xóa `mut` không cần thiết
+    let rx_reconfigure_analyze = tx_reconfigure.subscribe();
 
-    'epoch_loop: loop {
-        let (tx_reconfigure, mut rx_reconfigure) = channel::<ReconfigureNotification>(1);
-        let (tx_shutdown, _) = broadcast::channel::<Shutdown>(1);
-        let (tx_output, rx_output) =
-            channel::<(Vec<CommittedSubDag>, Committee, Option<Round>)>(CHANNEL_CAPACITY);
+    // *** THAY ĐỔI BẮT ĐẦU: Tạo subscription cho Consensus ***
+    let rx_reconfigure_for_consensus = tx_reconfigure.subscribe();
+    // *** THAY ĐỔI KẾT THÚC ***
 
-        if let RunMode::Primary = run_mode {
-            tokio::spawn(analyze(
-                rx_output,
-                shared_state.store.clone(),
-                shared_state.node_config.clone(),
-                tx_shutdown.subscribe(),
-            ));
-        }
+    let (tx_shutdown, rx_shutdown_for_analyze) = broadcast::channel::<Shutdown>(1);
+    let mut rx_shutdown_main = tx_shutdown.subscribe();
 
-        let is_in_committee = current_committee
-            .authorities
-            .contains_key(&shared_state.node_config.name);
-        let role = if is_in_committee {
-            NodeRole::Validator
-        } else {
-            NodeRole::Follower
-        };
+    let (tx_output, _rx_dummy) =
+        broadcast::channel::<(Vec<CommittedSubDag>, Committee, Option<Round>)>(CHANNEL_CAPACITY);
+    let rx_output_for_analyze = tx_output.subscribe();
 
-        if role == NodeRole::Validator {
-            info!(
-                "Starting Validator tasks for epoch {}...",
-                current_committee.epoch
-            );
-            if let RunMode::Primary = run_mode {
-                let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
-                let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
+    // --- Khởi chạy các service MỘT LẦN ---
+    info!("Spawning all services for long-running (hot-swap) mode...");
+    let committee_arc = shared_state.committee.clone();
+    let initial_committee = committee_arc.read().await.clone();
 
-                shared_state.store.write(STATE_KEY.to_vec(), vec![]).await;
+    // 1. Khởi chạy Analyze (nếu là Primary)
+    if let RunMode::Primary = run_mode {
+        // THAY ĐỔI: Truyền cả tx_shutdown vào analyze
+        let tx_shutdown_clone = tx_shutdown.clone();
+        tokio::spawn(analyze_hot_swap(
+            rx_reconfigure_analyze,
+            rx_output_for_analyze,
+            shared_state.store.clone(),
+            shared_state.node_config.clone(),
+            rx_shutdown_for_analyze,
+            tx_shutdown_clone, // Truyền Sender vào
+        ));
+    }
+
+    // 2. Xác định vai trò (Validator / Follower)
+    let is_in_committee = initial_committee
+        .authorities
+        .contains_key(&shared_state.node_config.name);
+    let role = if is_in_committee {
+        NodeRole::Validator
+    } else {
+        NodeRole::Follower
+    };
+
+    // 3. Khởi chạy các service theo vai trò
+    if role == NodeRole::Validator {
+        info!(
+            "Starting Validator tasks for epoch {}...",
+            initial_committee.epoch
+        );
+        match run_mode {
+            RunMode::Primary => {
+                let (tx_new_certificates, rx_new_certificates) =
+                    tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+                let (tx_feedback, rx_feedback) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
 
                 Primary::spawn(
                     shared_state.node_config.clone(),
-                    shared_state.committee.clone(),
+                    committee_arc.clone(),
                     shared_state.parameters.clone(),
                     shared_state.store.clone(),
-                    tx_new_certificates,
+                    tx_new_certificates.clone(),
                     rx_feedback,
                     tx_reconfigure.clone(),
                     epoch_transitioning.clone(),
                 );
 
+                // *** THAY ĐỔI BẮT ĐẦU: Truyền rx_reconfigure_for_consensus vào Consensus::spawn ***
                 Consensus::spawn(
-                    shared_state.committee.clone(),
-                    shared_state.parameters.gc_depth,
+                    committee_arc.clone(),
+                    shared_state.parameters.clone(),
                     shared_state.store.clone(),
                     rx_new_certificates,
                     tx_feedback,
                     tx_output.clone(),
-                    ConsensusProtocol::Bullshark(Bullshark::new(
-                        current_committee.clone(),
-                        shared_state.parameters.gc_depth,
-                    )),
+                    rx_reconfigure_for_consensus, // <-- THAM SỐ MỚI
                 );
-            } else if let RunMode::Worker(id) = run_mode {
+                // *** THAY ĐỔI KẾT THÚC ***
+            }
+            RunMode::Worker(id) => {
                 Worker::spawn(
                     shared_state.node_config.name,
                     id,
-                    current_committee.clone(),
+                    initial_committee.clone(),
                     shared_state.parameters.clone(),
                     shared_state.store.clone(),
                 )
                 .await;
             }
-        } else {
-            info!(
-                "Starting Follower (StateSyncer) tasks for epoch {}...",
-                current_committee.epoch
-            );
-            StateSyncer::spawn(
-                shared_state.node_config.name,
-                shared_state.committee.clone(),
-                shared_state.store.clone(),
-                tx_shutdown.subscribe(),
-            );
-
-            let mut rx_shutdown = tx_shutdown.subscribe();
-            if let Ok(Shutdown::Now) = rx_shutdown.recv().await {}
-            break 'epoch_loop;
         }
-
-        if run_mode == RunMode::Primary {
-            let notification = rx_reconfigure.recv().await.unwrap();
-            let old_epoch = notification.committee.epoch;
-
-            info!(
-                "Received reconfigure notification for end of epoch {} (at round {}). Entering wind-down period.",
-                old_epoch, notification.round
-            );
-            epoch_transitioning.store(true, Ordering::SeqCst);
-
-            // SỬA ĐỔI: Logic chờ một round rỗng được commit sau round 100.
-            info!(
-                "Winding down epoch {}: Waiting for an empty round >= {} to be committed...",
-                old_epoch, notification.round
-            );
-            loop {
-                let consensus_state = load_consensus_state(&mut shared_state.store.clone()).await;
-                if consensus_state.last_committed_round >= notification.round {
-                    let committed_round = consensus_state.last_committed_round;
-                    if let Some(certs_in_round) = consensus_state.dag.get(&committed_round) {
-                        let is_payload_empty = certs_in_round
-                            .values()
-                            .all(|(_, cert)| cert.header.payload.is_empty());
-                        if is_payload_empty {
-                            info!(
-                                 "Epoch {} successfully wound down. Detected empty commit at round {}.",
-                                 old_epoch, committed_round
-                             );
-                            break;
-                        }
-                    }
-                }
-                sleep(Duration::from_millis(500)).await;
-            }
-            // KẾT THÚC SỬA ĐỔI
-
-            info!("[ANALYZE] Sending Finalize signal for epoch {}.", old_epoch);
-            if tx_shutdown.send(Shutdown::Finalize(old_epoch)).is_err() {
-                warn!("[ANALYZE] Failed to send Finalize signal: No active receivers.");
-            }
-
-            drop(tx_output);
-
-            sleep(Duration::from_millis(2000)).await;
-
-            info!("Starting transition to new epoch...");
-            let new_epoch = old_epoch + 1;
-            let block_number_to_fetch = (notification.round / 2) - 1;
-
-            let new_committee = fetch_committee_from_uds(
-                matches.value_of("uds-socket").unwrap(),
-                block_number_to_fetch,
-                &shared_state.node_config,
-                new_epoch,
-            )
-            .await?;
-
-            if new_committee.authorities.is_empty()
-                || !new_committee
-                    .authorities
-                    .contains_key(&shared_state.node_config.name)
-            {
-                warn!(
-                    "Node is no longer in the committee for epoch {}. Shutting down.",
-                    new_epoch
-                );
-                let _ = tx_shutdown.send(Shutdown::Now);
-                break 'epoch_loop;
-            }
-
-            {
-                let mut committee_guard = shared_state.committee.write().await;
-                *committee_guard = new_committee.clone();
-            }
-            current_committee = new_committee;
-
-            epoch_transitioning.store(false, Ordering::SeqCst);
-            info!(
-                "Transition complete. Restarting components for new epoch {}.",
-                current_committee.epoch
-            );
-        } else {
-            let mut rx_shutdown = tx_shutdown.subscribe();
-            if let Ok(_) = rx_shutdown.recv().await {
-                info!("Worker received shutdown signal. Restarting for new epoch.");
-            }
-        }
+    } else {
+        info!(
+            "Starting Follower (StateSyncer) tasks for epoch {}...",
+            initial_committee.epoch
+        );
+        StateSyncer::spawn(
+            shared_state.node_config.name,
+            committee_arc.clone(),
+            shared_state.store.clone(),
+            tx_shutdown.subscribe(),
+        );
     }
-    Ok(())
-}
+    info!("All services spawned and running.");
 
-async fn analyze(
-    mut rx_output: Receiver<(Vec<CommittedSubDag>, Committee, Option<Round>)>,
-    mut store: Store,
-    node_config: NodeConfig,
-    mut rx_shutdown: broadcast::Receiver<Shutdown>,
-) {
-    let mut epoch_buffers: HashMap<u64, Vec<CommittedSubDag>> = HashMap::new();
-
-    if node_config.uds_block_path.is_empty() {
-        warn!("[ANALYZE] uds_block_path is not configured. Committed blocks will be discarded.");
-        let _ = rx_shutdown.recv().await;
-        return;
-    }
-    let socket_path = node_config.uds_block_path.clone();
+    // --- Vòng lặp `run` MỚI ---
+    let mut network_sender = SimpleSender::new();
 
     loop {
         tokio::select! {
-            Some((dags, committee, skipped_round_option)) = rx_output.recv() => {
-                 if let Some(skipped_round) = skipped_round_option {
-                    info!(
-                        "[ANALYZE] Sending empty block for skipped epoch {} at height {}.",
-                        committee.epoch, skipped_round
-                    );
-                    let empty_block = comm::CommittedBlock {
-                        epoch: committee.epoch,
-                        height: skipped_round,
-                        transactions: Vec::new(),
-                    };
-                    let epoch_data = comm::CommittedEpochData {
-                        blocks: vec![empty_block],
-                    };
-                    send_to_uds(epoch_data, &socket_path).await;
-                } else if !dags.is_empty() {
-                    epoch_buffers
-                        .entry(committee.epoch)
-                        .or_default()
-                        .extend(dags);
+            // 1. Lắng nghe tín hiệu Reconfigure từ Core
+            result = rx_reconfigure_main.recv() => {
+                match result {
+                    Ok(notification) => {
+                        let old_epoch = notification.committee.epoch;
+                        info!(
+                            "Received reconfigure signal for end of epoch {} (at round {}).",
+                             old_epoch, notification.round
+                        );
+
+                        epoch_transitioning.store(true, Ordering::SeqCst);
+
+                        let new_epoch = old_epoch + 1;
+                        let block_number_to_fetch = if notification.round > 0 {
+                             (notification.round / RECONFIGURE_INTERVAL) * RECONFIGURE_INTERVAL / 2
+                        } else { 0 };
+
+                        let uds_socket_path = matches.value_of("uds-socket")
+                            .context("UDS socket path is required for reconfiguration")?;
+
+                        let new_committee = match fetch_committee_from_uds(
+                            uds_socket_path,
+                            block_number_to_fetch,
+                            &shared_state.node_config,
+                            new_epoch,
+                        ).await {
+                            Ok(c) => c,
+                            Err(e) => {
+                                error!("FATAL: Failed to fetch new committee: {}. Shutting down.", e);
+                                let _ = tx_shutdown.send(Shutdown::Now);
+                                break;
+                            }
+                        };
+
+                        info!("Successfully fetched new committee for epoch {}", new_epoch);
+
+                        {
+                            let mut committee_guard = committee_arc.write().await;
+                            *committee_guard = new_committee.clone();
+                            info!("Updated shared committee Arc to epoch {}", new_epoch);
+                        }
+
+                        info!("Broadcasting PrimaryWorkerMessage::Reconfigure to all workers...");
+                        let reconfigure_msg = PrimaryWorkerMessage::Reconfigure(new_committee.clone());
+                        let bytes = bincode::serialize(&reconfigure_msg)
+                            .expect("Failed to serialize reconfigure message");
+
+                        match new_committee.our_workers(&shared_state.node_config.name) {
+                            Ok(worker_addrs) => {
+                                let addresses: Vec<_> = worker_addrs
+                                    .iter()
+                                    .map(|addr| addr.primary_to_worker)
+                                    .collect();
+                                network_sender.broadcast(addresses, bytes.into()).await;
+                                info!("Reconfigure message sent to workers.");
+                            },
+                            Err(e) => {
+                                warn!("Could not find own workers in new committee: {}. Node may be shutting down.", e);
+                                if !new_committee.authorities.contains_key(&shared_state.node_config.name) {
+                                     info!("Node is no longer in committee. Initiating shutdown.");
+                                     let _ = tx_shutdown.send(Shutdown::Now);
+                                     break;
+                                }
+                            }
+                        }
+
+                        epoch_transitioning.store(false, Ordering::SeqCst);
+                    },
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                         warn!("Reconfigure channel lagged by {}. Missed epoch transitions!", n);
+                    },
+                    Err(broadcast::error::RecvError::Closed) => {
+                         error!("Reconfigure channel closed unexpectedly. Shutting down.");
+                         let _ = tx_shutdown.send(Shutdown::Now);
+                         break;
+                    }
                 }
             },
-            Ok(shutdown_signal) = rx_shutdown.recv() => {
-                match shutdown_signal {
-                    Shutdown::Finalize(epoch_to_finalize) => {
-                        info!("[ANALYZE] Received Finalize signal for epoch {}. Processing final block.", epoch_to_finalize);
-                        if let Some(dags) = epoch_buffers.remove(&epoch_to_finalize) {
-                            finalize_and_send_epoch(epoch_to_finalize, dags, &mut store, &socket_path).await;
-                        } else {
-                             warn!("[ANALYZE] No committed dags found in buffer for epoch {} to finalize.", epoch_to_finalize);
-                             finalize_and_send_epoch(epoch_to_finalize, Vec::new(), &mut store, &socket_path).await;
+
+            // 2. Lắng nghe Ctrl+C
+            _ = tokio::signal::ctrl_c() => {
+                info!("Ctrl-C received, initiating graceful shutdown...");
+                let _ = tx_shutdown.send(Shutdown::Now);
+            },
+
+            // 3. Lắng nghe tín hiệu Shutdown
+            result = rx_shutdown_main.recv() => {
+                 match result {
+                    Ok(Shutdown::Now) => {
+                        info!("Received Shutdown::Now. Exiting main loop.");
+                    },
+                    Err(_) => {
+                        info!("Shutdown channel closed. Exiting main loop.");
+                    },
+                 }
+                 break;
+            }
+        }
+    }
+
+    info!("Node main loop finished.");
+    Ok(())
+}
+
+// ########################################################################
+// #                      HÀM `analyze_hot_swap`                         #
+// ########################################################################
+async fn analyze_hot_swap(
+    mut rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
+    mut rx_output: broadcast::Receiver<(Vec<CommittedSubDag>, Committee, Option<Round>)>,
+    mut store: Store,
+    node_config: NodeConfig,
+    mut rx_shutdown: broadcast::Receiver<Shutdown>,
+    // THAY ĐỔI: Thêm tx_shutdown
+    tx_shutdown: broadcast::Sender<Shutdown>,
+) {
+    let mut epoch_buffers: HashMap<u64, Vec<CommittedSubDag>> = HashMap::new();
+    let socket_path = node_config.uds_block_path.clone();
+
+    if socket_path.is_empty() {
+        warn!("[ANALYZE] uds_block_path is not configured. Committed blocks will be discarded.");
+        let _ = rx_shutdown.recv().await;
+        info!("[ANALYZE] Discard-mode task exiting.");
+        return;
+    }
+
+    info!("[ANALYZE] Started (Hot-Swap Mode). Waiting for commits or signals.");
+
+    loop {
+        tokio::select! {
+            // 1. Nhận committed dags từ Consensus
+            result = rx_output.recv() => {
+                match result {
+                    Ok((dags, committee, skipped_round_option)) => {
+                         let current_epoch = committee.epoch;
+                         if let Some(skipped_round) = skipped_round_option {
+                            info!(
+                                "[ANALYZE] Sending empty block for skipped epoch {} at height {}.",
+                                current_epoch, skipped_round
+                            );
+                            let empty_block = comm::CommittedBlock {
+                                epoch: current_epoch,
+                                height: skipped_round,
+                                transactions: Vec::new(),
+                            };
+                            let epoch_data = comm::CommittedEpochData {
+                                blocks: vec![empty_block],
+                            };
+                            send_to_uds(epoch_data, &socket_path, "skipped round").await;
+                        } else if !dags.is_empty() {
+                             debug!("[ANALYZE] Buffering {} committed sub-dag(s) for epoch {}.", dags.len(), current_epoch);
+                            epoch_buffers
+                                .entry(current_epoch)
+                                .or_default()
+                                .extend(dags);
                         }
                     },
-                    Shutdown::Now => {
-                        info!("[ANALYZE] Received Shutdown::Now signal. Exiting.");
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                         warn!("[ANALYZE] Receiver lagged by {} messages. Skipping blocks.", n);
+                    },
+                    Err(broadcast::error::RecvError::Closed) => {
+                        info!("[ANALYZE] Output channel closed. Finalizing buffers and exiting.");
+                         for (epoch, dags) in epoch_buffers.drain() {
+                             warn!("[ANALYZE] Finalizing epoch {} from buffer (channel close).", epoch);
+                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
+                         }
                         break;
                     }
                 }
             },
-            else => {
-                info!("[ANALYZE] Channel closed. Finalizing any remaining buffers and exiting.");
-                for (epoch, dags) in epoch_buffers.drain() {
-                    warn!("[ANALYZE] Finalizing epoch {} from buffer due to channel close.", epoch);
-                    finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
+
+            // 2. Nhận tín hiệu Reconfigure từ Core (qua main)
+            result = rx_reconfigure.recv() => {
+                 match result {
+                    Ok(notification) => {
+                        let epoch_to_finalize = notification.committee.epoch;
+                        info!("[ANALYZE] Received Reconfigure signal for end of epoch {}. Processing final block.", epoch_to_finalize);
+                        if let Some(dags) = epoch_buffers.remove(&epoch_to_finalize) {
+                            finalize_and_send_epoch(epoch_to_finalize, dags, &mut store, &socket_path).await;
+                        } else {
+                             warn!("[ANALYZE] No committed dags found in buffer for epoch {} to finalize. Sending empty final block.", epoch_to_finalize);
+                             finalize_and_send_epoch(epoch_to_finalize, Vec::new(), &mut store, &socket_path).await;
+                        }
+                    },
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        warn!("[ANALYZE] Reconfigure receiver lagged by {}. Missed final blocks!", n);
+                    },
+                    Err(broadcast::error::RecvError::Closed) => {
+                        error!("[ANALYZE] Reconfigure channel closed unexpectedly. Shutting down.");
+                        // THAY ĐỔI: Gửi tín hiệu Shutdown::Now qua tx_shutdown thay vì gọi .close()
+                        let _ = tx_shutdown.send(Shutdown::Now);
+                        break;
+                    }
+                 }
+            },
+
+
+            // 3. Nhận tín hiệu Shutdown (Now)
+            result = rx_shutdown.recv() => {
+                match result {
+                    Ok(Shutdown::Now) => {
+                        info!("[ANALYZE] Received Shutdown::Now signal. Finalizing all remaining buffers and exiting.");
+                        for (epoch, dags) in epoch_buffers.drain() {
+                             warn!("[ANALYZE] Finalizing epoch {} from buffer (Shutdown::Now).", epoch);
+                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
+                         }
+                        break;
+                    },
+                    Err(_) => { // Channel closed
+                         info!("[ANALYZE] Shutdown channel closed. Finalizing buffers and exiting.");
+                         for (epoch, dags) in epoch_buffers.drain() {
+                             warn!("[ANALYZE] Finalizing epoch {} from buffer (channel close).", epoch);
+                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
+                         }
+                         break;
+                    }
                 }
-                break;
-            }
+            },
         }
     }
+    info!("[ANALYZE] Task finished.");
 }
 
+// --- Các hàm finalize_and_send_epoch và send_to_uds giữ nguyên ---
 async fn finalize_and_send_epoch(
     epoch: u64,
     dags: Vec<CommittedSubDag>,
@@ -619,21 +710,23 @@ async fn finalize_and_send_epoch(
 ) {
     if dags.is_empty() {
         info!("[ANALYZE] No dags to process for final block of epoch {}. Sending an empty final block.", epoch);
+        let final_height = (epoch + 1) * RECONFIGURE_INTERVAL - 1; // Ước lượng round cuối
         let final_block = comm::CommittedBlock {
             epoch,
-            height: 100,
+            height: final_height,
             transactions: Vec::new(),
         };
         let epoch_data = comm::CommittedEpochData {
             blocks: vec![final_block],
         };
-        send_to_uds(epoch_data, socket_path).await;
+        send_to_uds(epoch_data, socket_path, "empty final").await;
         return;
     }
 
     info!(
-        "[ANALYZE] Finalizing epoch {}. Aggregating all transactions into a single final block.",
-        epoch
+        "[ANALYZE] Finalizing epoch {}. Aggregating transactions from {} sub-dags into a single final block.",
+        epoch,
+        dags.len()
     );
 
     let mut all_transactions = Vec::new();
@@ -645,30 +738,50 @@ async fn finalize_and_send_epoch(
         .flat_map(|dag| &dag.certificates)
         .map(|cert| cert.round())
         .max()
-        .unwrap_or(100);
+        .unwrap_or_else(|| (epoch + 1) * RECONFIGURE_INTERVAL - 1); // Giá trị dự phòng
 
     for sub_dag in dags {
         for certificate in sub_dag.certificates {
             if certificate.epoch() != epoch {
+                warn!(
+                     "[ANALYZE] Skipping certificate {} from wrong epoch {} during finalization of epoch {}",
+                      certificate.digest(), certificate.epoch(), epoch
+                 );
                 continue;
             }
-
             if !processed_certificates.insert(certificate.digest()) {
                 continue;
             }
 
             for (digest, worker_id) in &certificate.header.payload {
-                if let Ok(Some(serialized_batch)) = store.read(digest.to_vec()).await {
-                    if let Ok(WorkerMessage::Batch(batch)) = bincode::deserialize(&serialized_batch)
-                    {
-                        for tx_data in batch {
-                            if committed_tx_digests.insert(tx_data.clone()) {
-                                all_transactions.push(comm::Transaction {
-                                    digest: tx_data,
-                                    worker_id: *worker_id as u32,
-                                });
+                match store.read(digest.to_vec()).await {
+                    Ok(Some(serialized_batch)) => {
+                        match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
+                            Ok(WorkerMessage::Batch(batch)) => {
+                                for tx_data in batch {
+                                    if committed_tx_digests.insert(tx_data.clone()) {
+                                        all_transactions.push(comm::Transaction {
+                                            digest: tx_data.clone(),
+                                            worker_id: *worker_id as u32,
+                                        });
+                                        info!("tx {}", hex::encode(tx_data));
+                                    }
+                                }
+                            }
+                            Ok(_) => warn!(
+                                "[ANALYZE] Deserialized unexpected WorkerMessage type for batch {}",
+                                digest
+                            ),
+                            Err(e) => {
+                                warn!("[ANALYZE] Failed to deserialize batch {}: {}", digest, e)
                             }
                         }
+                    }
+                    Ok(None) => {
+                        warn!("[ANALYZE] Batch {} referenced in committed certificate {} not found in store!", digest, certificate.digest());
+                    }
+                    Err(e) => {
+                        error!("[ANALYZE] Error reading batch {} from store: {}", digest, e);
                     }
                 }
             }
@@ -682,7 +795,7 @@ async fn finalize_and_send_epoch(
     };
 
     info!(
-        "[ANALYZE] Created final block for epoch {} at height {} with {} total transactions.",
+        "[ANALYZE] Created final block for epoch {} at height {} with {} unique transactions.",
         epoch,
         final_height,
         final_block.transactions.len()
@@ -692,43 +805,60 @@ async fn finalize_and_send_epoch(
         blocks: vec![final_block],
     };
 
-    send_to_uds(epoch_data, socket_path).await;
+    send_to_uds(epoch_data, socket_path, "final block").await;
 }
 
-async fn send_to_uds(epoch_data: comm::CommittedEpochData, socket_path: &str) {
+async fn send_to_uds(epoch_data: comm::CommittedEpochData, socket_path: &str, context: &str) {
+    let epoch_num = epoch_data.blocks.first().map(|b| b.epoch).unwrap_or(0);
+    let block_count = epoch_data.blocks.len();
+    let tx_count: usize = epoch_data.blocks.iter().map(|b| b.transactions.len()).sum();
+
     match UnixStream::connect(socket_path).await {
         Ok(mut stream) => {
             let mut proto_buf = BytesMut::new();
-            epoch_data
-                .encode(&mut proto_buf)
-                .expect("Protobuf serialization failed");
-
-            let mut len_buf = BytesMut::new();
-            fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
-                loop {
-                    if value < 0x80 {
-                        buf.put_u8(value as u8);
-                        break;
-                    }
-                    buf.put_u8(((value & 0x7F) | 0x80) as u8);
-                    value >>= 7;
-                }
+            if let Err(e) = epoch_data.encode(&mut proto_buf) {
+                error!(
+                    "[ANALYZE] UDS ({}) Epoch {}: Failed to encode Protobuf: {}",
+                    context, epoch_num, e
+                );
+                return;
             }
-            put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
+            let len = proto_buf.len();
+            let mut len_buf = BytesMut::new();
+            len_buf.put_u32(len as u32);
 
             if let Err(e) = stream.write_all(&len_buf).await {
-                error!("[ANALYZE] UDS: Failed to write length: {}", e);
+                error!(
+                    "[ANALYZE] UDS ({}) Epoch {}: Failed to write length ({} bytes): {}",
+                    context,
+                    epoch_num,
+                    len_buf.len(),
+                    e
+                );
                 return;
             }
             if let Err(e) = stream.write_all(&proto_buf).await {
-                error!("[ANALYZE] UDS: Failed to write payload: {}", e);
+                error!(
+                    "[ANALYZE] UDS ({}) Epoch {}: Failed to write payload ({} bytes): {}",
+                    context,
+                    epoch_num,
+                    proto_buf.len(),
+                    e
+                );
                 return;
             }
+
             info!(
-                "[ANALYZE] Successfully sent epoch data for epoch {} to UDS.",
-                epoch_data.blocks.first().map(|b| b.epoch).unwrap_or(0)
+                "[ANALYZE] UDS ({}) Epoch {}: Successfully sent {} block(s) with {} total transactions (payload size: {} bytes).",
+                context, epoch_num, block_count, tx_count, proto_buf.len()
             );
         }
-        Err(e) => error!("[ANALYZE] UDS: Connection to {} failed: {}", socket_path, e),
+        Err(e) => {
+            error!(
+                "[ANALYZE] UDS ({}) Epoch {}: Connection to {} failed: {}",
+                context, epoch_num, socket_path, e
+            );
+        }
     }
 }

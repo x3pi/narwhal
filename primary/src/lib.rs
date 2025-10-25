@@ -5,7 +5,7 @@
 mod error;
 mod aggregators;
 mod certificate_waiter;
-mod core;
+pub mod core; // SỬA LỖI: Chuyển 'mod core;' thành 'pub mod core;'
 mod garbage_collector;
 mod header_waiter;
 mod helper;

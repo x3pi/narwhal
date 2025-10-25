@@ -16,13 +16,13 @@ use log::{debug, error, info, warn};
 use network::{CancelHandler, ReliableSender};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering}; // Đảm bảo Ordering được import
 use std::sync::Arc;
 use std::time::Duration;
 use store::{Store, ROUND_INDEX_CF};
+use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
-use tokio::time::sleep;
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
@@ -53,7 +53,9 @@ pub struct Core {
     rx_proposer: Receiver<Header>,
     tx_consensus: Sender<Certificate>,
     tx_proposer: Sender<(Vec<Digest>, Round)>,
-    tx_reconfigure: Sender<ReconfigureNotification>,
+    tx_reconfigure: broadcast::Sender<ReconfigureNotification>,
+    // *** THAY ĐỔI: Thêm Receiver ***
+    rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
 
     epoch: Epoch,
     gc_round: Round,
@@ -67,7 +69,6 @@ pub struct Core {
     network: ReliableSender,
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
     sync_state: Option<SyncState>,
-    reconfiguring: Arc<AtomicBool>,
 }
 
 impl Core {
@@ -86,8 +87,10 @@ impl Core {
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
-        tx_reconfigure: Sender<ReconfigureNotification>,
-        reconfiguring: Arc<AtomicBool>,
+        tx_reconfigure: broadcast::Sender<ReconfigureNotification>,
+        // *** THAY ĐỔI: Thêm tham số Receiver ***
+        rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
+        _reconfiguring: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
             let epoch = committee.read().await.epoch;
@@ -106,6 +109,8 @@ impl Core {
                 tx_consensus,
                 tx_proposer,
                 tx_reconfigure,
+                // *** THAY ĐỔI: Khởi tạo Receiver ***
+                rx_reconfigure,
                 epoch,
                 gc_round: 0,
                 dag_round: 0,
@@ -117,7 +122,6 @@ impl Core {
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 sync_state: None,
-                reconfiguring,
             }
             .run()
             .await;
@@ -386,8 +390,8 @@ impl Core {
                     round: next_round,
                     committee: self.committee.read().await.clone(),
                 };
-                if self.tx_reconfigure.send(notification).await.is_err() {
-                    error!("Failed to send reconfiguration signal: channel closed");
+                if self.tx_reconfigure.send(notification).is_err() {
+                    warn!("No receivers for reconfigure signal (this is ok if not Primary node).");
                 }
             }
 
@@ -410,16 +414,17 @@ impl Core {
     }
 
     async fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
+        let committee = self.committee.read().await;
         ensure!(header.epoch == self.epoch, DagError::InvalidEpoch);
         ensure!(
             self.gc_round <= header.round,
             DagError::TooOld(header.id.clone(), header.round)
         );
-        let committee = self.committee.read().await;
         header.verify(&committee)
     }
 
     async fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
+        let committee = self.committee.read().await;
         ensure!(vote.epoch == self.epoch, DagError::InvalidEpoch);
         ensure!(
             self.current_header.round <= vote.round,
@@ -431,17 +436,16 @@ impl Core {
                 && vote.round == self.current_header.round,
             DagError::UnexpectedVote(vote.id.clone())
         );
-        let committee = self.committee.read().await;
         vote.verify(&committee).map_err(DagError::from)
     }
 
     async fn sanitize_certificate(&mut self, certificate: &Certificate) -> DagResult<()> {
+        let committee = self.committee.read().await;
         ensure!(certificate.epoch() == self.epoch, DagError::InvalidEpoch);
         ensure!(
             self.gc_round <= certificate.round(),
             DagError::TooOld(certificate.digest(), certificate.round())
         );
-        let committee = self.committee.read().await;
         certificate.verify(&committee).map_err(DagError::from)
     }
 
@@ -458,12 +462,13 @@ impl Core {
                             certificates.len()
                         );
                         let committee = self.committee.read().await.clone();
+                        let current_epoch = self.epoch;
                         let verification_results = tokio::task::spawn_blocking(move || {
                             certificates
                                 .into_par_iter()
                                 .filter_map(|cert| {
-                                    if cert.epoch() != committee.epoch {
-                                        warn!("Received certificate from wrong epoch {} during sync (expected {})", cert.epoch(), committee.epoch);
+                                    if cert.epoch() != current_epoch {
+                                        warn!("Received certificate from wrong epoch {} during sync (expected {})", cert.epoch(), current_epoch);
                                         return None;
                                     }
                                     match cert.verify(&committee) {
@@ -503,6 +508,7 @@ impl Core {
                     let cert_round = certificate.round();
 
                     if cert_round > target_round
+                        && certificate.epoch() == self.epoch
                         && self.sanitize_certificate(&certificate).await.is_ok()
                     {
                         info!(
@@ -558,12 +564,67 @@ impl Core {
         }
     }
 
+    // THÊM HÀM HELPER ĐỂ RESET STATE
+    fn reset_state_for_new_epoch(&mut self, new_epoch: Epoch) {
+        info!(
+            "Core detected epoch change from {} to {}. Resetting internal state.",
+            self.epoch, new_epoch
+        );
+        self.epoch = new_epoch;
+        self.gc_round = 0;
+        self.last_voted.clear();
+        self.processing.clear();
+        self.certificates_aggregators.clear();
+        self.cancel_handlers.clear();
+        self.current_header = Header::default();
+        self.votes_aggregator = VotesAggregator::new();
+        self.sync_state = None;
+    }
+
     pub async fn run(&mut self) {
         let mut sync_retry_timer = tokio::time::interval(Duration::from_millis(SYNC_RETRY_DELAY));
         sync_retry_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
+            // *** THAY ĐỔI: Xóa logic kiểm tra epoch thụ động ở đây ***
+            // (Đã được thay thế bằng nhánh select! bên dưới)
+
             let result = tokio::select! {
+                biased; // Ưu tiên các message nhận được hơn là timer
+
+                // *** SỬA ĐỔI BẮT ĐẦU: Sửa nhánh select! cho reconfigure ***
+                result = self.rx_reconfigure.recv() => {
+                    match result {
+                        Ok(_notification) => { // Bỏ qua nội dung notification
+                            // Đọc ủy ban MỚI NHẤT từ Arc
+                            let new_committee = self.committee.read().await;
+                            let new_epoch = new_committee.epoch;
+                            drop(new_committee); // Giải phóng lock sớm
+
+                            // Chỉ reset nếu epoch thực sự mới
+                            if new_epoch > self.epoch {
+                                self.reset_state_for_new_epoch(new_epoch); // <-- SỬA LỖI: Dùng new_epoch
+                            } else {
+                                debug!(
+                                    "Core received reconfigure signal for epoch {} but current epoch is already {}. Ignoring reset.",
+                                    new_epoch,
+                                    self.epoch
+                                );
+                            }
+                            Ok(())
+                        },
+                        Err(e) => {
+                            warn!("Reconfigure channel error in Core: {}", e);
+                            if e == broadcast::error::RecvError::Closed {
+                                // Nếu kênh reconfigure bị đóng, đó là lỗi nghiêm trọng
+                                return;
+                            }
+                            Ok(()) // Bỏ qua lỗi Lagged
+                        }
+                    }
+                },
+                // *** SỬA ĐỔI KẾT THÚC ***
+
                 Some(message) = self.rx_primaries.recv() => self.handle_message(message).await,
                 Some(header) = self.rx_header_waiter.recv(), if self.sync_state.is_none() => self.process_header(&header, false).await,
                 Some(certificate) = self.rx_certificate_waiter.recv(), if self.sync_state.is_none() => self.process_certificate(certificate, false).await,
@@ -582,11 +643,15 @@ impl Core {
                     panic!("Storage failure: killing node.");
                 }
                 Err(e @ DagError::TooOld(..)) | Err(e @ DagError::InvalidEpoch) => debug!("{}", e),
+                Err(e @ DagError::AuthorityReuse(..)) => warn!("Authority reuse detected: {}", e),
                 Err(e) => warn!("{}", e),
             }
 
             if self.sync_state.is_none() {
+                // *** SỬA LỖI Ở ĐÂY ***
+                // Thay Ordering.Relaxed thành Ordering::Relaxed
                 let round = self.consensus_round.load(Ordering::Relaxed);
+                // *** KẾT THÚC SỬA LỖI ***
                 if round > self.gc_depth {
                     let gc_round = round - self.gc_depth;
                     self.last_voted.retain(|k, _| k >= &gc_round);

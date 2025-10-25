@@ -3,7 +3,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
 use crate::messages::Header;
-use crate::primary::{PrimaryMessage, PrimaryWorkerMessage};
+use crate::primary::{PrimaryMessage, PrimaryWorkerMessage, ReconfigureNotification}; // <-- THÊM ReconfigureNotification
 use crate::Round; // SỬA LỖI: Thay đổi đường dẫn import
 use bytes::Bytes;
 use config::{Committee, WorkerId};
@@ -11,13 +11,14 @@ use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error};
+use log::{debug, error, info, warn}; // <-- THÊM info
 use network::SimpleSender;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
+use tokio::sync::broadcast; // <-- THÊM broadcast
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::RwLock;
 use tokio::time::{sleep, Duration, Instant};
@@ -41,6 +42,8 @@ pub struct HeaderWaiter {
 
     rx_synchronizer: Receiver<WaiterMessage>,
     tx_core: Sender<Header>,
+    // *** THAY ĐỔI: Thêm Receiver ***
+    rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
 
     network: SimpleSender,
     parent_requests: HashMap<Digest, (Round, u128)>,
@@ -60,6 +63,8 @@ impl HeaderWaiter {
         sync_retry_nodes: usize,
         rx_synchronizer: Receiver<WaiterMessage>,
         tx_core: Sender<Header>,
+        // *** THAY ĐỔI: Thêm tham số mới ***
+        rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -72,6 +77,8 @@ impl HeaderWaiter {
                 sync_retry_nodes,
                 rx_synchronizer,
                 tx_core,
+                // *** THAY ĐỔI: Khởi tạo trường mới ***
+                rx_reconfigure,
                 network: SimpleSender::new(),
                 parent_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
@@ -108,9 +115,18 @@ impl HeaderWaiter {
         loop {
             tokio::select! {
                 Some(message) = self.rx_synchronizer.recv() => {
-                    let committee = self.committee.read().await; // Lock committee
+                    // *** THAY ĐỔI: Check xem committee đã bị lock chưa trước khi lock ***
+                    // (Lưu ý: Đoạn code gốc đã lock ở đây)
+                    let committee_guard = self.committee.read().await; // Lock committee
+                    let current_epoch = committee_guard.epoch;
+
                     match message {
                         WaiterMessage::SyncBatches(missing, header) => {
+                            // Chỉ xử lý nếu header thuộc epoch hiện tại
+                            if header.epoch != current_epoch {
+                                warn!("HeaderWaiter discarding sync batch request for header {} from old epoch {}", header.id, header.epoch);
+                                continue;
+                            }
                             debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();
                             let round = header.round;
@@ -138,7 +154,7 @@ impl HeaderWaiter {
                                 });
                             }
                             for (worker_id, digests) in requires_sync {
-                                let address = committee
+                                let address = committee_guard // *** SỬA: Dùng committee_guard
                                     .worker(&author, &worker_id)
                                     .expect("Author of valid header is not in the committee")
                                     .primary_to_worker;
@@ -150,6 +166,11 @@ impl HeaderWaiter {
                         }
 
                         WaiterMessage::SyncParents(missing, header) => {
+                             // Chỉ xử lý nếu header thuộc epoch hiện tại
+                            if header.epoch != current_epoch {
+                                warn!("HeaderWaiter discarding sync parents request for header {} from old epoch {}", header.id, header.epoch);
+                                continue;
+                            }
                             debug!("Synching the parents of {}", header);
                             let header_id = header.id.clone();
                             let round = header.round;
@@ -181,7 +202,7 @@ impl HeaderWaiter {
                                 });
                             }
                             if !requires_sync.is_empty() {
-                                let address = committee
+                                let address = committee_guard // *** SỬA: Dùng committee_guard
                                     .primary(&author)
                                     .expect("Author of valid header not in the committee")
                                     .primary_to_primary;
@@ -191,6 +212,7 @@ impl HeaderWaiter {
                             }
                         }
                     }
+                    // drop(committee_guard) // Tự động drop khi hết scope
                 },
 
                 Some(result) = waiting.next() => match result {
@@ -225,17 +247,56 @@ impl HeaderWaiter {
                         }
                     }
 
-                    let addresses = self.committee.read().await
+                    // *** SỬA: Lock committee ở đây ***
+                    let committee = self.committee.read().await;
+                    let addresses = committee
                         .others_primaries(&self.name)
                         .iter()
                         .map(|(_, x)| x.primary_to_primary)
                         .collect();
+                    drop(committee); // Release lock
+
                     let message = PrimaryMessage::CertificatesRequest(retry, self.name);
                     let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                     self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
 
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
-                }
+                },
+
+                // *** SỬA ĐỔI BẮT ĐẦU: Sửa nhánh reconfigure ***
+                result = self.rx_reconfigure.recv() => {
+                    match result {
+                        Ok(_notification) => {
+                            // Đọc ủy ban MỚI NHẤT từ Arc để log
+                            let new_committee = self.committee.read().await;
+                            let new_epoch = new_committee.epoch;
+                            drop(new_committee);
+
+                            info!("HeaderWaiter received reconfigure for epoch {}. Clearing all pending requests.", new_epoch);
+
+                            // 1. Gửi tín hiệu hủy đến tất cả các future 'waiter' đang chạy
+                            for (_, (_, handler)) in self.pending.iter() {
+                                let _ = handler.send(()).await; // Gửi tín hiệu hủy
+                            }
+
+                            // 2. Xóa tất cả state nội bộ
+                            self.parent_requests.clear();
+                            self.batch_requests.clear();
+                            self.pending.clear();
+
+                            // 3. Xóa các future khỏi FuturesUnorderedSet
+                            // (Chúng sẽ tự kết thúc với Ok(None) khi nhận tín hiệu hủy)
+                            waiting.clear();
+                        },
+                        Err(e) => {
+                            warn!("Reconfigure channel error in HeaderWaiter: {}", e);
+                            if e == broadcast::error::RecvError::Closed {
+                                break; // Thoát vòng lặp nếu kênh bị đóng
+                            }
+                        }
+                    }
+                },
+                // *** SỬA ĐỔI KẾT THÚC ***
             }
 
             let round = self.consensus_round.load(Ordering::Relaxed);
