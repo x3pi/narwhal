@@ -209,13 +209,27 @@ impl Certificate {
         committee
             .authorities
             .keys()
-            .map(|name| Self {
-                header: Header {
+            .map(|name| {
+                // Tạo một header tạm thời chỉ để tính toán digest (id)
+                let temp_header = Header {
                     author: name.clone(),
-                    epoch: committee.epoch, // BỔ SUNG: Genesis certificate phải có epoch
-                    ..Header::default()
-                },
-                ..Self::default()
+                    round: 0,
+                    epoch: committee.epoch, // Sử dụng epoch chính xác từ committee
+                    payload: BTreeMap::new(), // Genesis không có payload
+                    parents: BTreeSet::new(), // Genesis không có parents
+                    id: Digest::default(),  // Placeholder, sẽ được thay thế
+                    signature: Signature::default(), // Genesis không có chữ ký
+                };
+                let header_id = temp_header.digest(); // Tính toán digest thực sự
+
+                // Tạo Certificate cuối cùng với header_id chính xác
+                Self {
+                    header: Header {
+                        id: header_id, // Sử dụng id đã tính toán
+                        ..temp_header  // Giữ các trường khác từ temp_header
+                    },
+                    votes: Vec::new(), // Genesis không có votes
+                }
             })
             .collect()
     }

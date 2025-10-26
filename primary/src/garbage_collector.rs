@@ -5,7 +5,7 @@ use crate::messages::Certificate;
 use crate::primary::{
     CommittedBatches, PendingBatches, PrimaryWorkerMessage, ReconfigureNotification,
 }; // <-- THÊM ReconfigureNotification
-use crate::Round;
+use crate::{Epoch, Round}; // <-- THÊM Epoch
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
@@ -18,7 +18,7 @@ use store::Store;
 use tokio::sync::broadcast; // <-- THÊM
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
-use tokio::time::{interval, Duration};
+use tokio::time::{interval, sleep, Duration}; // <-- THÊM sleep
 
 const GC_TIMER_MS: u64 = 5_000;
 const ORPHAN_BATCH_THRESHOLD_ROUNDS: Round = 10;
@@ -36,6 +36,7 @@ pub struct GarbageCollector {
     rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     network: SimpleSender,
     store: Store,
+    epoch: Epoch, // <-- THÊM TRẠNG THÁI EPOCH
 }
 
 impl GarbageCollector {
@@ -53,7 +54,11 @@ impl GarbageCollector {
         // *** THAY ĐỔI: Thêm tham số mới ***
         rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     ) {
+        // *** BỌC VIỆC KHỞI TẠO TRONG MỘT ASYNC BLOCK ***
         tokio::spawn(async move {
+            // Lấy epoch ban đầu từ committee Arc
+            let initial_epoch = committee.read().await.epoch;
+
             Self {
                 name,      // Thêm khởi tạo
                 committee, // SỬA ĐỔI
@@ -67,6 +72,7 @@ impl GarbageCollector {
                 rx_reconfigure,
                 network: SimpleSender::new(),
                 store,
+                epoch: initial_epoch, // <-- KHỞI TẠO EPOCH
             }
             .run()
             .await;
@@ -91,7 +97,8 @@ impl GarbageCollector {
                     let committee = self.committee.read().await;
 
                     // *** THAY ĐỔI: Chỉ gửi Cleanup nếu epoch khớp ***
-                    if certificate.epoch() == committee.epoch {
+                    // *** VÀ SỬ DỤNG self.epoch NỘI BỘ ***
+                    if certificate.epoch() == self.epoch && certificate.epoch() == committee.epoch {
                         let worker_addresses: Vec<SocketAddr> = committee
                             .our_workers(&self.name)
                             .expect("Our public key or worker id is not in the committee")
@@ -144,15 +151,37 @@ impl GarbageCollector {
                 // *** SỬA ĐỔI BẮT ĐẦU: Sửa nhánh reconfigure ***
                 result = self.rx_reconfigure.recv() => {
                     match result {
-                        Ok(_notification) => {
-                            // Đọc ủy ban MỚI NHẤT từ Arc để log
-                            let new_committee = self.committee.read().await;
-                            let new_epoch = new_committee.epoch;
-                            drop(new_committee);
+                        Ok(notification) => { // <-- LẤY `notification`
+                            // KIỂM TRA 1: Tín hiệu này có phải cho epoch HIỆN TẠI của chúng ta không?
+                            if notification.committee.epoch != self.epoch {
+                                warn!(
+                                    "GarbageCollector: Ignoring stale reconfigure signal for epoch {} (current epoch is {})",
+                                    notification.committee.epoch, self.epoch
+                                );
+                                continue;
+                            }
 
-                            info!("GarbageCollector received reconfigure for epoch {}. Clearing batch caches.", new_epoch);
+                            // KIỂM TRA 2: Chờ cho committee Arc được cập nhật
+                            info!("GarbageCollector: Received reconfigure signal for epoch {}. Waiting for committee update...", self.epoch);
+                            let mut new_epoch = self.epoch;
+                            while new_epoch == self.epoch {
+                                sleep(Duration::from_millis(100)).await; // Chờ và thử lại
+                                let committee = self.committee.read().await;
+                                new_epoch = committee.epoch;
+                                drop(committee); // Giải phóng read-lock
+                            }
+
+                            info!("GarbageCollector: Committee updated to epoch {}. Clearing caches AND resetting consensus round.", new_epoch);
+
+                            // CẬP NHẬT EPOCH NỘI BỘ
+                            self.epoch = new_epoch;
+
                             self.pending_batches.clear();
                             self.committed_batches.clear();
+
+                            // !!!!! SỬA LỖI QUAN TRỌNG !!!!!
+                            // Đặt lại round đồng thuận về 0 cho kỷ nguyên mới.
+                            self.consensus_round.store(0, Ordering::Relaxed);
                         },
                         Err(e) => {
                             warn!("Reconfigure channel error in GarbageCollector: {}", e);
