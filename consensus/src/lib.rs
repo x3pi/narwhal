@@ -1063,62 +1063,49 @@ impl Consensus {
         Ok(())
     }
 
-    async fn run(&mut self) {
+    pub async fn run(&mut self) {
         let mut state = self.load_state().await;
         info!(
             "Consensus engine starting for epoch {}. Initial last committed round: {}",
-            self.current_protocol_epoch, // Log epoch hiện tại khi bắt đầu
-            state.last_committed_round
+            self.current_protocol_epoch, state.last_committed_round
         );
 
         loop {
             tokio::select! {
                 biased;
 
-                // *** LOGIC RECONFIGURE ĐÃ SỬA ***
                 result = self.rx_reconfigure.recv() => {
                     match result {
-                        Ok(_notification) => { // Trigger only, ignore old committee inside
-                            // 1. Đọc ủy ban MỚI NHẤT từ Arc
-                            let new_committee = self.committee.read().await.clone(); // Clone để sử dụng sau khi drop lock
+                        Ok(_notification) => {
+                            let new_committee = self.committee.read().await.clone();
                             let new_epoch = new_committee.epoch;
 
-                            // 2. So sánh epoch MỚI TỪ ARC với epoch NỘI BỘ
                             if new_epoch > self.current_protocol_epoch {
                                 info!(
                                     "Consensus detected epoch change from {} to {}. Resetting state and updating protocol.",
                                     self.current_protocol_epoch, new_epoch
                                 );
 
-                                // 3. Cập nhật epoch nội bộ
                                 self.current_protocol_epoch = new_epoch;
+                                self.protocol.update_committee(new_committee.clone());
 
-                                // 4. Cập nhật committee cho protocol bên trong
-                                self.protocol.update_committee(new_committee.clone()); // Dùng committee đã clone
-
-                                // 5. Lấy genesis certificates của ủy ban MỚI
-                                let new_genesis = Certificate::genesis(&new_committee); // Dùng committee đã clone
-                                // 6. Khởi tạo lại HOÀN TOÀN trạng thái DAG và commit
-                                state = ConsensusState::new(new_genesis.clone()); // <-- SỬ DỤNG NEW GENESIS
+                                let new_genesis = Certificate::genesis(&new_committee);
+                                state = ConsensusState::new(new_genesis.clone());
                                 info!(
                                     "Consensus state fully reset for epoch {}. Starting from new genesis.",
                                     new_epoch
                                 );
 
-                                // 7. Cập nhật genesis nội bộ (để load_state dùng nếu restart)
-                                self.genesis = new_genesis; // <-- CẬP NHẬT GENESIS NỘI BỘ
+                                self.genesis = new_genesis;
 
-                                // 8. Lưu trạng thái mới (quan trọng!)
                                 if let Err(e) = self.save_state(&state).await {
                                     error!("CRITICAL: Failed to save initial state for new epoch {}: {}", new_epoch, e);
-                                    // Consider shutting down the node here if state cannot be saved
                                 }
 
                             } else {
-                                // Epoch không mới hơn, log debug thay vì warn
                                 debug!(
                                     "Consensus received reconfigure signal for epoch {} but current epoch is already {}. Ignoring reset.",
-                                    new_committee.epoch, // Log epoch từ Arc để debug
+                                    new_epoch,
                                     self.current_protocol_epoch
                                 );
                             }
@@ -1126,27 +1113,23 @@ impl Consensus {
                         Err(e) => {
                             warn!("Reconfigure channel error in Consensus: {}", e);
                             if e == broadcast::error::RecvError::Closed {
-                                break; // Exit loop if channel closed
+                                break;
                             }
-                            // Ignore Lagged errors
                         }
                     }
                 },
-                // *** KẾT THÚC SỬA LOGIC RECONFIGURE ***
 
                 Some(certificate) = self.rx_primary.recv() => {
-                    // Lấy committee hiện tại từ Arc (chỉ để gửi ra ngoài khi commit)
+                    // ✅ FIX: LẤY COMMITTEE TỪ ARC TRƯỚC KHI SỬ DỤNG
                     let current_committee_for_output = self.committee.read().await.clone();
 
-                    // An toàn: bỏ qua certificate từ epoch cũ hoặc tương lai so với epoch nội bộ ĐÃ ĐƯỢC ĐỒNG BỘ
                     if certificate.epoch() != self.current_protocol_epoch {
                         warn!(
                             "Consensus received certificate from wrong epoch {} (current is {}), discarding.",
                             certificate.epoch(), self.current_protocol_epoch
                         );
-                        continue; // Bỏ qua certificate này
+                        continue;
                     }
-
 
                     let cert_round = certificate.round();
                     let cert_digest = certificate.digest();
@@ -1156,11 +1139,11 @@ impl Consensus {
                     );
 
                     let mut metrics_guard = self.metrics.write().await;
-                    let potential_commit_leader_round = cert_round.saturating_sub(1); // Bullshark specific logic
+                    let potential_commit_leader_round = cert_round.saturating_sub(1);
 
                     match self.protocol.process_certificate(&mut state, certificate, &mut *metrics_guard) {
                         Ok((committed_sub_dags, commit_occurred)) => {
-                            drop(metrics_guard); // Drop metrics lock
+                            drop(metrics_guard);
 
                             if commit_occurred {
                                 debug!(
@@ -1169,43 +1152,39 @@ impl Consensus {
                                 );
                                 if let Err(e) = self.save_state(&state).await {
                                     error!("CRITICAL: Failed to save consensus state after commit: {}", e);
-                                    // Consider shutting down the node here
                                 }
 
                                 if !committed_sub_dags.is_empty() {
-                                     if log_enabled!(log::Level::Info) {
-                                         for dag in &committed_sub_dags {
-                                              info!("Committed leader L{}({}) digest {}", dag.leader.round(), dag.leader.origin(), dag.leader.digest());
-                                              #[cfg(feature = "benchmark")]
-                                              for cert in &dag.certificates {
-                                                   for digest in cert.header.payload.keys() {
-                                                        info!("Committed {} -> {:?}", cert.header, digest);
-                                                    }
-                                               }
-                                         }
-                                     }
+                                    if log_enabled!(log::Level::Info) {
+                                        for dag in &committed_sub_dags {
+                                            info!("Committed leader L{}({}) digest {}", dag.leader.round(), dag.leader.origin(), dag.leader.digest());
+                                            #[cfg(feature = "benchmark")]
+                                            for cert in &dag.certificates {
+                                                for digest in cert.header.payload.keys() {
+                                                    info!("Committed {} -> {:?}", cert.header, digest);
+                                                }
+                                            }
+                                        }
+                                    }
 
-                                    // Gửi kèm committee của epoch mà commit này xảy ra
-                                    let output_tuple = (committed_sub_dags.clone(), current_committee_for_output, None);
+                                    let output_tuple = (committed_sub_dags.clone(), current_committee_for_output.clone(), None);
                                     if self.tx_output.send(output_tuple).is_err() {
                                         debug!("No receivers for committed dags (this is okay).");
                                     }
                                 } else {
-                                     warn!("Commit reported by protocol, but committed_sub_dags list is empty!");
+                                    warn!("Commit reported by protocol, but committed_sub_dags list is empty!");
                                 }
                             } else {
-                                 trace!("No commit occurred for certificate round {}", cert_round);
+                                trace!("No commit occurred for certificate round {}", cert_round);
 
-                                // Logic gửi thông báo skipped round (cho Bullshark)
                                 if potential_commit_leader_round > state.last_committed_round
-                                       && potential_commit_leader_round % 2 == 0
-                                       && self.protocol.name() == "Bullshark" // Check protocol type
-                                   {
+                                    && potential_commit_leader_round % 2 == 0
+                                    && self.protocol.name() == "Bullshark"
+                                {
                                     debug!(
-                                         "Potential leader round {} was not committed (last committed is {}). Sending skipped round notification.",
-                                         potential_commit_leader_round, state.last_committed_round
+                                        "Potential leader round {} was not committed (last committed is {}). Sending skipped round notification.",
+                                        potential_commit_leader_round, state.last_committed_round
                                     );
-                                    // Gửi kèm committee của epoch hiện tại
                                     let output_tuple = (Vec::new(), current_committee_for_output, Some(potential_commit_leader_round));
                                     if self.tx_output.send(output_tuple).is_err() {
                                         debug!("No receivers for skipped round {} (this is okay).", potential_commit_leader_round);
@@ -1214,20 +1193,20 @@ impl Consensus {
                             }
                         }
                         Err(e) => {
-                            drop(metrics_guard); // Drop metrics lock in case of error too
+                            drop(metrics_guard);
                             error!("Error processing certificate {}: {}", cert_digest, e);
                         }
                     }
                 },
                 else => {
                     info!("Primary Core channel closed. Consensus engine shutting down.");
-                    break; // Exit loop
+                    break;
                 }
             }
-        } // end loop
+        }
 
         info!("Consensus engine main loop finished.");
-    } // end run
+    }
 
     pub async fn get_metrics(metrics: &Arc<RwLock<ConsensusMetrics>>) -> ConsensusMetrics {
         metrics.read().await.clone()

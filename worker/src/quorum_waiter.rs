@@ -6,7 +6,7 @@ use config::{Committee, Stake};
 use crypto::PublicKey;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, warn}; // <-- THÊM debug
+use log::{debug, info, warn}; // <-- THÊM debug
 use network::CancelHandler;
 use std::sync::Arc; // <-- THÊM Arc
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -70,52 +70,62 @@ impl QuorumWaiter {
     /// Main loop.
     async fn run(&mut self) {
         while let Some(QuorumWaiterMessage { batch, handlers }) = self.rx_message.recv().await {
-            // *** THAY ĐỔI: Lấy committee và stake động trong mỗi lần lặp ***
+            // ✅ LẤY COMMITTEE VÀ STAKE ĐỘNG TRONG MỖI LẦN LẶP
             let committee = self.committee.read().await;
             let my_stake = committee.stake(&self.name);
             let quorum_threshold = committee.quorum_threshold();
+            let committee_size = committee.authorities.len();
 
-            debug!(
-                "Received batch for quorum wait. My stake: {}, Quorum threshold: {}",
-                my_stake, quorum_threshold
-            );
+            info!("QuorumWaiter: Processing batch. My stake: {}, Quorum: {}, Committee size: {}, Handlers: {}", 
+                  my_stake, quorum_threshold, committee_size, handlers.len());
+
+            // ✅ KIỂM TRA HANDLERS HỢP LỆ
+            if handlers.is_empty() && my_stake < quorum_threshold {
+                warn!(
+                    "QuorumWaiter: No handlers and stake insufficient. Batch may not reach quorum!"
+                );
+            }
 
             let mut wait_for_quorum: FuturesUnordered<_> = handlers
                 .into_iter()
                 .map(|(name, handler)| {
-                    // Lấy stake từ committee hiện tại
                     let stake = committee.stake(&name);
+                    debug!(
+                        "QuorumWaiter: Waiting for ACK from {} (stake: {})",
+                        name, stake
+                    );
                     Self::waiter(handler, stake)
                 })
                 .collect();
 
-            // Drop committee lock sớm
             drop(committee);
 
-            // Wait for the first 2f nodes to send back an Ack. Then we consider the batch
-            // delivered and we send its digest to the primary (that will include it into
-            // the dag). This should reduce the amount of synching.
-            let mut total_stake = my_stake; // Bắt đầu với stake của chính mình
+            // Wait for quorum
+            let mut total_stake = my_stake;
+            info!(
+                "QuorumWaiter: Starting quorum wait with initial stake {}/{}",
+                total_stake, quorum_threshold
+            );
+
             while let Some(stake) = wait_for_quorum.next().await {
                 total_stake += stake;
                 debug!(
-                    "Received ack, total stake now: {}/{}",
-                    total_stake, quorum_threshold
+                    "QuorumWaiter: Received ACK (stake: {}), total: {}/{}",
+                    stake, total_stake, quorum_threshold
                 );
+
                 if total_stake >= quorum_threshold {
-                    debug!("Quorum reached! Sending batch to processor.");
+                    info!("QuorumWaiter: Quorum reached! Sending batch to Processor.");
                     if self.tx_batch.send(batch).await.is_err() {
-                        // Lỗi xảy ra nếu kênh tx_batch bị đóng (ví dụ: Processor đã dừng)
-                        warn!("Failed to send batch to processor channel closed.");
+                        warn!("QuorumWaiter: Failed to send batch - channel closed");
                     }
-                    // Thoát khỏi vòng lặp while let Some(stake) sau khi đạt quorum
                     break;
                 }
             }
-            // Nếu vòng lặp kết thúc mà không đạt quorum (ví dụ: tất cả handler bị hủy)
+
             if total_stake < quorum_threshold {
                 warn!(
-                    "Batch failed to reach quorum ({}/{})",
+                    "QuorumWaiter: Failed to reach quorum ({}/{}) for batch",
                     total_stake, quorum_threshold
                 );
             }

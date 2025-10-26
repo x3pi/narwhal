@@ -9,7 +9,7 @@ use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::info;
-use log::{debug, warn};
+use log::{debug, error, warn};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use store::Store;
@@ -157,68 +157,72 @@ impl Proposer {
                 // *** LOGIC RECONFIGURE ĐÃ SỬA ***
                 result = self.rx_reconfigure.recv() => {
                     match result {
-                        Ok(_notification) => { // Trigger only, ignore old committee inside
-
-                            // 1. Đọc ủy ban MỚI NHẤT từ Arc
+                        Ok(_notification) => {
                             let new_committee = self.committee.read().await;
                             let new_epoch = new_committee.epoch;
 
-                            // 2. So sánh epoch MỚI TỪ ARC với epoch NỘI BỘ
                             if new_epoch > self.epoch {
-                                info!("Proposer detected epoch change from {} to {}. Resetting and proposing empty header.", self.epoch, new_epoch);
+                                info!("Proposer detected epoch change from {} to {}. Full reset initiated.", self.epoch, new_epoch);
 
-                                // 3. Cập nhật epoch nội bộ
+                                // 1. Cập nhật epoch
                                 self.epoch = new_epoch;
 
-                                // 4. Reset trạng thái DÙNG ỦY BAN MỚI (từ Arc)
+                                // 2. Reset trạng thái HOÀN TOÀN
                                 self.round = 1;
                                 self.digests.clear();
                                 self.payload_size = 0;
-                                self.last_parents = Certificate::genesis(&*new_committee) // <-- DÙNG new_committee TỪ ARC
+
+                                // 3. Lấy genesis parents MỚI
+                                self.last_parents = Certificate::genesis(&*new_committee)
                                     .iter()
                                     .map(|x| x.digest())
                                     .collect();
 
-                                // 5. Giải phóng lock sớm
-                                drop(new_committee);
+                                drop(new_committee); // Giải phóng lock
 
-                                // 6. Chủ động đề xuất header MỚI (header rỗng)
+                                // 4. ✅ KIỂM TRA VÀ ĐỀ XUẤT HEADER ĐẦU TIÊN
                                 if !self.last_parents.is_empty() {
-                                    self.make_header().await; // Sẽ dùng self.epoch=2, self.round=1
+                                    info!("Proposer: Creating initial header for epoch {} round {}", self.epoch, self.round);
+                                    self.make_header().await; // Tạo header NGAY LẬP TỨC
+                                    // make_header sẽ tăng self.round và reset last_parents
                                 } else {
-                                    warn!("Proposer reset for epoch {} but found no genesis parents!", self.epoch);
+                                    error!("Proposer: CRITICAL - No genesis parents found for epoch {}!", self.epoch);
                                 }
 
-                                // 7. Reset timer
+                                // 5. Reset timer để sẵn sàng cho vòng kế tiếp
                                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                                 timer.as_mut().reset(deadline);
+
+                                info!("Proposer: Reset complete for epoch {}. Ready to receive parents.", self.epoch);
                             } else {
-                                // Epoch không mới hơn, chỉ cần giải phóng lock
                                 drop(new_committee);
-                                // Log cũ không còn đúng, nên xóa hoặc sửa
-                                // warn!("Proposer received reconfigure signal but epoch {} is not newer than {}.", new_epoch, self.epoch);
-                                debug!("Proposer received reconfigure signal for epoch {} but current epoch is already {}. Ignoring reset.", new_epoch, self.epoch);
+                                debug!("Proposer: Ignoring reconfigure for epoch {} (current is {})", new_epoch, self.epoch);
                             }
                         },
-                        Err(e) => warn!("Reconfigure channel error in Proposer: {}", e),
+                        Err(e) => warn!("Proposer: Reconfigure channel error: {}", e),
                     }
                 },
                 // *** KẾT THÚC SỬA LOGIC RECONFIGURE ***
 
                 Some((parents, round)) = self.rx_core.recv() => {
-                    // Chỉ cập nhật round và parents nếu nó thuộc epoch hiện tại hoặc tương lai gần
-                    // (Có thể cần kiểm tra epoch của certificate tạo ra parents này nếu có)
-                    if self.epoch > 0 && round >= self.round { // Điều kiện đơn giản hóa
+                    // ✅ CHẤP NHẬN PARENTS BẤT KỂ ROUND (vì có thể là từ epoch mới)
+                    if round > self.round || (round == self.round && self.last_parents.is_empty()) {
+                        info!("Proposer: Received parents for round {}, advancing to round {}", round, round + 1);
                         self.round = round + 1;
-                        debug!("Dag moved to round {}", self.round);
                         self.last_parents = parents;
-                         // Reset timer nếu có parents mới để đảm bảo đề xuất kịp thời
+
+                        // ✅ TẠO HEADER NGAY NẾU CÓ DIGESTS HOẶC TIMER ĐÃ HẾT
+                        if !self.digests.is_empty() || timer.is_elapsed() {
+                            self.make_header().await;
+                            self.payload_size = 0;
+                        }
+
+                        // Reset timer
                         let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                         timer.as_mut().reset(deadline);
                     } else if round < self.round {
-                         debug!("Received outdated parents for round {}, current round is {}. Ignoring.", round, self.round);
+                        debug!("Proposer: Ignoring outdated parents for round {} (current {})", round, self.round);
                     }
-                     // Trường hợp epoch không khớp có thể cần xử lý thêm nếu có
                 }
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
                     // Chỉ xử lý batch nếu node không đang trong quá trình chuyển đổi (hoặc đã chuyển xong)

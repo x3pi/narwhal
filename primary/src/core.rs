@@ -331,6 +331,26 @@ impl Core {
     ) -> DagResult<()> {
         debug!("Processing {:?}", certificate);
 
+        // ✅ KIỂM TRA EPOCH - CHỈ XỬ LÝ NẾU KHỚP
+        if certificate.epoch() != self.epoch {
+            warn!(
+                "Core: Discarding certificate from wrong epoch {} (current {})",
+                certificate.epoch(),
+                self.epoch
+            );
+            return Ok(());
+        }
+
+        // ✅ CẬP NHẬT dag_round NGAY LẬP TỨC
+        if certificate.round() > self.dag_round {
+            debug!(
+                "Core: Advancing dag_round from {} to {}",
+                self.dag_round,
+                certificate.round()
+            );
+            self.dag_round = certificate.round();
+        }
+
         if !self
             .processing
             .get(&certificate.header.round)
@@ -570,8 +590,11 @@ impl Core {
             "Core detected epoch change from {} to {}. Resetting internal state.",
             self.epoch, new_epoch
         );
+
         self.epoch = new_epoch;
         self.gc_round = 0;
+        self.dag_round = 0; // ✅ THÊM DÒNG NÀY - QUAN TRỌNG!
+
         self.last_voted.clear();
         self.processing.clear();
         self.certificates_aggregators.clear();
@@ -579,6 +602,11 @@ impl Core {
         self.current_header = Header::default();
         self.votes_aggregator = VotesAggregator::new();
         self.sync_state = None;
+
+        info!(
+            "Core: State reset complete for epoch {}. Ready to process certificates.",
+            new_epoch
+        );
     }
 
     pub async fn run(&mut self) {
