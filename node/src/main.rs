@@ -148,16 +148,16 @@ async fn load_consensus_state(store: &mut Store) -> ConsensusState {
                     "Failed to deserialize consensus state: {}. Starting from genesis (Round 0).",
                     e
                 );
-                ConsensusState::default()
+                ConsensusState::default() // Sử dụng default() nếu state rỗng
             }
         },
-        Ok(None) => ConsensusState::default(),
+        Ok(None) => ConsensusState::default(), // Sử dụng default() nếu state rỗng
         Err(e) => {
             error!(
                 "Failed to read from store: {:?}. Starting from genesis (Round 0).",
                 e
             );
-            ConsensusState::default()
+            ConsensusState::default() // Sử dụng default() nếu state rỗng
         }
     }
 }
@@ -359,7 +359,7 @@ async fn fetch_committee_from_uds(
 }
 
 // ########################################################################
-// #                      HÀM `run_hot_swap`                             #
+// #                      HÀM `run_hot_swap` (Không đổi)                  #
 // ########################################################################
 async fn run_hot_swap(
     shared_state: SharedNodeState,
@@ -370,12 +370,8 @@ async fn run_hot_swap(
     // --- Tạo các kênh giao tiếp vĩnh viễn ---
     let (tx_reconfigure, mut rx_reconfigure_main) =
         broadcast::channel::<ReconfigureNotification>(1);
-    // THAY ĐỔI: Xóa `mut` không cần thiết
     let rx_reconfigure_analyze = tx_reconfigure.subscribe();
-
-    // *** THAY ĐỔI BẮT ĐẦU: Tạo subscription cho Consensus ***
     let rx_reconfigure_for_consensus = tx_reconfigure.subscribe();
-    // *** THAY ĐỔI KẾT THÚC ***
 
     let (tx_shutdown, rx_shutdown_for_analyze) = broadcast::channel::<Shutdown>(1);
     let mut rx_shutdown_main = tx_shutdown.subscribe();
@@ -391,15 +387,15 @@ async fn run_hot_swap(
 
     // 1. Khởi chạy Analyze (nếu là Primary)
     if let RunMode::Primary = run_mode {
-        // THAY ĐỔI: Truyền cả tx_shutdown vào analyze
         let tx_shutdown_clone = tx_shutdown.clone();
         tokio::spawn(analyze_hot_swap(
+            // <--- Dùng phiên bản CÓ TRẠNG THÁI
             rx_reconfigure_analyze,
             rx_output_for_analyze,
             shared_state.store.clone(),
             shared_state.node_config.clone(),
             rx_shutdown_for_analyze,
-            tx_shutdown_clone, // Truyền Sender vào
+            tx_shutdown_clone,
         ));
     }
 
@@ -436,7 +432,6 @@ async fn run_hot_swap(
                     epoch_transitioning.clone(),
                 );
 
-                // *** THAY ĐỔI BẮT ĐẦU: Truyền rx_reconfigure_for_consensus vào Consensus::spawn ***
                 Consensus::spawn(
                     committee_arc.clone(),
                     shared_state.parameters.clone(),
@@ -444,9 +439,8 @@ async fn run_hot_swap(
                     rx_new_certificates,
                     tx_feedback,
                     tx_output.clone(),
-                    rx_reconfigure_for_consensus, // <-- THAM SỐ MỚI
+                    rx_reconfigure_for_consensus,
                 );
-                // *** THAY ĐỔI KẾT THÚC ***
             }
             RunMode::Worker(id) => {
                 Worker::spawn(
@@ -473,12 +467,12 @@ async fn run_hot_swap(
     }
     info!("All services spawned and running.");
 
-    // --- Vòng lặp `run` MỚI ---
+    // --- Vòng lặp `run` (giữ nguyên) ---
     let mut network_sender = SimpleSender::new();
 
     loop {
         tokio::select! {
-            // 1. Lắng nghe tín hiệu Reconfigure từ Core
+            // 1. Lắng nghe tín hiệu Reconfigure từ Core (giữ nguyên)
             result = rx_reconfigure_main.recv() => {
                 match result {
                     Ok(notification) => {
@@ -557,13 +551,13 @@ async fn run_hot_swap(
                 }
             },
 
-            // 2. Lắng nghe Ctrl+C
+            // 2. Lắng nghe Ctrl+C (giữ nguyên)
             _ = tokio::signal::ctrl_c() => {
                 info!("Ctrl-C received, initiating graceful shutdown...");
                 let _ = tx_shutdown.send(Shutdown::Now);
             },
 
-            // 3. Lắng nghe tín hiệu Shutdown
+            // 3. Lắng nghe tín hiệu Shutdown (giữ nguyên)
             result = rx_shutdown_main.recv() => {
                  match result {
                     Ok(Shutdown::Now) => {
@@ -583,7 +577,7 @@ async fn run_hot_swap(
 }
 
 // ########################################################################
-// #                      HÀM `analyze_hot_swap`                         #
+// #                      HÀM `analyze_hot_swap` (ĐÃ SỬA LỖI)             #
 // ########################################################################
 async fn analyze_hot_swap(
     mut rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
@@ -591,10 +585,16 @@ async fn analyze_hot_swap(
     mut store: Store,
     node_config: NodeConfig,
     mut rx_shutdown: broadcast::Receiver<Shutdown>,
-    // THAY ĐỔI: Thêm tx_shutdown
     tx_shutdown: broadcast::Sender<Shutdown>,
 ) {
     let mut epoch_buffers: HashMap<u64, Vec<CommittedSubDag>> = HashMap::new();
+
+    // [SỬA LỖI BẮT ĐẦU]
+    // Di chuyển bộ lọc chống trùng lặp (trí nhớ) ra ngoài vòng lặp.
+    // Key: Epoch, Value: Set chứa các digest của giao dịch (dạng Vec<u8>) đã được gửi đi.
+    let mut all_committed_txs_by_epoch: HashMap<u64, HashSet<Vec<u8>>> = HashMap::new();
+    // [SỬA LỖI KẾT THÚC]
+
     let socket_path = node_config.uds_block_path.clone();
 
     if socket_path.is_empty() {
@@ -613,7 +613,9 @@ async fn analyze_hot_swap(
                 match result {
                     Ok((dags, committee, skipped_round_option)) => {
                          let current_epoch = committee.epoch;
+
                          if let Some(skipped_round) = skipped_round_option {
+                            // (Xử lý skipped_round_option giữ nguyên)
                             info!(
                                 "[ANALYZE] Sending empty block for skipped epoch {} at height {}.",
                                 current_epoch, skipped_round
@@ -628,11 +630,29 @@ async fn analyze_hot_swap(
                             };
                             send_to_uds(epoch_data, &socket_path, "skipped round").await;
                         } else if !dags.is_empty() {
-                             debug!("[ANALYZE] Buffering {} committed sub-dag(s) for epoch {}.", dags.len(), current_epoch);
-                            epoch_buffers
-                                .entry(current_epoch)
-                                .or_default()
-                                .extend(dags);
+                            let representative_round = dags.iter()
+                                .map(|dag| dag.leader.round())
+                                .max()
+                                .unwrap_or(0);
+
+                            // Logic "gửi lắt nhắt" (round < 100) hay "gộp" (round >= 100)
+                            if representative_round < RECONFIGURE_INTERVAL {
+                                info!(
+                                    "[ANALYZE] Processing {} sub-dag(s) immediately (Leader Round: {} < {}).",
+                                    dags.len(), representative_round, RECONFIGURE_INTERVAL
+                                );
+                                // [SỬA LỖI] Truyền `all_committed_txs_by_epoch` vào hàm
+                                finalize_and_send_epoch(current_epoch, dags, &mut store, &socket_path, &mut all_committed_txs_by_epoch).await;
+                            } else {
+                                info!(
+                                    "[ANALYZE] Buffering {} sub-dag(s) (Leader Round: {} >= {}) for final aggregation.",
+                                    dags.len(), representative_round, RECONFIGURE_INTERVAL
+                                );
+                                epoch_buffers
+                                    .entry(current_epoch)
+                                    .or_default()
+                                    .extend(dags);
+                            }
                         }
                     },
                     Err(broadcast::error::RecvError::Lagged(n)) => {
@@ -642,7 +662,8 @@ async fn analyze_hot_swap(
                         info!("[ANALYZE] Output channel closed. Finalizing buffers and exiting.");
                          for (epoch, dags) in epoch_buffers.drain() {
                              warn!("[ANALYZE] Finalizing epoch {} from buffer (channel close).", epoch);
-                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
+                             // [SỬA LỖI] Truyền `all_committed_txs_by_epoch` vào hàm
+                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path, &mut all_committed_txs_by_epoch).await;
                          }
                         break;
                     }
@@ -655,19 +676,28 @@ async fn analyze_hot_swap(
                     Ok(notification) => {
                         let epoch_to_finalize = notification.committee.epoch;
                         info!("[ANALYZE] Received Reconfigure signal for end of epoch {}. Processing final block.", epoch_to_finalize);
+
                         if let Some(dags) = epoch_buffers.remove(&epoch_to_finalize) {
-                            finalize_and_send_epoch(epoch_to_finalize, dags, &mut store, &socket_path).await;
+                            // [SỬA LỖI] Truyền `all_committed_txs_by_epoch` vào hàm
+                            finalize_and_send_epoch(epoch_to_finalize, dags, &mut store, &socket_path, &mut all_committed_txs_by_epoch).await;
                         } else {
                              warn!("[ANALYZE] No committed dags found in buffer for epoch {} to finalize. Sending empty final block.", epoch_to_finalize);
-                             finalize_and_send_epoch(epoch_to_finalize, Vec::new(), &mut store, &socket_path).await;
+                             // [SỬA LỖI] Truyền `all_committed_txs_by_epoch` vào hàm (kể cả khi rỗng)
+                             finalize_and_send_epoch(epoch_to_finalize, Vec::new(), &mut store, &socket_path, &mut all_committed_txs_by_epoch).await;
                         }
+
+                        // [SỬA LỖI BẮT ĐẦU]
+                        // Dọn dẹp bộ lọc (HashSet) của epoch cũ để tiết kiệm bộ nhớ.
+                        all_committed_txs_by_epoch.remove(&epoch_to_finalize);
+                        info!("[ANALYZE] Cleared committed TX cache for epoch {}.", epoch_to_finalize);
+                        // [SỬA LỖI KẾT THÚC]
+
                     },
                     Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!("[ANALYZE] Reconfigure receiver lagged by {}. Missed final blocks!", n);
                     },
                     Err(broadcast::error::RecvError::Closed) => {
                         error!("[ANALYZE] Reconfigure channel closed unexpectedly. Shutting down.");
-                        // THAY ĐỔI: Gửi tín hiệu Shutdown::Now qua tx_shutdown thay vì gọi .close()
                         let _ = tx_shutdown.send(Shutdown::Now);
                         break;
                     }
@@ -682,7 +712,8 @@ async fn analyze_hot_swap(
                         info!("[ANALYZE] Received Shutdown::Now signal. Finalizing all remaining buffers and exiting.");
                         for (epoch, dags) in epoch_buffers.drain() {
                              warn!("[ANALYZE] Finalizing epoch {} from buffer (Shutdown::Now).", epoch);
-                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
+                             // [SỬA LỖI] Truyền `all_committed_txs_by_epoch` vào hàm
+                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path, &mut all_committed_txs_by_epoch).await;
                          }
                         break;
                     },
@@ -690,7 +721,8 @@ async fn analyze_hot_swap(
                          info!("[ANALYZE] Shutdown channel closed. Finalizing buffers and exiting.");
                          for (epoch, dags) in epoch_buffers.drain() {
                              warn!("[ANALYZE] Finalizing epoch {} from buffer (channel close).", epoch);
-                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path).await;
+                             // [SỬA LỖI] Truyền `all_committed_txs_by_epoch` vào hàm
+                             finalize_and_send_epoch(epoch, dags, &mut store, &socket_path, &mut all_committed_txs_by_epoch).await;
                          }
                          break;
                     }
@@ -701,16 +733,20 @@ async fn analyze_hot_swap(
     info!("[ANALYZE] Task finished.");
 }
 
-// --- Các hàm finalize_and_send_epoch và send_to_uds giữ nguyên ---
+// --- Các hàm finalize_and_send_epoch (ĐÃ SỬA) và send_to_uds ---
+
+// [SỬA LỖI] Thay đổi chữ ký hàm (thêm `all_committed_txs_by_epoch`)
 async fn finalize_and_send_epoch(
     epoch: u64,
     dags: Vec<CommittedSubDag>,
     store: &mut Store,
     socket_path: &str,
+    all_committed_txs_by_epoch: &mut HashMap<u64, HashSet<Vec<u8>>>,
 ) {
     if dags.is_empty() {
+        // ... (Logic gửi block rỗng khi reconfigure giữ nguyên) ...
         info!("[ANALYZE] No dags to process for final block of epoch {}. Sending an empty final block.", epoch);
-        let final_height = (epoch + 1) * RECONFIGURE_INTERVAL - 1; // Ước lượng round cuối
+        let final_height = (epoch + 1) * RECONFIGURE_INTERVAL - 1;
         let final_block = comm::CommittedBlock {
             epoch,
             height: final_height,
@@ -724,14 +760,19 @@ async fn finalize_and_send_epoch(
     }
 
     info!(
-        "[ANALYZE] Finalizing epoch {}. Aggregating transactions from {} sub-dags into a single final block.",
+        "[ANALYZE] Finalizing/Sending for epoch {}. Aggregating transactions from {} sub-dags...",
         epoch,
         dags.len()
     );
 
     let mut all_transactions = Vec::new();
     let mut processed_certificates = HashSet::new();
-    let mut committed_tx_digests = HashSet::new();
+
+    // [SỬA LỖI BẮT ĐẦU]
+    // Lấy HashSet của epoch này từ HashMap, hoặc tạo mới nếu chưa có.
+    // Đây là "trí nhớ" dài hạn cho epoch này.
+    let committed_tx_digests = all_committed_txs_by_epoch.entry(epoch).or_default();
+    // [SỬA LỖI KẾT THÚC]
 
     let final_height = dags
         .iter()
@@ -749,6 +790,7 @@ async fn finalize_and_send_epoch(
                  );
                 continue;
             }
+            // `processed_certificates` chỉ dùng để tránh xử lý trùng cert *trong cùng một block*
             if !processed_certificates.insert(certificate.digest()) {
                 continue;
             }
@@ -759,12 +801,18 @@ async fn finalize_and_send_epoch(
                         match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
                             Ok(WorkerMessage::Batch(batch)) => {
                                 for tx_data in batch {
+                                    // [SỬA LỖI] Kiểm tra bằng `committed_tx_digests` (trí nhớ dài hạn)
                                     if committed_tx_digests.insert(tx_data.clone()) {
+                                        // Chỉ thêm vào block và log nếu NÓ CHƯA TỒN TẠI trong epoch này
                                         all_transactions.push(comm::Transaction {
                                             digest: tx_data.clone(),
                                             worker_id: *worker_id as u32,
                                         });
-                                        info!("tx {}", hex::encode(tx_data));
+                                        info!("tx hex encode: {}", hex::encode(tx_data));
+                                    } else {
+                                        // Giao dịch này đã được gửi đi trong một block (L2) trước đó của epoch này.
+                                        // Bỏ qua để tránh trùng lặp.
+                                        debug!("[ANALYZE] Skipping duplicate transaction (already sent this epoch).");
                                     }
                                 }
                             }
@@ -788,6 +836,13 @@ async fn finalize_and_send_epoch(
         }
     }
 
+    // [SỬA LỖI] Chỉ gửi block nếu nó chứa giao dịch MỚI
+    if all_transactions.is_empty() {
+        // [SỬA LỖI BIÊN DỊCH] Sửa lại log message
+        info!("[ANALYZE] No *new* unique transactions found in this batch (Epoch {}, Leader Round {}). Skipping UDS send.", epoch, final_height);
+        return;
+    }
+
     let final_block = comm::CommittedBlock {
         epoch,
         height: final_height,
@@ -808,6 +863,7 @@ async fn finalize_and_send_epoch(
     send_to_uds(epoch_data, socket_path, "final block").await;
 }
 
+// --- Hàm send_to_uds (Không đổi) ---
 async fn send_to_uds(epoch_data: comm::CommittedEpochData, socket_path: &str, context: &str) {
     let epoch_num = epoch_data.blocks.first().map(|b| b.epoch).unwrap_or(0);
     let block_count = epoch_data.blocks.len();
@@ -826,7 +882,7 @@ async fn send_to_uds(epoch_data: comm::CommittedEpochData, socket_path: &str, co
 
             let len = proto_buf.len();
             let mut len_buf = BytesMut::new();
-            len_buf.put_u32(len as u32);
+            len_buf.put_u32(len as u32); // Sửa: Dùng u32 (Big Endian)
 
             if let Err(e) = stream.write_all(&len_buf).await {
                 error!(
