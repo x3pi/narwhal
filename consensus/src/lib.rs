@@ -1345,7 +1345,6 @@ impl Consensus {
                 Some(certificate) = self.rx_primary.recv() => {
                     let current_committee_for_output = self.committee.read().await.clone();
                     if certificate.epoch() != self.current_protocol_epoch { continue; }
-                    let cert_round = certificate.round();
                     let cert_digest = certificate.digest();
                     let mut metrics_guard = self.metrics.write().await;
                     // Bỏ potential_commit_leader_round nếu không dùng nữa

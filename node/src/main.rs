@@ -18,10 +18,7 @@ use log::{debug, error, info, warn};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
 // THAY ĐỔI: Import thêm GRACE_PERIOD_ROUNDS và BLOCKS_PER_EPOCH
-use primary::{
-    core::{GRACE_PERIOD_ROUNDS, RECONFIGURE_INTERVAL},
-    Core, Primary, ReconfigureNotification, Round,
-};
+use primary::{core::RECONFIGURE_INTERVAL, Core, Primary, ReconfigureNotification, Round};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
 // THAY ĐỔI: Xóa Ordering
@@ -367,6 +364,7 @@ async fn fetch_committee_from_uds(
 // ########################################################################
 // #                      HÀM `run_hot_swap` (ĐÃ SỬA ĐỔI)                  #
 // ########################################################################
+
 async fn run_hot_swap(
     shared_state: SharedNodeState,
     matches: &ArgMatches<'_>,
@@ -484,7 +482,6 @@ async fn run_hot_swap(
     }
     info!("All services spawned and running.");
 
-    // --- Vòng lặp `run` (giữ nguyên logic fetch committee, broadcast reconfigure) ---
     let mut network_sender = SimpleSender::new();
 
     loop {
@@ -614,13 +611,10 @@ async fn analyze_hot_swap(
     mut rx_shutdown: broadcast::Receiver<Shutdown>,
     tx_shutdown: broadcast::Sender<Shutdown>,
 ) {
-    use primary::core::RECONFIGURE_INTERVAL; // Keep this import
-
     let mut all_committed_txs_by_epoch: HashMap<u64, HashSet<Vec<u8>>> = HashMap::new();
     // Không cần sent_blocks_current_epoch nữa
 
     let socket_path = node_config.uds_block_path.clone();
-    // ... (socket path check) ...
     if socket_path.is_empty() {
         warn!("[ANALYZE] uds_block_path is not configured. Committed blocks will be discarded.");
         if let Err(e) = rx_shutdown.recv().await {
