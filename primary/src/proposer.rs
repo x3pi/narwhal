@@ -22,6 +22,11 @@ use tokio::time::{sleep, Duration, Instant};
 #[path = "tests/proposer_tests.rs"]
 pub mod proposer_tests;
 
+// THÊM: Import hằng số từ core
+// *** THAY ĐỔI BẮT ĐẦU: Import QUIET_PERIOD_ROUNDS ***
+use crate::core::{QUIET_PERIOD_ROUNDS, RECONFIGURE_INTERVAL};
+// *** THAY ĐỔI KẾT THÚC ***
+
 pub struct Proposer {
     name: PublicKey,
     committee: Arc<RwLock<Committee>>,
@@ -132,15 +137,26 @@ impl Proposer {
             &mut self.signature_service,
         )
         .await;
-        debug!(
-            "[Proposer][E{}] Created Header H{}({}) with {} digests ({} bytes), {} parents.",
-            header.epoch,
-            header.round,
-            header.author,
-            digests_for_header.len(),
-            current_payload_size, // Log size before reset
-            header.parents.len()
-        );
+
+        // *** THAY ĐỔI: Log nếu header rỗng trong thời gian đệm ***
+        if digests_for_header.is_empty()
+            && self.round >= (RECONFIGURE_INTERVAL.saturating_sub(QUIET_PERIOD_ROUNDS))
+        {
+            info!(
+                "[Proposer][E{}] Created EMPTY quiet period Header H{}({})",
+                header.epoch, header.round, header.author
+            );
+        } else {
+            debug!(
+                "[Proposer][E{}] Created Header H{}({}) with {} digests ({} bytes), {} parents.",
+                header.epoch,
+                header.round,
+                header.author,
+                digests_for_header.len(),
+                current_payload_size, // Log size before reset
+                header.parents.len()
+            );
+        }
 
         // Add the included digests to the pending map (to avoid re-proposing them immediately).
         for (digest, worker_id) in digests_for_header {
@@ -181,23 +197,40 @@ impl Proposer {
         tokio::pin!(timer);
 
         loop {
+            // *** THAY ĐỔI BẮT ĐẦU: Thay 'is_grace_period' bằng 'is_quiet_period' ***
+            // (Round >= 95 VÀ CHƯA reset sang epoch mới)
+            let is_quiet_period =
+                self.round >= (RECONFIGURE_INTERVAL.saturating_sub(QUIET_PERIOD_ROUNDS)); // 100 - 5 = 95
+                                                                                          // *** THAY ĐỔI KẾT THÚC ***
+
             // Check if it's time to propose a header. Conditions:
             // 1. We have parents for the current round (`!last_parents.is_empty()`). Genesis provides parents for R1.
-            // 2. EITHER the timer expired OR the payload size threshold is met.
+            // 2. EITHER the timer expired OR payload size threshold met OR (***MỚI***) ta đang trong round đệm (để ép tạo header rỗng)
             // 3. We are NOT currently in the middle of an epoch transition.
+            // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period ***
             let should_propose = !self.last_parents.is_empty()
-                && (timer.is_elapsed() || self.payload_size >= self.header_size)
+                && (timer.is_elapsed() || self.payload_size >= self.header_size || is_quiet_period) // <-- THAY ĐỔI
                 && !self.epoch_transitioning.load(Ordering::Relaxed);
+            // *** THAY ĐỔI KẾT THÚC ***
 
             // If conditions met, create a header.
             if should_propose {
                 // We only create a header if either the timer expired (forces proposal, possibly empty)
                 // or if we have accumulated payload digests.
-                if !self.digests.is_empty() || timer.is_elapsed() {
-                    info!(
-                        "[Proposer][E{}] Conditions met for round {}: TimerExpired={}, PayloadSize={}/{}, ParentsExist={}. Creating header.",
-                        self.epoch, self.round, timer.is_elapsed(), self.payload_size, self.header_size, !self.last_parents.is_empty()
-                    );
+                // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period ***
+                if !self.digests.is_empty() || timer.is_elapsed() || is_quiet_period {
+                    if is_quiet_period && self.digests.is_empty() {
+                        // Log riêng cho trường hợp tạo header rỗng
+                        info!(
+                            "[Proposer][E{}] Quiet period (R{}). Timer expired. Proposing empty header.", // <-- THAY ĐỔI
+                            self.epoch, self.round
+                        );
+                    } else {
+                        info!(
+                            "[Proposer][E{}] Conditions met for round {}: TimerExpired={}, PayloadSize={}/{}, ParentsExist={}. Creating header.",
+                            self.epoch, self.round, timer.is_elapsed(), self.payload_size, self.header_size, !self.last_parents.is_empty()
+                        );
+                    }
                     self.make_header().await; // Creates header, advances round, clears parents/payload
                 } else {
                     // This case (payload threshold met but no digests) shouldn't happen due to payload_size reset.
@@ -255,8 +288,8 @@ impl Proposer {
 
                                 // 2. Perform FULL state reset for the new epoch.
                                 self.round = 1; // Reset round counter to 1.
-                                self.digests.clear(); // Clear any pending payload.
-                                self.payload_size = 0; // Reset payload size.
+                                // self.digests.clear(); // <-- ĐÃ XÓA: Giữ lại digest cho epoch mới
+                                // self.payload_size = 0; // <-- ĐÃ XÓA: Giữ lại
                                 self.last_parents.clear(); // Clear old parents.
 
                                 // 3. Get NEW genesis parents for the new epoch.
@@ -265,13 +298,21 @@ impl Proposer {
                                     .map(|x| x.digest())
                                     .collect();
 
-                                // 4. Immediately propose the first header (Round 1) if genesis parents exist.
+                                // 4. Log payload được giữ lại
+                                info!(
+                                    "[Proposer] {} digests ({} bytes) carried over to new epoch {}",
+                                    self.digests.len(), self.payload_size, self.epoch
+                                );
+
+
+                                // 5. Immediately propose the first header (Round 1) if genesis parents exist.
                                 if !self.last_parents.is_empty() {
                                     info!(
                                         "[Proposer] Creating initial header for epoch {} round {}",
                                         self.epoch, self.round
                                     );
                                     // Make header will use genesis parents, create H1, clear parents, advance round to 2.
+                                    // Nó cũng sẽ sử dụng payload đã mang sang (self.digests)
                                     self.make_header().await;
                                 } else {
                                     // This is a critical error if genesis fails.
@@ -282,7 +323,7 @@ impl Proposer {
                                     // State is inconsistent, maybe panic or shut down?
                                 }
 
-                                // 5. Reset the timer for the next round (Round 2).
+                                // 6. Reset the timer for the next round (Round 2).
                                 let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                                 timer.as_mut().reset(deadline);
 
@@ -321,13 +362,14 @@ impl Proposer {
                            self.last_parents = parents;
                            debug!("[Proposer][E{}] Received valid parents from round {} for header {}", self.epoch, round, self.round);
 
+                            // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period ***
                             // Check if receiving parents triggers immediate proposal (if payload full or timer expired)
                             if !self.epoch_transitioning.load(Ordering::Relaxed) &&
-                               (self.payload_size >= self.header_size || timer.is_elapsed()) {
+                               (self.payload_size >= self.header_size || timer.is_elapsed() || is_quiet_period) { // <-- THAY ĐỔI
 
-                                if !self.digests.is_empty() || timer.is_elapsed() {
+                                if !self.digests.is_empty() || timer.is_elapsed() || is_quiet_period { // <-- THAY ĐỔI
                                     info!(
-                                        "[Proposer][E{}] Parents received for round {}, payload/timer condition met. Proposing header {}.",
+                                        "[Proposer][E{}] Parents received for round {}, payload/timer/quiet condition met. Proposing header {}.", // <-- THAY ĐỔI
                                         self.epoch, round, self.round
                                     );
                                     self.make_header().await; // Creates header, advances round, clears parents/payload
@@ -336,6 +378,7 @@ impl Proposer {
                                     timer.as_mut().reset(deadline);
                                 }
                             }
+                            // *** THAY ĐỔI KẾT THÚC ***
                         } else {
                              debug!("[Proposer][E{}] Received duplicate parents from round {} for header {}. Ignoring.", self.epoch, round, self.round);
                         }
@@ -349,9 +392,11 @@ impl Proposer {
                     }
                 },
 
+                // *** THAY ĐỔI BẮT ĐẦU: Thêm '&& !is_quiet_period' ***
                 // Handle receiving new batch digests from own workers.
-                // Ignore batches if epoch transition is happening.
-                Some((digest, worker_id, batch)) = self.rx_workers.recv(), if !self.epoch_transitioning.load(Ordering::Relaxed) => {
+                // Ignore batches if epoch transition is happening OR in quiet period.
+                Some((digest, worker_id, batch)) = self.rx_workers.recv(), if !self.epoch_transitioning.load(Ordering::Relaxed) && !is_quiet_period => {
+                // *** THAY ĐỔI KẾT THÚC ***
                     // Check if the batch is already committed or pending proposal. Avoid duplicates.
                     if !self.committed_batches.contains_key(&digest) && !self.pending_batches.contains_key(&digest) {
                          // Only store and add if the proposer isn't already aware of this batch.
@@ -378,9 +423,11 @@ impl Proposer {
                     }
                 },
 
+                // *** THAY ĐỔI BẮT ĐẦU: Thêm '&& !is_quiet_period' ***
                 // Handle receiving batches that need to be re-proposed (e.g., after GC removed them from pending).
-                 // Ignore batches if epoch transition is happening.
-                Some((digest, worker_id, batch_data)) = self.rx_repropose.recv(), if !self.epoch_transitioning.load(Ordering::Relaxed) => {
+                 // Ignore batches if epoch transition is happening OR in quiet period.
+                Some((digest, worker_id, batch_data)) = self.rx_repropose.recv(), if !self.epoch_transitioning.load(Ordering::Relaxed) && !is_quiet_period => {
+                // *** THAY ĐỔI KẾT THÚC ***
                     // Check again if committed or pending (state might have changed).
                     if !self.committed_batches.contains_key(&digest) && !self.pending_batches.contains_key(&digest) {
                         warn!("[Proposer][E{}] Re-proposing batch {}", self.epoch, digest);
@@ -404,10 +451,12 @@ impl Proposer {
                 () = &mut timer => {
                     // Only propose if we have parents and are not transitioning.
                      if !self.last_parents.is_empty() && !self.epoch_transitioning.load(Ordering::Relaxed) {
+                         // *** THAY ĐỔI BẮT ĐẦU: Cập nhật log timer ***
                          info!(
-                            "[Proposer][E{}] Timer expired for round {}. Proposing header (payload size {}).",
-                             self.epoch, self.round, self.payload_size
+                            "[Proposer][E{}] Timer expired for round {}. Proposing header (payload size {}, quiet_period={}).",
+                             self.epoch, self.round, self.payload_size, is_quiet_period
                         );
+                        // *** THAY ĐỔI KẾT THÚC ***
                         self.make_header().await; // Creates header (possibly empty), advances round, clears parents/payload.
                     } else if self.epoch_transitioning.load(Ordering::Relaxed){
                          debug!("[Proposer][E{}] Timer expired during epoch transition. Waiting.", self.epoch);

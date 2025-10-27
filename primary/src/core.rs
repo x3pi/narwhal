@@ -39,6 +39,14 @@ const LAG_THRESHOLD: Round = 50; // Round difference triggering sync mode
 // Interval for triggering committee reconfiguration checks
 pub const RECONFIGURE_INTERVAL: Round = 100;
 
+// *** THAY ĐỔI BẮT ĐẦU: Giảm grace period và thêm quiet period ***
+// Số round đệm (rỗng) để chạy trước khi kích hoạt reconfigure.
+// Đặt là 1 để R100 là round cuối cùng, trigger ở R101.
+pub const GRACE_PERIOD_ROUNDS: Round = 1;
+// Số round "yên tĩnh" trước khi reconfigure (R95-R100).
+pub const QUIET_PERIOD_ROUNDS: Round = 5;
+// *** THAY ĐỔI KẾT THÚC ***
+
 // Internal state structure for synchronization process
 struct SyncState {
     final_target_round: Round,   // The ultimate round we aim to sync up to
@@ -88,7 +96,6 @@ pub struct Core {
     network: ReliableSender,                     // Network sender for reliable P2P messages
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>, // Handles for cancelling network requests
     sync_state: Option<SyncState>, // State indicating if the node is currently syncing
-                                   // epoch_transitioning: Arc<AtomicBool>, // Flag indicating reconfiguration is in progress <-- BỎ CỜ NÀY
 }
 
 impl Core {
@@ -109,7 +116,7 @@ impl Core {
         tx_proposer: Sender<(Vec<Digest>, Round)>,
         tx_reconfigure: broadcast::Sender<ReconfigureNotification>,
         rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
-        _epoch_transitioning: Arc<AtomicBool>, // Pass the flag, but Core won't use it internally <-- SỬA COMMENT
+        _epoch_transitioning: Arc<AtomicBool>, // Bỏ qua, không dùng cờ này trong Core
     ) {
         tokio::spawn(async move {
             // Read initial epoch from the committee
@@ -141,7 +148,6 @@ impl Core {
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 sync_state: None, // Start in Running state
-                                  // epoch_transitioning, // Store the flag <-- BỎ LƯU CỜ
             }
             .run()
             .await;
@@ -482,7 +488,9 @@ impl Core {
                     }
                     committee_guard
                         .primary(&header.author)
-                        .map_err(|e| DagError::UnknownAuthority(header.author)) // Map ConfigError to DagError
+                        // *** THAY ĐỔI BẮT ĐẦU: Sửa lỗi unused variable ***
+                        .map_err(|_| DagError::UnknownAuthority(header.author)) // Map ConfigError to DagError
+                                                                                // *** THAY ĐỔI KẾT THÚC ***
                                                                                 // Lock released here
                 };
 
@@ -791,21 +799,27 @@ impl Core {
         if let Some(parents) = parents_option {
             // Parents are the digests of the quorum of certificates forming round N.
             // These will be used by the Proposer to create Header for round N+1.
-            let formed_round = certificate.round(); // <-- SỬA tên biến
+            let formed_round = certificate.round();
             info!(
-                "[Core][E{}] Quorum reached for round {}. Sending {} parents to Proposer.",
+                "[Core][E{}] Quorum reached for round {}. Sending {} parents to Proposer (for R{}).", // <-- SỬA LOG
                 self.epoch,
                 formed_round,
-                parents.len() // <-- SỬA tên biến
+                parents.len(),
+                formed_round + 1 // <-- THÊM
             );
 
+            // *** THAY ĐỔI BẮT ĐẦU: Logic Reconfigure đã được sửa đổi ***
             // --- Reconfiguration Check ---
             // Check if the *next* round (N+1) is a reconfiguration boundary.
-            let proposing_round = formed_round + 1; // <-- SỬA tên biến
-            if proposing_round > 0 && proposing_round % RECONFIGURE_INTERVAL == 0 {
+            let proposing_round = formed_round + 1;
+
+            // TÍNH TOÁN ROUND KÍCH HOẠT MỚI (100 + 1 = 101)
+            let reconfigure_trigger_round = RECONFIGURE_INTERVAL + GRACE_PERIOD_ROUNDS;
+
+            if proposing_round > 0 && proposing_round == reconfigure_trigger_round {
                 info!(
-                    "[Core][E{}] Round {} is reconfiguration boundary. Signaling committee reconfiguration.",
-                     self.epoch, proposing_round
+                    "[Core][E{}] Round {} IS the reconfiguration trigger round {}. Signaling committee reconfiguration.", // Sửa log
+                     self.epoch, proposing_round, reconfigure_trigger_round
                 );
                 // Send notification *before* sending parents to proposer for this round.
                 // The notification includes the *current* committee (epoch N).
@@ -820,32 +834,21 @@ impl Core {
                         self.epoch
                     );
                 }
-                // Set the transitioning flag immediately after sending the signal
-                // self.epoch_transitioning.store(true, Ordering::Relaxed); // <-- BỎ CỜ NÀY
-                warn!("[Core][E{}] Signaled reconfig for R{}. Parent sending might be suppressed if flag is set elsewhere.", self.epoch, proposing_round);
-                // <-- SỬA LOG
             }
+            // *** THAY ĐỔI KẾT THÚC ***
 
-            // Send parents to Proposer unless we are currently transitioning epochs.
-            // if !self.epoch_transitioning.load(Ordering::Relaxed) { // <-- BỎ GUARD CỜ
+            // Send parents to Proposer
+            // (Không cần cờ 'epoch_transitioning' ở đây nữa, Proposer sẽ tự kiểm tra round)
             if let Err(e) = self
                 .tx_proposer
-                .send((parents, formed_round)) // Send (parent_digests, round_N) <-- SỬA tên biến
+                .send((parents, formed_round)) // Send (parent_digests, round_N)
                 .await
             {
                 error!(
                     "[Core][E{}] Failed to send parents for round {} to Proposer: {}",
-                    self.epoch,
-                    formed_round,
-                    e // <-- SỬA tên biến
+                    self.epoch, formed_round, e
                 );
             }
-            // } else { // <-- BỎ GUARD CỜ
-            //      warn!(
-            //         "[Core][E{}] Epoch transitioning. Suppressing sending parents for round {} to Proposer.",
-            //          self.epoch, formed_round // <-- SỬA tên biến
-            //     );
-            // }
         }
 
         // --- Send to Consensus ---
@@ -874,8 +877,8 @@ impl Core {
                     "[Core][E{}] Failed to deliver certificate {} (R{}) to consensus: {}",
                     self.epoch,
                     cert_digest,
-                    self.dag_round,
-                    e // Use round from cert or dag_round? Use dag_round for consistency.
+                    self.dag_round, // Ghi log dag_round tại thời điểm lỗi
+                    e
                 );
                 // Depending on design, might need to panic or attempt recovery.
                 // For now, just log the warning.
@@ -884,7 +887,7 @@ impl Core {
                     "[Core][E{}] Certificate {} (R{}) sent to consensus.",
                     self.epoch,
                     cert_digest,
-                    self.dag_round
+                    self.dag_round // Ghi log dag_round
                 );
             }
         } else {
@@ -1125,11 +1128,7 @@ impl Core {
         }
 
         // --- Handling logic when in Running State ---
-        // Ensure not transitioning before processing normal messages
-        // if self.epoch_transitioning.load(Ordering::Relaxed) { // <-- BỎ GUARD CỜ
-        //     warn!("[Core][E{}] Ignoring message {:?} during epoch transition.", self.epoch, message);
-        //     return Ok(());
-        // }
+        // (Không cần cờ epoch_transitioning ở đây nữa)
 
         match message {
             // Received Header from peer or loopback (after dependencies met)
@@ -1277,9 +1276,8 @@ impl Core {
                                 info!("[Core] Committee Arc updated to epoch {}. Resetting internal state.", updated_committee_epoch);
                                 // Perform the state reset for the new epoch.
                                 self.reset_state_for_new_epoch(updated_committee_epoch);
-                                // Crucially, unset the transitioning flag *after* Core has reset
-                                // self.epoch_transitioning.store(false, Ordering::Relaxed); // <-- BỎ CỜ NÀY
-                                warn!("[Core][E{}] State reset for new epoch complete.", self.epoch); // <-- SỬA LOG
+                                // (Không cần cờ epoch_transitioning nữa)
+                                info!("[Core][E{}] State reset for new epoch complete.", self.epoch); // <-- SỬA LOG
 
                             }
                             Ok(()) // Continue loop after handling signal
@@ -1296,14 +1294,17 @@ impl Core {
                     }
                 },
 
+                // *** THAY ĐỔI BẮT ĐẦU: Sửa lỗi borrow ***
                 // Handle messages from other primaries (Headers, Votes, Certificates)
-                // Only process if not syncing.
-                Some(message) = self.rx_primaries.recv(), if self.sync_state.is_none() => {
-                    self.handle_message(message).await
+                // Receive message first, then handle based on sync_state.
+                Some(message) = self.rx_primaries.recv() => {
+                    self.handle_message(message).await // handle_message already checks sync_state internally
                 },
+                // *** THAY ĐỔI KẾT THÚC ***
+
 
                 // Handle headers returned by HeaderWaiter (dependencies met)
-                 // Only process if not syncing.
+                 // Chỉ xử lý nếu không syncing.
                 Some(header) = self.rx_header_waiter.recv(), if self.sync_state.is_none() => {
                     // Sanitize checks epoch/GC round. Process checks parents/payload/votes.
                     match self.sanitize_header(&header).await {
@@ -1316,7 +1317,7 @@ impl Core {
                 },
 
                 // Handle certificates returned by CertificateWaiter (dependencies met)
-                 // Only process if not syncing.
+                 // Chỉ xử lý nếu không syncing.
                 Some(certificate) = self.rx_certificate_waiter.recv(), if self.sync_state.is_none() => {
                      // Sanitize checks epoch/GC round. Process handles storage, aggregation, consensus send.
                      match self.sanitize_certificate(&certificate).await {
@@ -1335,7 +1336,7 @@ impl Core {
                 },
 
                 // Handle own headers created by Proposer
-                 // Only process if not syncing.
+                 // Chỉ xử lý nếu không syncing.
                 Some(header) = self.rx_proposer.recv(), if self.sync_state.is_none() => {
                     // Assumes own header is sanitized correctly by Proposer.
                     self.process_own_header(header).await

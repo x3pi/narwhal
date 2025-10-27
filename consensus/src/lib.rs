@@ -11,7 +11,7 @@ use log::{debug, error, info, log_enabled, trace, warn};
 use primary::{Certificate, Epoch, ReconfigureNotification, Round}; // Import ReconfigureNotification
 use serde::{Deserialize, Serialize};
 use std::cmp::max;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet}; // Đảm bảo HashSet được import
 use std::sync::Arc;
 use store::Store;
 use thiserror::Error;
@@ -1084,14 +1084,14 @@ impl ConsensusAlgorithm for ConsensusProtocol {
 pub struct Consensus {
     store: Store,
     rx_primary: Receiver<Certificate>,
-    // [SỬA LỖI] Kênh này (tx_output) gửi (Vec<CommittedSubDag>, ...)
-    tx_output: broadcast::Sender<(Vec<CommittedSubDag>, Committee, Option<Round>)>,
+    // Chỉ gửi khi commit thành công
+    tx_output: broadcast::Sender<(Vec<CommittedSubDag>, Committee, Option<Round>)>, // Giữ Option<Round> để tương thích type, nhưng luôn là None
     committee: Arc<RwLock<Committee>>,
     protocol: Box<dyn ConsensusAlgorithm>,
     metrics: Arc<RwLock<ConsensusMetrics>>,
     current_protocol_epoch: Epoch,
     rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
-    gc_depth: Round,
+    // processed_consensus_rounds: HashSet<Round>, // <-- XÓA BỎ
 }
 
 impl Consensus {
@@ -1136,7 +1136,7 @@ impl Consensus {
         parameters: config::Parameters,
         store: Store,
         rx_primary: Receiver<Certificate>,
-        _tx_primary: Sender<Certificate>, // [SỬA LỖI] Đổi tên thành _tx_primary vì nó không dùng
+        _tx_primary: Sender<Certificate>,
         tx_output: broadcast::Sender<(Vec<CommittedSubDag>, Committee, Option<Round>)>,
         rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     ) {
@@ -1147,8 +1147,6 @@ impl Consensus {
         tokio::spawn(async move {
             let initial_committee = committee_clone_for_spawn.read().await.clone();
             let initial_epoch = initial_committee.epoch;
-
-            // [SỬA LỖI] Chúng ta chỉ cần tx_primary cho GC của Core, không phải ở đây
             let protocol: Box<dyn ConsensusAlgorithm> =
                 Box::new(Bullshark::new(initial_committee.clone(), gc_depth));
 
@@ -1168,7 +1166,7 @@ impl Consensus {
                 metrics,
                 current_protocol_epoch: initial_epoch,
                 rx_reconfigure,
-                gc_depth,
+                // processed_consensus_rounds: HashSet::new(), // <-- XÓA BỎ
             }
             .run()
             .await;
@@ -1177,6 +1175,7 @@ impl Consensus {
 
     // Loads the consensus state from storage (đã sửa ở trên)
     async fn load_state(&mut self) -> ConsensusState {
+        // self.processed_consensus_rounds.clear(); // <-- XÓA BỎ
         match self.store.read(STATE_KEY.to_vec()).await {
             Ok(Some(bytes)) => match bincode::deserialize::<ConsensusState>(&bytes) {
                 Ok(mut state) => {
@@ -1198,9 +1197,11 @@ impl Consensus {
                             info!("Loaded state from old epoch {} is outdated (expected {}). Resetting state.", state.epoch, expected_epoch);
                         }
                         state = ConsensusState::new(current_genesis, expected_epoch);
+                        // self.processed_consensus_rounds.clear(); // <-- XÓA BỎ
                     } else if state.epoch > expected_epoch {
                         error!("CRITICAL: Loaded consensus state epoch {} is NEWER than committee epoch {}. Resetting state, but this might indicate a problem.", state.epoch, expected_epoch);
                         state = ConsensusState::new(current_genesis, expected_epoch);
+                        // self.processed_consensus_rounds.clear(); // <-- XÓA BỎ
                     }
                     state
                 }
@@ -1213,6 +1214,7 @@ impl Consensus {
                             "Failed to deserialize consensus state from store: {}. Re-initializing from genesis for epoch {}.",
                             e, current_epoch
                         );
+                    // self.processed_consensus_rounds.clear(); // <-- XÓA BỎ
                     ConsensusState::new(current_genesis, current_epoch)
                 }
             },
@@ -1238,6 +1240,7 @@ impl Consensus {
                     "{}. Initializing from genesis for epoch {} ({})",
                     log_message, current_epoch, error_context
                 );
+                // self.processed_consensus_rounds.clear(); // <-- XÓA BỎ
                 ConsensusState::new(current_genesis, current_epoch)
             }
         }
@@ -1306,7 +1309,11 @@ impl Consensus {
                                 self.current_protocol_epoch = updated_committee_epoch;
                                 self.protocol.update_committee(new_committee.clone());
                                 let new_genesis = Certificate::genesis(&new_committee);
+
+                                // *** XÓA SET KHI TÁI CẤU HÌNH ***
+                                // self.processed_consensus_rounds.clear(); // <-- XÓA BỎ
                                 state = ConsensusState::new(new_genesis.clone(), updated_committee_epoch);
+
                                 info!(
                                     "[Consensus] State fully reset for epoch {}. Starting from new genesis. Last committed round reset to 0.",
                                     updated_committee_epoch
@@ -1337,93 +1344,58 @@ impl Consensus {
                 // Handle incoming certificates from the primary core.
                 Some(certificate) = self.rx_primary.recv() => {
                     let current_committee_for_output = self.committee.read().await.clone();
-
-                    if certificate.epoch() != self.current_protocol_epoch {
-                        warn!(
-                            "[Consensus] Received certificate from wrong epoch {} (current is {}). Discarding C{}({}).",
-                            certificate.epoch(), self.current_protocol_epoch, certificate.round(), certificate.origin()
-                        );
-                        continue;
-                    }
-
+                    if certificate.epoch() != self.current_protocol_epoch { continue; }
                     let cert_round = certificate.round();
                     let cert_digest = certificate.digest();
-                    trace!(
-                        "[Consensus][E{}] Received certificate C{}({}) digest {}",
-                        self.current_protocol_epoch, cert_round, certificate.origin(), cert_digest
-                    );
-
                     let mut metrics_guard = self.metrics.write().await;
-                    let potential_commit_leader_round = cert_round.saturating_sub(1);
+                    // Bỏ potential_commit_leader_round nếu không dùng nữa
 
-                    // Process the certificate. `state` is modified in-place.
-                    // `order_dag` (đã sửa) bên trong `process_certificate` sẽ lọc bỏ các cert đã commit.
+
                     match self.protocol.process_certificate(&mut state, certificate, &mut *metrics_guard) {
-                        Ok((committed_sub_dags, commit_occurred)) => {
+                        // *** === THAY ĐỔI LOGIC GỬI === ***
+                        Ok((committed_sub_dags, commit_occurred)) => { // Quay lại dùng kiểu trả về cũ
                             drop(metrics_guard);
 
-                            if commit_occurred {
+                            if commit_occurred { // Chỉ gửi khi CÓ commit
                                 debug!(
-                                    "[Consensus][E{}] Commit occurred. New last committed round: {}. Saving state.",
+                                    "[Consensus][E{}] Commit occurred. New last committed round: {}.",
                                     self.current_protocol_epoch, state.last_committed_round
                                 );
                                 if let Err(e) = self.save_state(&state).await {
-                                    error!("CRITICAL: Failed to save consensus state after commit for epoch {}: {}", self.current_protocol_epoch, e);
+                                    error!("CRITICAL: Failed to save consensus state after commit: {}", e);
                                     break;
-                                }
+                                 }
 
-                                // [SỬA LỖI] Gửi (Vec<CommittedSubDag>, ...)
-                                // `committed_sub_dags` đã được lọc bởi `order_dag` (đã sửa)
+                                // Chỉ gửi nếu danh sách dags commit không rỗng
                                 if !committed_sub_dags.is_empty() {
                                     if log_enabled!(log::Level::Info) {
                                         for dag in &committed_sub_dags {
                                             info!("[Consensus][E{}] Committed leader L{}({}) digest {}", self.current_protocol_epoch, dag.leader.round(), dag.leader.origin(), dag.leader.digest());
-                                            #[cfg(feature = "benchmark")]
-                                            for cert in &dag.certificates {
-                                                for digest in cert.header.payload.keys() {
-                                                    info!("Committed {} -> {:?}", cert.header, digest);
-                                                }
-                                            }
                                         }
                                     }
 
+                                    // Luôn gửi None cho skipped_round khi commit
                                     let output_tuple = (committed_sub_dags.clone(), current_committee_for_output.clone(), None);
                                     if self.tx_output.send(output_tuple).is_err() {
-                                        debug!("[Consensus][E{}] No receivers for committed dags (this is okay).", self.current_protocol_epoch);
-                                    }
+                                         debug!("[Consensus][E{}] No receivers for committed dags (this is okay).", self.current_protocol_epoch);
+                                     }
                                 } else {
-                                    // Điều này là bình thường nếu sub-DAG chỉ chứa các cert đã được commit (đã lọc)
-                                    debug!("[Consensus][E{}] Commit reported by protocol, but generated sequence is empty (likely filtered).", self.current_protocol_epoch);
-                                }
-                            } else {
-                                trace!("[Consensus][E{}] No commit occurred for certificate round {}", self.current_protocol_epoch, cert_round);
-
-                                // Gửi thông báo skipped round (logic Bullshark)
-                                if potential_commit_leader_round > state.last_committed_round
-                                    && potential_commit_leader_round % 2 == 0
-                                    && self.protocol.name() == "Bullshark"
-                                {
-                                    debug!(
-                                        "[Consensus][E{}] Potential leader round {} was not committed (last committed is {}). Sending skipped round notification.",
-                                        self.current_protocol_epoch, potential_commit_leader_round, state.last_committed_round
-                                    );
-                                    let output_tuple = (Vec::new(), current_committee_for_output, Some(potential_commit_leader_round));
-                                    if self.tx_output.send(output_tuple).is_err() {
-                                        debug!("[Consensus][E{}] No receivers for skipped round {} (this is okay).", self.current_protocol_epoch, potential_commit_leader_round);
-                                    }
+                                    debug!("[Consensus][E{}] Commit reported by protocol, but generated sequence is empty (likely filtered). No message sent.", self.current_protocol_epoch);
                                 }
                             }
+                            // BỎ HOÀN TOÀN NHÁNH 'else' (khi commit_occurred == false)
+                            // Không gửi gì cả nếu không có commit
                         }
                         Err(e) => {
                             drop(metrics_guard);
                             error!("[Consensus][E{}] Error processing certificate {}: {}", self.current_protocol_epoch, cert_digest, e);
-                        }
+                         }
                     }
                 },
-
-                else => {
+                // ... (nhánh else) ...
+                 else => {
                     info!("[Consensus] Primary Core channel closed. Consensus engine shutting down.");
-                    break;
+                    break; // Exit loop if primary channel closes
                 }
             }
         } // End main loop.
@@ -1447,42 +1419,57 @@ impl Consensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::PrimaryAddresses;
-    use crypto::generate_keypair;
+    use config::{Authority, PrimaryAddresses, WorkerAddresses}; // Thêm WorkerAddresses
+    use crypto::{
+        generate_consensus_keypair, generate_keypair, ConsensusPublicKey, ConsensusSecretKey,
+        SecretKey,
+    }; // Thêm SecretKey và consensus keys
+    use primary::Header; // Thêm Header
+    use rand::rngs::StdRng; // Thêm StdRng
+    use rand::SeedableRng as _; // Thêm SeedableRng
     use std::collections::BTreeSet;
-    use tokio::sync::mpsc::channel;
+    use std::fs;
+    use tokio::sync::mpsc::channel; // Thêm fs
 
     // Fixture
-    fn keys() -> Vec<(PublicKey, SecretKey)> {
+    fn keys() -> Vec<(PublicKey, SecretKey, ConsensusPublicKey, ConsensusSecretKey)> {
+        // Sửa signature
         let mut rng = StdRng::from_seed([0; 32]);
-        (0..4).map(|_| generate_keypair(&mut rng)).collect()
+        (0..4)
+            .map(|_| {
+                let (pk, sk) = generate_keypair(&mut rng);
+                let (cpk, csk) = generate_consensus_keypair(&mut rng); // Tạo cả consensus keys
+                (pk, sk, cpk, csk)
+            })
+            .collect()
     }
 
     // Fixture
-    pub fn mock_committee(keys: &[(PublicKey, SecretKey)]) -> Committee {
+    pub fn mock_committee() -> Committee {
+        // Bỏ tham số keys
+        let keys_data = keys(); // Gọi hàm keys() bên trong
         let epoch = 1; // Test epoch
         Committee {
-            authorities: keys
+            authorities: keys_data // Sử dụng keys_data đã tạo
                 .iter()
-                .map(|(id, _)| {
+                .map(|(id, _, consensus_key, _)| {
+                    // Lấy consensus_key
                     (
                         *id,
                         Authority {
                             stake: 1,
-                            // SỬA: Tạo khóa đồng thuận giả
-                            consensus_key: ConsensusPublicKey::default(),
+                            consensus_key: consensus_key.clone(), // Clone consensus_key
                             primary: PrimaryAddresses {
                                 primary_to_primary: "0.0.0.0:0".parse().unwrap(),
                                 worker_to_primary: "0.0.0.0:0".parse().unwrap(),
                             },
-                            workers: HashMap::default(),
-                            // SỬA: Thêm p2p_address giả
+                            workers: HashMap::default(), // Giữ workers rỗng cho test đơn giản
                             p2p_address: "0.0.0.0:0".to_string(),
                         },
                     )
                 })
                 .collect(),
-            epoch, // SỬA: Thêm epoch
+            epoch,
         }
     }
 
@@ -1513,8 +1500,9 @@ mod tests {
         epoch: Epoch, // SỬA: Thêm epoch
         initial_parents: &BTreeSet<Digest>,
         keys: &[PublicKey],
-    ) -> (VecDeque<Certificate>, BTreeSet<Digest>) {
-        let mut certificates = VecDeque::new();
+    ) -> (std::collections::VecDeque<Certificate>, BTreeSet<Digest>) {
+        // Sửa: Thêm std::collections::
+        let mut certificates = std::collections::VecDeque::new(); // Sửa: Thêm std::collections::
         let mut parents = initial_parents.iter().cloned().collect::<BTreeSet<_>>();
         let mut next_parents = BTreeSet::new();
 
@@ -1535,30 +1523,33 @@ mod tests {
 
     #[tokio::test]
     async fn commit_one() {
-        let keys: Vec<_> = keys().into_iter().map(|(x, _)| x).collect();
-        let committee = mock_committee(&keys()); // Tạo committee từ keys
+        let keys_data = keys(); // Lấy dữ liệu keys
+        let keys_pks: Vec<_> = keys_data.iter().map(|(pk, _, _, _)| *pk).collect(); // Lấy public keys
+        let committee = mock_committee(); // Tạo committee từ keys
         let epoch = committee.epoch; // Lấy epoch từ committee
 
         let genesis = Certificate::genesis(&committee)
             .iter()
             .map(|x| x.digest())
             .collect::<BTreeSet<_>>();
-        let (mut certificates, next_parents) = make_certificates(1, 4, epoch, &genesis, &keys); // SỬA: Truyền epoch
+        let (mut certificates, next_parents) = make_certificates(1, 4, epoch, &genesis, &keys_pks); // SỬA: Truyền epoch và keys_pks
 
-        let (_, certificate) = mock_certificate(keys[0], 5, epoch, next_parents); // SỬA: Truyền epoch
+        let (_, certificate) = mock_certificate(keys_pks[0], 5, epoch, next_parents); // SỬA: Truyền epoch
         certificates.push_back(certificate);
 
         let (tx_waiter, rx_waiter) = channel(1);
         let (tx_primary, mut rx_primary) = channel(1);
-        let (tx_output, mut rx_output) = broadcast::channel(10); // SỬA: Dùng broadcast
-        let (tx_reconfigure, rx_reconfigure) = broadcast::channel(1); // SỬA: Thêm kênh reconfigure
+        // SỬA: Dùng broadcast và đúng kiểu tuple
+        let (tx_output, mut rx_output) =
+            broadcast::channel::<(Vec<CommittedSubDag>, Committee, Option<Round>)>(10);
+        let (_tx_reconfigure, rx_reconfigure) = broadcast::channel(1); // SỬA: Thêm kênh reconfigure (dùng _tx vì không gửi)
 
-        let path = ".db_test_commit_one";
-        let _ = std::fs::remove_dir_all(path);
+        let path = ".db_test_consensus_commit_one"; // Sửa tên path
+        let _ = fs::remove_dir_all(path); // Dùng fs thay vì std::fs
         let store = Store::new(path).unwrap();
 
         Consensus::spawn(
-            committee.clone(), // SỬA: Clone committee
+            Arc::new(RwLock::new(committee.clone())), // SỬA: Truyền Arc<RwLock<Committee>>
             config::Parameters {
                 gc_depth: 50,
                 ..Default::default()
@@ -1576,20 +1567,34 @@ mod tests {
         }
 
         // SỬA: Nhận (Vec<CommittedSubDag>, Committee, Option<Round>)
-        let (dags, _, _) = rx_output.recv().await.unwrap();
-        assert_eq!(dags.len(), 1, "Expected 1 CommittedSubDag");
-        let committed_certificates = &dags[0].certificates;
+        // Chúng ta mong đợi commit ở round 5 (khi C5 được xử lý)
+        // Commit này sẽ chứa L2 và các cert liên quan
+        let (dags, _, skipped_round) = rx_output.recv().await.unwrap();
+        assert!(
+            skipped_round.is_none(),
+            "Expected no skipped round, but got {:?}",
+            skipped_round
+        );
+        assert!(!dags.is_empty(), "Expected at least one CommittedSubDag");
 
-        // Sắp xếp certs đã commit (nếu cần)
-        let mut committed_rounds: Vec<Round> =
-            committed_certificates.iter().map(|c| c.round()).collect();
+        // Lấy dag đầu tiên (và duy nhất trong trường hợp này)
+        let dag = &dags[0];
+        assert_eq!(
+            dag.leader.round(),
+            2,
+            "Expected leader of round 2 to be committed"
+        );
+
+        let mut committed_rounds: Vec<Round> = dag.certificates.iter().map(|c| c.round()).collect();
         committed_rounds.sort_unstable();
 
-        let mut expected_rounds: Vec<Round> = vec![];
-        expected_rounds.extend(std::iter::repeat(1).take(4)); // 4 certs ở Round 1
-        expected_rounds.extend(std::iter::repeat(2).take(1)); // 1 cert (leader) ở Round 2
-
-        assert_eq!(committed_rounds, expected_rounds);
-        assert_eq!(dags[0].leader.round(), 2);
+        // Kiểm tra xem các cert của round 1 và leader round 2 có trong đó không
+        let expected_rounds: Vec<Round> = vec![1, 1, 1, 1, 2]; // 4 certs R1 + 1 leader R2
+        assert_eq!(
+            committed_rounds, expected_rounds,
+            "Mismatch in committed rounds"
+        );
     }
+
+    // Thêm các bài test khác tương tự nếu cần
 }
