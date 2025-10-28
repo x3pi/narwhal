@@ -40,6 +40,16 @@ impl SimpleSender {
     }
 
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
+        // DEBUG: Log địa chỉ trước khi gửi để trace task nào gọi
+        if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+            warn!("[SimpleSender::send] ⚠️ ATTEMPTING TO SEND TO INVALID ADDRESS: {} (data size: {} bytes)", 
+                  address, data.len());
+            warn!(
+                "[SimpleSender::send] Stack trace:\n{:?}",
+                std::backtrace::Backtrace::capture()
+            );
+        }
+
         let transport_clone = self.transport.clone();
         let tx = self
             .connections
@@ -66,8 +76,23 @@ impl SimpleSender {
     }
 
     pub async fn broadcast(&mut self, addresses: Vec<SocketAddr>, data: Bytes) {
-        for address in addresses {
-            self.send(address, data.clone()).await;
+        info!(
+            "[SimpleSender::broadcast] Broadcasting to {} addresses, data size: {} bytes",
+            addresses
+                .iter()
+                .map(|addr| addr.to_string())
+                .collect::<Vec<String>>()
+                .join(", "),
+            data.len()
+        );
+        for (idx, address) in addresses.iter().enumerate() {
+            if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                warn!(
+                    "[SimpleSender::broadcast] ⚠️ INVALID ADDRESS #{}: {}",
+                    idx, address
+                );
+            }
+            self.send(*address, data.clone()).await;
         }
     }
 
@@ -144,10 +169,21 @@ impl ConnectionManager {
                     }
                 }
                 Err(e) => {
-                    warn!(
-                        "Failed to connect to {}: {}. Retrying in {:?}...",
-                        self.address, e, retry_delay
-                    );
+                    if self.address.ip().to_string() == "0.0.0.0" || self.address.port() == 0 {
+                        warn!(
+                            "🚨 [ConnectionManager] Failed to connect to INVALID address {}: {}. Retrying in {:?}...",
+                            self.address, e, retry_delay
+                        );
+                        warn!(
+                            "[ConnectionManager] Stack trace:\n{:?}",
+                            std::backtrace::Backtrace::capture()
+                        );
+                    } else {
+                        warn!(
+                            "Failed to connect to {}: {}. Retrying in {:?}...",
+                            self.address, e, retry_delay
+                        );
+                    }
                     sleep(retry_delay).await;
                     retry_delay = Duration::from_millis(
                         (retry_delay.as_millis() * 2).clamp(200, 10_000) as u64,

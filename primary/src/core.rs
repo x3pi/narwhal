@@ -306,12 +306,31 @@ impl Core {
                 warn!("[Core][E{}] Committee epoch changed during own header processing. Aborting broadcast for H{}.", self.epoch, header.round);
                 return Ok(()); // Avoid broadcasting if epoch changed
             }
-            committee_guard
+            let addrs = committee_guard
                 .others_primaries(&self.name)
                 .iter()
-                .map(|(_, x)| x.primary_to_primary)
-                .collect()
+                .map(|(name, x)| {
+                    let addr = x.primary_to_primary;
+                    if addr.ip().to_string() == "0.0.0.0" || addr.port() == 0 {
+                        warn!(
+                            "[Core] ⚠️ INVALID PRIMARY ADDRESS for {} when broadcasting H{}: {}",
+                            name, header.round, addr
+                        );
+                    }
+                    addr
+                })
+                .collect();
+            addrs
         };
+
+        // DEBUG: Log địa chỉ trước khi broadcast
+        info!(
+            "[Core] Broadcasting header H{} to {} addresses: {:?}",
+            header.round,
+            addresses.len(),
+            addresses
+        );
+
         if !addresses.is_empty() {
             let bytes_msg = bincode::serialize(&PrimaryMessage::Header(header.clone()))
                 .expect("Failed to serialize header message");
@@ -507,6 +526,20 @@ impl Core {
                 } else if let Ok(addresses) = target_primary_address_result {
                     // <-- Corrected pattern matching
                     // If voting for a peer's header, send the vote reliably.
+
+                    // DEBUG: Log địa chỉ trước khi gửi vote để trace
+                    if addresses.primary_to_primary.ip().to_string() == "0.0.0.0"
+                        || addresses.primary_to_primary.port() == 0
+                    {
+                        warn!("[Core] ⚠️ SENDING VOTE TO INVALID ADDRESS {} for H{}({}), header author: {}, vote origin: {}, epoch: {}", 
+                              addresses.primary_to_primary, header.round, header.author, header.author, vote.origin, self.epoch);
+                    } else {
+                        info!(
+                            "[Core] Sending vote for H{}({}) to {}",
+                            header.round, header.author, addresses.primary_to_primary
+                        );
+                    }
+
                     let vote_bytes = bincode::serialize(&PrimaryMessage::Vote(vote))
                         .expect("Failed to serialize vote message");
                     let handler = self
@@ -603,12 +636,29 @@ impl Core {
                     warn!("[Core][E{}] Committee epoch changed before broadcasting C{}({}). Aborting broadcast.", self.epoch, certificate.round(), certificate.origin());
                     return Ok(());
                 }
-                committee_guard
+                let addrs = committee_guard
                     .others_primaries(&self.name)
                     .iter()
-                    .map(|(_, x)| x.primary_to_primary)
-                    .collect()
+                    .map(|(name, x)| {
+                        let addr = x.primary_to_primary;
+                        if addr.ip().to_string() == "0.0.0.0" || addr.port() == 0 {
+                            warn!("[Core] ⚠️ INVALID PRIMARY ADDRESS for {}: {}", name, addr);
+                        }
+                        addr
+                    })
+                    .collect();
+                addrs
             };
+
+            // DEBUG: Log địa chỉ trước khi broadcast
+            info!(
+                "[Core] Broadcasting certificate C{}({}) to {} addresses: {:?}",
+                certificate.round(),
+                certificate.origin(),
+                addresses.len(),
+                addresses
+            );
+
             if !addresses.is_empty() {
                 let cert_bytes_msg =
                     bincode::serialize(&PrimaryMessage::Certificate(certificate.clone()))

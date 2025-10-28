@@ -5,7 +5,7 @@ use crypto::{
     generate_consensus_keypair, generate_production_keypair, ConsensusPublicKey,
     ConsensusSecretKey, PublicKey, SecretKey,
 };
-use log::info;
+use log::{info, warn};
 use rand::SeedableRng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -199,6 +199,17 @@ impl Committee {
                     val.primary_address, e
                 ))
             })?;
+
+            // DEBUG: Log primary address để trace
+            if primary_to_primary.ip().to_string() == "0.0.0.0" || primary_to_primary.port() == 0 {
+                warn!("[Config] ⚠️ INVALID PRIMARY ADDRESS for validator {} (address: {}, pubkey_secp: {}): {}", 
+                      val.address, val.address, &val.pubkey_secp[..20], primary_to_primary);
+            } else {
+                info!(
+                    "[Config] Loaded validator {} with primary_address: {}",
+                    val.address, primary_to_primary
+                );
+            }
 
             let (worker_to_primary, primary_to_worker, transactions) =
                 if val.address.to_lowercase() == self_address.to_lowercase() {

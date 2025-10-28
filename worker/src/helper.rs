@@ -76,6 +76,11 @@ impl Helper {
                     Ok(Some(data)) => {
                         // *** SỬA LỖI: Chỉ gửi nếu dữ liệu không rỗng ***
                         if !data.is_empty() {
+                            // DEBUG: Log địa chỉ trước khi gửi batch data
+                            if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                warn!("[Worker::Helper] ⚠️ SENDING BATCH DATA TO INVALID ADDRESS: {} (digest: {})", address, digest);
+                            }
+
                             // *** SỬA LỖI: Clone `data` để sử dụng lại ***
                             // Gửi data gốc đã đọc từ store
                             self.network.send(address, Bytes::from(data.clone())).await;

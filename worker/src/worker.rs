@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 // *** SỬA LỖI: Xóa import không dùng ***
 // use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
 use std::error::Error;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
@@ -56,43 +57,52 @@ pub struct Worker {
     committee: Arc<RwLock<Committee>>,
     parameters: Parameters,
     store: Store,
+    // *** THÊM: Lưu địa chỉ primary nội bộ để không đổi theo epoch ***
+    primary_address: SocketAddr,
 }
 
 impl Worker {
-    pub async fn spawn(
+    pub fn spawn(
         name: PublicKey,
         id: WorkerId,
-        initial_committee: Committee,
+        committee: Arc<RwLock<Committee>>,
         parameters: Parameters,
         store: Store,
     ) {
-        // *** THAY ĐỔI: Khởi tạo committee là Arc<RwLock<...>> ***
-        let committee = Arc::new(RwLock::new(initial_committee));
-        let worker = Self {
-            name,
-            id,
-            committee, // Bây giờ là Arc<RwLock<Committee>>
-            parameters,
-            store,
-        };
+        tokio::spawn(async move {
+            // *** Lấy địa chỉ primary_address một lần duy nhất lúc khởi động ***
+            let primary_address = {
+                let committee_reader = committee.read().await;
+                committee_reader
+                    .primary(&name)
+                    .expect("Our public key is not in the committee")
+                    .worker_to_primary
+            };
 
+            // *** Log địa chỉ primary được lưu ***
+            info!(
+                "Worker {} initialized with primary address: {} (will not change across epochs)",
+                id, primary_address
+            );
+
+            Self {
+                name,
+                id,
+                committee,
+                parameters,
+                store,
+                primary_address, // *** Lưu địa chỉ ***
+            }
+            .run()
+            .await;
+        });
+    }
+
+    async fn run(&self) {
         let transport = QuicTransport::new();
-
-        worker.handle_primary_messages(&transport).await;
-        worker.handle_clients_transactions(&transport).await;
-        worker.handle_workers_messages(&transport).await;
-
-        // Đọc committee từ Arc để lấy worker_info
-        let committee_reader = worker.committee.read().await;
-        let worker_info = committee_reader
-            .worker(&worker.name, &worker.id)
-            .expect("Our public key or worker id is not in the committee");
-
-        info!(
-            "Worker {} successfully booted on {}",
-            id,
-            worker_info.transactions.ip()
-        );
+        self.handle_clients_transactions(&transport).await;
+        self.handle_workers_messages(&transport).await;
+        self.handle_primary_messages(&transport).await;
     }
 
     async fn handle_primary_messages(&self, transport: &QuicTransport) {
@@ -159,10 +169,11 @@ impl Worker {
             .expect("Failed to create transaction listener");
         NetworkReceiver::spawn(listener, TxReceiverHandler { tx_batch_maker }); // <--- Sử dụng tên đã import
 
-        let primary_address = committee_reader
-            .primary(&self.name)
-            .expect("Our public key is not in the committee")
-            .worker_to_primary;
+        // *** THAY ĐỔI: Không lấy primary_address từ committee nữa, dùng self.primary_address ***
+        // let primary_address = committee_reader
+        //     .primary(&self.name)
+        //     .expect("Our public key is not in the committee")
+        //     .worker_to_primary;
 
         let others_workers: Vec<_> = committee_reader // <-- Đảm bảo kiểu dữ liệu rõ ràng
             .others_workers(&self.name, &self.id)
@@ -199,7 +210,7 @@ impl Worker {
             self.store.clone(),
             rx_processor,
             SimpleSender::new(),
-            primary_address,
+            self.primary_address, // *** SỬ DỤNG địa chỉ đã lưu ***
             /* own_digest */ true, // Tạo digest cho batch của chính mình
         );
 
@@ -237,10 +248,11 @@ impl Worker {
         // *** THAY ĐỔI: Clone Arc committee để truyền vào Helper ***
         let committee_clone_for_helper = self.committee.clone();
 
-        let primary_address = committee_reader
-            .primary(&self.name)
-            .expect("Our public key is not in the committee")
-            .worker_to_primary;
+        // *** THAY ĐỔI: Không lấy primary_address từ committee nữa ***
+        // let primary_address = committee_reader
+        //     .primary(&self.name)
+        //     .expect("Our public key is not in the committee")
+        //     .worker_to_primary;
         drop(committee_reader); // Release lock
 
         // *** THAY ĐỔI: Truyền Arc committee đã clone vào Helper::spawn ***
@@ -256,7 +268,7 @@ impl Worker {
             self.store.clone(),
             rx_processor,
             SimpleSender::new(),
-            primary_address,
+            self.primary_address, // *** SỬ DỤNG địa chỉ đã lưu ***
             /* own_digest */
             false, // Không tạo digest cho batch của người khác
         );

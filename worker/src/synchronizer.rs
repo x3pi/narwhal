@@ -153,6 +153,12 @@ impl Synchronizer {
                                 };
                                 let message = WorkerMessage::BatchRequest(missing, self.name);
                                 let serialized = bincode::serialize(&message).expect("Failed to serialize message");
+
+                                // DEBUG: Log địa chỉ trước khi gửi batch request
+                                if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                    warn!("[Synchronizer] ⚠️ SENDING BATCH REQUEST TO INVALID ADDRESS: {} (target: {})", address, target);
+                                }
+
                                 self.network.send(address, Bytes::from(serialized)).await;
                             }
                         },

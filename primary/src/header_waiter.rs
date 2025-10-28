@@ -158,6 +158,12 @@ impl HeaderWaiter {
                                     .worker(&author, &worker_id)
                                     .expect("Author of valid header is not in the committee")
                                     .primary_to_worker;
+
+                                // DEBUG: Log địa chỉ trước khi gửi sync request
+                                if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                    warn!("[HeaderWaiter] ⚠️ SENDING SYNC TO INVALID WORKER ADDRESS: {} (author: {}, worker_id: {})", address, author, worker_id);
+                                }
+
                                 let message = PrimaryWorkerMessage::Synchronize(digests, author);
                                 let bytes = bincode::serialize(&message)
                                     .expect("Failed to serialize batch sync request");
@@ -206,6 +212,12 @@ impl HeaderWaiter {
                                     .primary(&author)
                                     .expect("Author of valid header not in the committee")
                                     .primary_to_primary;
+
+                                // DEBUG: Log địa chỉ trước khi gửi certificate request
+                                if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                    warn!("[HeaderWaiter] ⚠️ SENDING CERT REQUEST TO INVALID ADDRESS: {} (author: {})", address, author);
+                                }
+
                                 let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                                 self.network.send(address, Bytes::from(bytes)).await;

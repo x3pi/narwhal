@@ -31,6 +31,16 @@ impl PrimaryConnector {
     async fn run(&mut self) {
         // đưa rx vào để lắng nghe
         while let Some(digest) = self.rx_digest.recv().await {
+            // DEBUG: Log địa chỉ trước khi gửi digest đến primary
+            if self.primary_address.ip().to_string() == "0.0.0.0"
+                || self.primary_address.port() == 0
+            {
+                warn!(
+                    "[PrimaryConnector] ⚠️ SENDING DIGEST TO INVALID PRIMARY ADDRESS: {}",
+                    self.primary_address
+                );
+            }
+
             // Send the digest through the network.
             self.network
                 .send(self.primary_address, Bytes::from(digest))

@@ -46,6 +46,11 @@ impl Processor {
 
                 store.write(digest.to_vec(), batch.clone()).await;
 
+                // DEBUG: Log địa chỉ trước khi gửi batch đến primary
+                if primary_address.ip().to_string() == "0.0.0.0" || primary_address.port() == 0 {
+                    ::log::warn!("[Processor] ⚠️ SENDING BATCH TO INVALID PRIMARY ADDRESS: {}", primary_address);
+                }
+
                 let message = match own_digest {
                     true => WorkerPrimaryMessage::OurBatch(digest, id, batch),
                     false => WorkerPrimaryMessage::OthersBatch(digest, id, batch),

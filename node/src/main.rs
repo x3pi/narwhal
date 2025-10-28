@@ -15,8 +15,6 @@ use crypto::Hash as _;
 use env_logger::Env;
 // THAY ĐỔI: Xóa `trace` không dùng
 use log::{debug, error, info, warn};
-use network::SimpleSender;
-use primary::PrimaryWorkerMessage;
 // THAY ĐỔI: Import thêm GRACE_PERIOD_ROUNDS và BLOCKS_PER_EPOCH
 use primary::{core::RECONFIGURE_INTERVAL, Core, Primary, ReconfigureNotification, Round};
 use prost::Message;
@@ -130,6 +128,34 @@ async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Resul
     };
     let mut wrapper_list = ValidatorInfo::default();
     for proto_val in proto_list.validators {
+        // DEBUG: Log primary_address nhận được từ chain để trace
+        if proto_val
+            .primary_address
+            .parse::<std::net::SocketAddr>()
+            .is_ok()
+        {
+            let parsed_addr = proto_val
+                .primary_address
+                .parse::<std::net::SocketAddr>()
+                .unwrap();
+            if parsed_addr.ip().to_string() == "0.0.0.0" || parsed_addr.port() == 0 {
+                log::warn!("[Node] ⚠️ RECEIVED INVALID PRIMARY ADDRESS from chain for validator {} (address: {}): {}", 
+                      proto_val.address, proto_val.address, proto_val.primary_address);
+            } else {
+                log::info!(
+                    "[Node] Received validator {} from chain with primary_address: {}",
+                    proto_val.address,
+                    proto_val.primary_address
+                );
+            }
+        } else {
+            log::warn!(
+                "[Node] ⚠️ FAILED TO PARSE primary_address from chain for validator {}: {}",
+                proto_val.address,
+                proto_val.primary_address
+            );
+        }
+
         let wrapper_val = Validator {
             address: proto_val.address,
             primary_address: proto_val.primary_address,
@@ -240,11 +266,13 @@ async fn setup_and_run(matches: &ArgMatches<'_>) -> Result<()> {
     let initial_committee =
         load_initial_committee(matches, &mut store.clone(), &node_config).await?;
     let shared_state = SharedNodeState {
-        committee: Arc::new(RwLock::new(initial_committee)),
+        committee: Arc::new(RwLock::new(initial_committee.clone())),
         store,
         node_config,
         parameters,
     };
+
+    info!("initial_committee: {:?}", initial_committee);
 
     // Xác định RunMode
     let run_mode = match matches.subcommand() {
@@ -461,11 +489,10 @@ async fn run_hot_swap(
                 Worker::spawn(
                     shared_state.node_config.name,
                     id,
-                    initial_committee.clone(), // Worker bắt đầu với committee ban đầu
+                    shared_state.committee.clone(), // Worker bắt đầu với committee ban đầu
                     shared_state.parameters.clone(),
                     shared_state.store.clone(),
-                )
-                .await; // Worker::spawn là async
+                ); // Xóa .await vì Worker::spawn không phải async
             }
         }
     } else {
@@ -481,8 +508,6 @@ async fn run_hot_swap(
         );
     }
     info!("All services spawned and running.");
-
-    let mut network_sender = SimpleSender::new();
 
     loop {
         tokio::select! {
@@ -524,6 +549,8 @@ async fn run_hot_swap(
                         };
 
                         info!("Successfully fetched new committee for epoch {}", new_epoch);
+                        info!("New_committee: {:?}", new_committee);
+
 
                         // Cập nhật committee dùng chung
                         {
@@ -534,33 +561,20 @@ async fn run_hot_swap(
                         // Core, Consensus, Proposer,... sẽ tự nhận biết sự thay đổi epoch
                         // qua kênh broadcast `tx_reconfigure` và cập nhật committee nội bộ của chúng.
 
-                        // Gửi message reconfigure cho Workers qua mạng
-                        info!("Broadcasting PrimaryWorkerMessage::Reconfigure to all workers...");
-                        let reconfigure_msg = PrimaryWorkerMessage::Reconfigure(new_committee.clone());
-                        let bytes = bincode::serialize(&reconfigure_msg)
-                            .expect("Failed to serialize reconfigure message");
+                        // KHÔNG cần broadcast reconfigure tới workers của chính mình qua network
+                        // vì workers đã share Arc<RwLock<Committee>> với primary.
+                        // Workers sẽ tự động thấy committee mới khi Arc được update.
+                        // Địa chỉ primary nội bộ (worker_to_primary) không đổi theo epoch.
+                        info!("Workers will automatically use new committee from shared Arc (no network broadcast needed).");
 
-                        match new_committee.our_workers(&shared_state.node_config.name) {
-                            Ok(worker_addrs) => {
-                                let addresses: Vec<_> = worker_addrs
-                                    .iter()
-                                    .map(|addr| addr.primary_to_worker)
-                                    .collect();
-                                network_sender.broadcast(addresses, bytes.into()).await;
-                                info!("Reconfigure message sent to workers.");
-                            },
-                            Err(e) => {
-                                warn!("Could not find own workers in new committee: {}. Node may be shutting down or becoming a follower.", e);
-                                // Kiểm tra xem node còn trong committee mới không
-                                if !new_committee.authorities.contains_key(&shared_state.node_config.name) {
-                                     info!("Node is no longer in committee. Initiating shutdown.");
-                                     // TODO: Cần cơ chế shutdown graceful cho các task validator cũ
-                                     // và khởi chạy task follower mới nếu cần.
-                                     // Hiện tại chỉ shutdown.
-                                     let _ = tx_shutdown.send(Shutdown::Now);
-                                     break;
-                                }
-                            }
+                        // Kiểm tra xem node còn trong committee mới không
+                        if !new_committee.authorities.contains_key(&shared_state.node_config.name) {
+                            info!("Node is no longer in committee. Initiating shutdown.");
+                            // TODO: Cần cơ chế shutdown graceful cho các task validator cũ
+                            // và khởi chạy task follower mới nếu cần.
+                            // Hiện tại chỉ shutdown.
+                            let _ = tx_shutdown.send(Shutdown::Now);
+                            break;
                         }
 
                     },

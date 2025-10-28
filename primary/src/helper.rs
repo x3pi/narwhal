@@ -93,6 +93,11 @@ impl Helper {
                                         continue;
                                     }
 
+                                    // DEBUG: Log địa chỉ trước khi gửi certificate
+                                    if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                        warn!("[Helper] ⚠️ SENDING CERTIFICATE TO INVALID ADDRESS: {}", address);
+                                    }
+
                                     let response = PrimaryMessage::Certificate(certificate);
                                     let bytes = bincode::serialize(&response)
                                         .expect("Failed to serialize certificate");
@@ -141,6 +146,11 @@ impl Helper {
                                             if current_bundle_size + cert_bytes.len() > MAX_BUNDLE_SIZE
                                                 && !certificates_to_send.is_empty()
                                             {
+                                                // DEBUG: Log địa chỉ trước khi gửi certificate bundle
+                                                if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                                    warn!("[Helper] ⚠️ SENDING CERTIFICATE BUNDLE TO INVALID ADDRESS: {}", address);
+                                                }
+
                                                 let bundle_to_send = PrimaryMessage::CertificateBundle(
                                                     certificates_to_send.drain(..).collect(),
                                                 );
@@ -161,6 +171,11 @@ impl Helper {
                             }
 
                             if !certificates_to_send.is_empty() {
+                                // DEBUG: Log địa chỉ trước khi gửi final bundle
+                                if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                    warn!("[Helper] ⚠️ SENDING FINAL CERTIFICATE BUNDLE TO INVALID ADDRESS: {}", address);
+                                }
+
                                 let final_bundle = PrimaryMessage::CertificateBundle(certificates_to_send);
                                 let bytes = bincode::serialize(&final_bundle)
                                     .expect("Failed to serialize final bundle");
