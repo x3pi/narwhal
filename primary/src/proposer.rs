@@ -288,8 +288,8 @@ impl Proposer {
 
                                 // 2. Perform FULL state reset for the new epoch.
                                 self.round = 1; // Reset round counter to 1.
-                                // self.digests.clear(); // <-- ĐÃ XÓA: Giữ lại digest cho epoch mới
-                                // self.payload_size = 0; // <-- ĐÃ XÓA: Giữ lại
+                                self.digests.clear(); // Clear old payload digests from previous epoch
+                                self.payload_size = 0; // Reset payload size
                                 self.last_parents.clear(); // Clear old parents.
 
                                 // 3. Get NEW genesis parents for the new epoch.
@@ -298,10 +298,10 @@ impl Proposer {
                                     .map(|x| x.digest())
                                     .collect();
 
-                                // 4. Log payload được giữ lại
+                                // 4. Log clean state
                                 info!(
-                                    "[Proposer] {} digests ({} bytes) carried over to new epoch {}",
-                                    self.digests.len(), self.payload_size, self.epoch
+                                    "[Proposer] Starting epoch {} with clean state (0 digests, 0 bytes)",
+                                    self.epoch
                                 );
 
 
@@ -312,7 +312,7 @@ impl Proposer {
                                         self.epoch, self.round
                                     );
                                     // Make header will use genesis parents, create H1, clear parents, advance round to 2.
-                                    // Nó cũng sẽ sử dụng payload đã mang sang (self.digests)
+                                    // Uses empty payload (digests already cleared for clean epoch transition)
                                     self.make_header().await;
                                 } else {
                                     // This is a critical error if genesis fails.
