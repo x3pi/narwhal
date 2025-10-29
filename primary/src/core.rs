@@ -859,6 +859,27 @@ impl Core {
             // Parents are the digests of the quorum of certificates forming round N.
             // These will be used by the Proposer to create Header for round N+1.
             let formed_round = certificate.round();
+            // --- Auto-catchup: if this node is lagging behind too much, enter Syncing state ---
+            if self.sync_state.is_none()
+                && formed_round > self.dag_round.saturating_add(LAG_THRESHOLD)
+            {
+                info!(
+                    "[Core][E{}] Detected lag via parent aggregation: formed_round {} >> dag_round {}. Entering Syncing to catch up.",
+                    self.epoch,
+                    formed_round,
+                    self.dag_round
+                );
+                // Target at least the next proposing round; add small buffer of 5 rounds
+                let target = formed_round.saturating_add(5);
+                self.sync_state = Some(SyncState {
+                    final_target_round: target,
+                    current_chunk_target: 0,
+                    retry_count: 0,
+                    last_request_time: Instant::now(),
+                });
+                // Immediately kick sync progress
+                self.advance_sync().await;
+            }
             info!(
                 "[Core][E{}] Quorum reached for round {}. Sending {} parents to Proposer (for R{}).", // <-- SỬA LOG
                 self.epoch,
@@ -894,14 +915,8 @@ impl Core {
                     );
                 }
 
-                // Do NOT send parents for the reconfiguration trigger round to the Proposer.
-                // This avoids delivering round-RECONFIGURE parents from the old epoch,
-                // which the Proposer (already resetting to round 1) would reject and can cause stalls.
-                debug!(
-                    "[Core][E{}] Skipping sending parents for trigger round {} to Proposer to avoid cross-epoch leakage.",
-                    self.epoch, formed_round
-                );
-                return Ok(());
+                // Note: vẫn tiếp tục gửi parents như bình thường.
+                // Proposer có logic tự bỏ qua trong lúc epoch_transitioning, tránh kẹt leader-support.
             }
             // *** THAY ĐỔI KẾT THÚC ***
 

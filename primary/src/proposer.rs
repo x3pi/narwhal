@@ -331,6 +331,28 @@ impl Proposer {
                                     "[Proposer] Reset complete for epoch {}. Now at round {}. Ready.",
                                      self.epoch, self.round // Should be 2 now
                                 );
+                                // Drain any stale parents from previous epoch buffered in rx_core to avoid cross-epoch leakage
+                                let mut drained = 0usize;
+                                loop {
+                                    match self.rx_core.try_recv() {
+                                        Ok((_parents, r)) => {
+                                            drained += 1;
+                                            warn!(
+                                                "[Proposer][E{}] Drained stale parents from round {} after epoch switch.",
+                                                self.epoch, r
+                                            );
+                                            // keep draining
+                                        }
+                                        Err(_e) => break,
+                                    }
+                                }
+                                if drained > 0 {
+                                    info!(
+                                        "[Proposer][E{}] Drained {} stale parent message(s) after epoch reset.",
+                                        self.epoch, drained
+                                    );
+                                }
+
                                 self.epoch_transitioning.store(false, Ordering::Relaxed); // Signal transition end
                             } else {
                                 error!("[Proposer] Logic error during reconfigure: Committee epoch updated but data not captured.");
