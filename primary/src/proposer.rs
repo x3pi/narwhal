@@ -16,7 +16,7 @@ use store::Store;
 use tokio::sync::broadcast;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
-use tokio::time::{sleep, Duration, Instant};
+use tokio::time::{interval, sleep, Duration, Instant};
 
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
@@ -39,10 +39,10 @@ pub struct Proposer {
     committed_batches: CommittedBatches,
     rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
 
-    rx_core: Receiver<(Vec<Digest>, Round)>, // Receives parents (digests) and the round they form (Round N)
+    rx_core: Receiver<(Epoch, Vec<Digest>, Round)>, // Receives (epoch, parents, formed round)
     rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>, // Receives own batches from workers
     rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>, // Receives batches to re-propose
-    tx_core: Sender<Header>,                 // Sends newly created headers to Core
+    tx_core: Sender<Header>,                        // Sends newly created headers to Core
 
     epoch: Epoch,                         // Internal epoch tracker
     round: Round, // Current round for which we are collecting payload to propose Header(Round)
@@ -50,6 +50,9 @@ pub struct Proposer {
     digests: Vec<(Digest, WorkerId)>, // Payload digests collected for the *next* header (Header(Round))
     payload_size: usize,              // Current size of the payload collected
     epoch_transitioning: Arc<AtomicBool>, // Flag indicating reconfiguration is in progress
+    // Watchdog
+    last_progress: Instant,
+    watchdog_interval_ms: u64,
 }
 
 impl Proposer {
@@ -64,7 +67,7 @@ impl Proposer {
         pending_batches: PendingBatches,
         committed_batches: CommittedBatches,
         epoch_transitioning: Arc<AtomicBool>, // Pass the flag
-        rx_core: Receiver<(Vec<Digest>, Round)>,
+        rx_core: Receiver<(Epoch, Vec<Digest>, Round)>,
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
         rx_repropose: Receiver<(Digest, WorkerId, Vec<u8>)>,
         tx_core: Sender<Header>,
@@ -100,6 +103,8 @@ impl Proposer {
                 digests: Vec::with_capacity(2 * header_size),
                 payload_size: 0,
                 epoch_transitioning, // Store the flag
+                last_progress: Instant::now(),
+                watchdog_interval_ms: 500,
             }
             .run()
             .await;
@@ -179,6 +184,8 @@ impl Proposer {
 
         // Advance to the next round. Parents for this next round are now unknown.
         self.round += 1;
+        // Mark progress
+        self.last_progress = Instant::now();
         debug!(
             "[Proposer][E{}] Advanced to round {}",
             self.epoch, self.round
@@ -195,6 +202,9 @@ impl Proposer {
         // Initialize the timer for the maximum header delay.
         let timer = sleep(Duration::from_millis(self.max_header_delay));
         tokio::pin!(timer);
+        // Watchdog interval to ensure progress
+        let mut watchdog = interval(Duration::from_millis(self.watchdog_interval_ms));
+        watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             // *** THAY ĐỔI BẮT ĐẦU: Thay 'is_grace_period' bằng 'is_quiet_period' ***
@@ -335,7 +345,7 @@ impl Proposer {
                                 let mut drained = 0usize;
                                 loop {
                                     match self.rx_core.try_recv() {
-                                        Ok((_parents, r)) => {
+                                        Ok((_epoch_msg, _parents, r)) => {
                                             drained += 1;
                                             warn!(
                                                 "[Proposer][E{}] Drained stale parents from round {} after epoch switch.",
@@ -373,8 +383,16 @@ impl Proposer {
                 // Handle receiving parent certificates from the Core.
                 // The tuple contains (parent_digests, round_number_N)
                 // These parents are needed to propose Header for Round N+1.
-                Some((parents, round)) = self.rx_core.recv() => {
+                Some((epoch_msg, parents, round)) = self.rx_core.recv() => {
                     // *** FIX: Stale Parent Check ***
+                    // Drop if epoch does not match
+                    if epoch_msg != self.epoch {
+                        warn!(
+                            "[Proposer][E{}] Ignoring parents from epoch {} (current epoch {}).",
+                            self.epoch, epoch_msg, self.epoch
+                        );
+                        continue;
+                    }
                     // Only accept parents if they are exactly for the round preceding the one we are currently trying to build.
                     // `self.round` is the round we are *about* to propose.
                     // The parents received should be from `self.round - 1`.
@@ -397,23 +415,17 @@ impl Proposer {
                            self.last_parents = parents;
                            debug!("[Proposer][E{}] Received valid parents from round {} for header {}", self.epoch, round, self.round);
 
-                            // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period ***
-                            // Check if receiving parents triggers immediate proposal (if payload full or timer expired)
-                            if !self.epoch_transitioning.load(Ordering::Relaxed) &&
-                               (self.payload_size >= self.header_size || timer.is_elapsed() || is_quiet_period) { // <-- THAY ĐỔI
-
-                                if !self.digests.is_empty() || timer.is_elapsed() || is_quiet_period { // <-- THAY ĐỔI
-                                    info!(
-                                        "[Proposer][E{}] Parents received for round {}, payload/timer/quiet condition met. Proposing header {}.", // <-- THAY ĐỔI
-                                        self.epoch, round, self.round
-                                    );
-                                    self.make_header().await; // Creates header, advances round, clears parents/payload
-                                     // Reset timer after proposing.
-                                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
-                                    timer.as_mut().reset(deadline);
-                                }
+                            // Đề xuất NGAY khi nhận parents hợp lệ, không phụ thuộc timer/payload
+                            if !self.epoch_transitioning.load(Ordering::Relaxed) {
+                                info!(
+                                    "[Proposer][E{}] Parents received for round {}. Proposing header {} immediately (empty payload allowed).",
+                                    self.epoch, round, self.round
+                                );
+                                self.make_header().await; // Creates header, advances round, clears parents/payload
+                                // Reset timer sau khi đề xuất
+                                let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                                timer.as_mut().reset(deadline);
                             }
-                            // *** THAY ĐỔI KẾT THÚC ***
                         } else {
                              debug!("[Proposer][E{}] Received duplicate parents from round {} for header {}. Ignoring.", self.epoch, round, self.round);
                         }
@@ -505,6 +517,22 @@ impl Proposer {
                     // Always reset the timer after it fires.
                      let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                      timer.as_mut().reset(deadline);
+                }
+                ,
+                // Watchdog: force proposal if no progress and we have parents
+                _ = watchdog.tick() => {
+                    if !self.epoch_transitioning.load(Ordering::Relaxed)
+                        && !self.last_parents.is_empty()
+                        && self.last_progress.elapsed() >= Duration::from_millis(self.watchdog_interval_ms)
+                    {
+                        warn!(
+                            "[Proposer][E{}] Watchdog fired. Forcing proposal for round {} (payload size {}).",
+                            self.epoch, self.round, self.payload_size
+                        );
+                        self.make_header().await;
+                        let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                        timer.as_mut().reset(deadline);
+                    }
                 }
             }
         }

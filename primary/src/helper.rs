@@ -3,10 +3,11 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::Certificate;
 use crate::primary::{PrimaryMessage, ReconfigureNotification}; // <-- THÊM ReconfigureNotification
+use crate::Epoch;
 use bytes::Bytes;
 use config::Committee;
 use crypto::Digest;
-use log::{debug, error, info, warn}; // <-- THÊM info
+use log::{debug, error, info, trace, warn}; // <-- THÊM trace
 use network::SimpleSender;
 use std::sync::Arc;
 use store::{Store, ROUND_INDEX_CF};
@@ -23,6 +24,7 @@ pub struct Helper {
     // *** THAY ĐỔI: Thêm Receiver ***
     rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     network: SimpleSender,
+    epoch: Epoch, // Track current epoch to quickly filter stale requests
 }
 
 impl Helper {
@@ -34,6 +36,7 @@ impl Helper {
         rx_reconfigure: broadcast::Receiver<ReconfigureNotification>,
     ) {
         tokio::spawn(async move {
+            let initial_epoch = committee.read().await.epoch;
             Self {
                 committee,
                 store,
@@ -41,6 +44,7 @@ impl Helper {
                 // *** THAY ĐỔI: Khởi tạo trường mới ***
                 rx_reconfigure,
                 network: SimpleSender::new(),
+                epoch: initial_epoch,
             }
             .run()
             .await;
@@ -55,6 +59,8 @@ impl Helper {
                     // SỬA ĐỔI: Khóa committee để đọc
                     let committee = self.committee.read().await;
                     let current_epoch = committee.epoch;
+                    // Update internal epoch tracker
+                    self.epoch = current_epoch;
 
                     let (requestor, address) = match &message {
                         PrimaryMessage::CertificatesRequest(_, pk) => (pk.clone(), committee.primary(pk)),
@@ -89,7 +95,8 @@ impl Helper {
 
                                     // *** THAY ĐỔI: Chỉ gửi nếu certificate thuộc epoch hiện tại ***
                                     if certificate.epoch() != current_epoch {
-                                        warn!("Helper skipping certificate {} from old epoch {}", digest, certificate.epoch());
+                                        // Reduce log spam: only log at trace level for skipped certificates
+                                        trace!("Helper skipping certificate {} from epoch {} (current: {})", digest, certificate.epoch(), current_epoch);
                                         continue;
                                     }
 
@@ -160,10 +167,14 @@ impl Helper {
                                                 current_bundle_size = 0;
                                             }
 
-                                            // (Đã check epoch qua round_key, không cần check lại cert)
-                                            if let Ok(certificate) = bincode::deserialize(&cert_bytes) {
-                                                certificates_to_send.push(certificate);
-                                                current_bundle_size += cert_bytes.len();
+                                            // Filter by epoch before adding to bundle (defense in depth)
+                                            if let Ok(certificate) = bincode::deserialize::<Certificate>(&cert_bytes) {
+                                                if certificate.epoch() == current_epoch {
+                                                    certificates_to_send.push(certificate);
+                                                    current_bundle_size += cert_bytes.len();
+                                                } else {
+                                                    trace!("Helper skipping certificate {} from epoch {} in range request (current: {})", digest, certificate.epoch(), current_epoch);
+                                                }
                                             }
                                         }
                                     }
@@ -195,7 +206,9 @@ impl Helper {
                             let new_epoch = new_committee.epoch;
                             drop(new_committee);
 
-                            info!("Helper received reconfigure for epoch {}. Ready for new committee.", new_epoch);
+                            // Update internal epoch tracker
+                            self.epoch = new_epoch;
+                            info!("Helper received reconfigure for epoch {}. Updated internal epoch tracker.", new_epoch);
                             // Không có state nội bộ cần xóa, chỉ cần acknowledge
                         },
                         Err(e) => {
