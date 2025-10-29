@@ -76,6 +76,7 @@ impl SimpleSender {
     }
 
     pub async fn broadcast(&mut self, addresses: Vec<SocketAddr>, data: Bytes) {
+        // Thay info! thành debug! hoặc xóa dòng log này hoàn toàn
         info!(
             "[SimpleSender::broadcast] Broadcasting to {} addresses, data size: {} bytes",
             addresses

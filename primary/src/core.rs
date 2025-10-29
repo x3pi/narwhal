@@ -505,12 +505,21 @@ impl Core {
                         warn!("[Core][E{}] Committee epoch changed before sending vote for H{}({}). Aborting vote.", self.epoch, header.round, header.author);
                         return Ok(());
                     }
-                    committee_guard
-                        .primary(&header.author)
-                        // *** THAY ĐỔI BẮT ĐẦU: Sửa lỗi unused variable ***
-                        .map_err(|_| DagError::UnknownAuthority(header.author)) // Map ConfigError to DagError
-                                                                                // *** THAY ĐỔI KẾT THÚC ***
-                                                                                // Lock released here
+                    match committee_guard.primary(&header.author) {
+                        Ok(addrs) => Ok(addrs),
+                        Err(e) => {
+                            log::info!(
+                                "[Core] UnknownAuthority when querying primary addr: author={}, round={}, epoch(core)={}, epoch(committee)={}, err={}",
+                                header.author,
+                                header.round,
+                                self.epoch,
+                                committee_guard.epoch,
+                                e
+                            );
+                            Err(DagError::UnknownAuthority(header.author))
+                        }
+                    }
+                    // Lock released here
                 };
 
                 // Handle sending the vote or processing it locally.

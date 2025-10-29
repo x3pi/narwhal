@@ -170,9 +170,17 @@ impl ConsensusState {
         if new_overall_last_committed > self.last_committed_round {
             let old_overall_last_committed = self.last_committed_round;
             self.last_committed_round = new_overall_last_committed;
-            debug!(
+            info!(
                 "[StateUpdate][E{}] Global last_committed_round advanced from {} to {}",
                 self.epoch, old_overall_last_committed, new_overall_last_committed
+            );
+
+            // Log memory usage
+            let dag_size = self.dag.len();
+            let committed_size = self.committed_certificates.len();
+            info!(
+                "[Consensus][E{}] Memory usage: DAG rounds: {}, Committed certs: {}",
+                self.epoch, dag_size, committed_size
             );
 
             // Tính toán round để dọn dẹp (GC)
@@ -1272,6 +1280,14 @@ impl Consensus {
             tokio::select! {
                 // Prioritize reconfiguration signals.
                 biased;
+
+                // Add timeout to prevent hanging
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                    info!("[Consensus] Heartbeat check at epoch {}, last_committed_round: {}",
+                          self.current_protocol_epoch, state.last_committed_round);
+                    // Continue processing
+                    continue;
+                }
 
                 // Handle reconfiguration signals.
                 result = self.rx_reconfigure.recv() => {

@@ -11,6 +11,7 @@ use sha3::Sha3_512 as Sha512;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::TryInto;
 use std::fmt;
+// dùng macro fully-qualified log::debug! để tránh cần import crate
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Header {
@@ -71,10 +72,17 @@ impl Header {
         ensure!(self.digest() == self.id, DagError::InvalidHeaderId);
 
         let voting_rights = committee.stake(&self.author);
-        ensure!(
-            voting_rights > 0,
-            DagError::UnknownAuthority(self.author.clone())
-        );
+        if voting_rights == 0 {
+            log::info!(
+                "[Header::verify] UnknownAuthority: author={}, round={}, epoch(header)={}, epoch(committee)={}, has_consensus_key={}",
+                self.author,
+                self.round,
+                self.epoch,
+                committee.epoch,
+                committee.consensus_key(&self.author).is_some()
+            );
+            bail!(DagError::UnknownAuthority(self.author.clone()));
+        }
 
         for worker_id in self.payload.values() {
             committee
@@ -82,9 +90,18 @@ impl Header {
                 .map_err(|_| DagError::MalformedHeader(self.id.clone()))?;
         }
 
-        let consensus_pk = committee
-            .consensus_key(&self.author)
-            .ok_or_else(|| DagError::UnknownAuthority(self.author.clone()))?;
+        let consensus_pk = if let Some(pk) = committee.consensus_key(&self.author) {
+            pk
+        } else {
+            log::info!(
+                "[Header::verify] Missing consensus_key -> UnknownAuthority: author={}, round={}, epoch(header)={}, epoch(committee)={}",
+                self.author,
+                self.round,
+                self.epoch,
+                committee.epoch
+            );
+            bail!(DagError::UnknownAuthority(self.author.clone()));
+        };
         self.signature
             .verify(&self.id, &consensus_pk)
             .map_err(DagError::from)
@@ -159,14 +176,32 @@ impl Vote {
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
         ensure!(self.epoch == committee.epoch, DagError::InvalidEpoch);
 
-        ensure!(
-            committee.stake(&self.author) > 0,
-            DagError::UnknownAuthority(self.author.clone())
-        );
+        if committee.stake(&self.author) == 0 {
+            log::info!(
+                "[Vote::verify] UnknownAuthority: vote_author={}, origin={}, round={}, epoch(vote)={}, epoch(committee)={}, has_consensus_key={}",
+                self.author,
+                self.origin,
+                self.round,
+                self.epoch,
+                committee.epoch,
+                committee.consensus_key(&self.author).is_some()
+            );
+            bail!(DagError::UnknownAuthority(self.author.clone()));
+        }
 
-        let consensus_pk = committee
-            .consensus_key(&self.author)
-            .ok_or_else(|| DagError::UnknownAuthority(self.author.clone()))?;
+        let consensus_pk = if let Some(pk) = committee.consensus_key(&self.author) {
+            pk
+        } else {
+            log::info!(
+                "[Vote::verify] Missing consensus_key -> UnknownAuthority: vote_author={}, origin={}, round={}, epoch(vote)={}, epoch(committee)={}",
+                self.author,
+                self.origin,
+                self.round,
+                self.epoch,
+                committee.epoch
+            );
+            bail!(DagError::UnknownAuthority(self.author.clone()));
+        };
         self.signature
             .verify(&self.digest(), &consensus_pk)
             .map_err(DagError::from)
@@ -249,7 +284,18 @@ impl Certificate {
         for (name, _) in self.votes.iter() {
             ensure!(!used.contains(name), DagError::AuthorityReuse(name.clone()));
             let voting_rights = committee.stake(name);
-            ensure!(voting_rights > 0, DagError::UnknownAuthority(name.clone()));
+            if voting_rights == 0 {
+                log::info!(
+                    "[Certificate::verify] UnknownAuthority in votes: voter={}, header_author={}, round={}, epoch(cert)={}, epoch(committee)={}, has_consensus_key={}",
+                    name,
+                    self.origin(),
+                    self.round(),
+                    self.epoch(),
+                    committee.epoch,
+                    committee.consensus_key(name).is_some()
+                );
+                bail!(DagError::UnknownAuthority(name.clone()));
+            }
             used.insert(name.clone());
             weight += voting_rights;
         }
@@ -262,10 +308,19 @@ impl Certificate {
             .votes
             .iter()
             .map(|(pk, sig)| {
-                let consensus_pk = committee
-                    .consensus_key(pk)
-                    .ok_or_else(|| DagError::UnknownAuthority(pk.clone()))?;
-                Ok((consensus_pk, sig.clone()))
+                if let Some(consensus_pk) = committee.consensus_key(pk) {
+                    Ok((consensus_pk, sig.clone()))
+                } else {
+                    log::info!(
+                        "[Certificate::verify] Missing consensus_key -> UnknownAuthority: voter={}, header_author={}, round={}, epoch(cert)={}, epoch(committee)={}",
+                        pk,
+                        self.origin(),
+                        self.round(),
+                        self.epoch(),
+                        committee.epoch
+                    );
+                    Err(DagError::UnknownAuthority(pk.clone()))
+                }
             })
             .collect();
 

@@ -208,19 +208,13 @@ impl HeaderWaiter {
                                 });
                             }
                             if !requires_sync.is_empty() {
-                                let address = committee_guard // *** SỬA: Dùng committee_guard
-                                    .primary(&author)
-                                    .expect("Author of valid header not in the committee")
-                                    .primary_to_primary;
-
-                                // DEBUG: Log địa chỉ trước khi gửi certificate request
-                                if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
-                                    warn!("[HeaderWaiter] ⚠️ SENDING CERT REQUEST TO INVALID ADDRESS: {} (author: {})", address, author);
-                                }
-
-                                let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
-                                let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send(address, Bytes::from(bytes)).await;
+                                let address = committee_guard
+                                .primary(&author)
+                                .expect("Author of valid header not in the committee")
+                                .primary_to_primary;
+                            let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
+                            let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
+                            self.network.send(address, Bytes::from(bytes)).await;
                             }
                         }
                     }
@@ -259,18 +253,20 @@ impl HeaderWaiter {
                         }
                     }
 
-                    // *** SỬA: Lock committee ở đây ***
-                    let committee = self.committee.read().await;
-                    let addresses = committee
-                        .others_primaries(&self.name)
-                        .iter()
-                        .map(|(_, x)| x.primary_to_primary)
-                        .collect();
-                    drop(committee); // Release lock
+                    // *** THÊM: Chỉ broadcast nếu có certificate cần retry ***
+                    if !retry.is_empty() {
+                        let committee = self.committee.read().await;
+                        let addresses = committee
+                            .others_primaries(&self.name)
+                            .iter()
+                            .map(|(_, x)| x.primary_to_primary)
+                            .collect();
+                        drop(committee);
 
-                    let message = PrimaryMessage::CertificatesRequest(retry, self.name);
-                    let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                    self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+                        let message = PrimaryMessage::CertificatesRequest(retry, self.name);
+                        let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
+                        self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+                    }
 
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
                 },
