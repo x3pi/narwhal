@@ -100,10 +100,12 @@ pub struct Core {
     pending_votes: HashMap<Round, Vec<Vote>>,
     // --- Quorum watchdog state ---
     authors_seen_per_round: HashMap<Round, HashSet<PublicKey>>, // Authors whose C_r we have seen
-    last_commit_observed_round: Round, // Last consensus round observed locally
-    last_commit_observed_at: Instant,  // Timestamp when last commit round was observed
-    quorum_timeout_ms: u64,            // Timeout to consider quorum stuck for a round
-    commit_stall_timeout_ms: u64,      // Timeout to consider consensus stalled
+    round_stuck_since: HashMap<Round, Instant>, // Track when a round started being stuck (missing quorum)
+    last_commit_observed_round: Round,          // Last consensus round observed locally
+    last_commit_observed_at: Instant,           // Timestamp when last commit round was observed
+    highest_round_sent_to_consensus: Round, // Highest round of certificate sent to consensus (for watchdog when consensus_round=0)
+    quorum_timeout_ms: u64,                 // Timeout to consider quorum stuck for a round
+    commit_stall_timeout_ms: u64,           // Timeout to consider consensus stalled
 }
 
 impl Core {
@@ -158,8 +160,10 @@ impl Core {
                 sync_state: None, // Start in Running state
                 pending_votes: HashMap::new(),
                 authors_seen_per_round: HashMap::new(),
+                round_stuck_since: HashMap::new(),
                 last_commit_observed_round: 0,
                 last_commit_observed_at: Instant::now(),
+                highest_round_sent_to_consensus: 0,
                 quorum_timeout_ms: 3_000,
                 commit_stall_timeout_ms: 10_000,
             }
@@ -1001,11 +1005,10 @@ impl Core {
         // until sync is complete and normal operation resumes.
         if !syncing {
             let cert_digest = certificate.digest(); // Get digest before moving certificate
+            let cert_round = certificate.round(); // Get round before moving certificate
             info!(
                 "[Core][E{}] Attempting to send C{} ({}) to consensus.",
-                self.epoch,
-                certificate.round(),
-                cert_digest
+                self.epoch, cert_round, cert_digest
             ); // <-- ADD LOG
                // Update commit-watchdog observation window baseline if consensus progressed
             let current_committed = self.consensus_round.load(Ordering::Relaxed) as Round;
@@ -1017,9 +1020,7 @@ impl Core {
                 // <-- THÊM kiểm tra kênh đóng
                 warn!(
                     "[Core][E{}] Consensus channel is closed. Cannot deliver certificate {} (R{})",
-                    self.epoch,
-                    cert_digest,
-                    certificate.round()
+                    self.epoch, cert_digest, cert_round
                 );
             } else if let Err(e) = self.tx_consensus.send(certificate).await {
                 // If the consensus channel is closed, it's a critical issue.
@@ -1033,11 +1034,16 @@ impl Core {
                 // Depending on design, might need to panic or attempt recovery.
                 // For now, just log the warning.
             } else {
+                // Update highest round sent to consensus for watchdog
+                if cert_round > self.highest_round_sent_to_consensus {
+                    self.highest_round_sent_to_consensus = cert_round;
+                }
                 trace!(
-                    "[Core][E{}] Certificate {} (R{}) sent to consensus.",
+                    "[Core][E{}] Certificate {} (R{}) sent to consensus. Highest round sent: {}",
                     self.epoch,
                     cert_digest,
-                    self.dag_round // Ghi log dag_round
+                    cert_round,
+                    self.highest_round_sent_to_consensus
                 );
             }
         } else {
@@ -1375,6 +1381,11 @@ impl Core {
         self.certificates_aggregators.clear();
         self.cancel_handlers.clear(); // Cancel pending network requests? Maybe let them timeout. Clearing handlers is safer.
         self.pending_votes.clear(); // Clear pending votes from old epoch
+        self.authors_seen_per_round.clear(); // Clear quorum tracking
+        self.round_stuck_since.clear(); // Clear stuck round tracking
+        self.last_commit_observed_round = 0; // Reset consensus commit tracking
+        self.last_commit_observed_at = Instant::now(); // Reset timestamp
+        self.highest_round_sent_to_consensus = 0; // Reset highest round sent to consensus
 
         // Reset current header and aggregators.
         self.current_header = Header::default();
@@ -1490,76 +1501,167 @@ impl Core {
                             .cloned()
                             .unwrap_or_default();
                         if seen.len() < expected_authors.len() {
+                            // Round is missing some authors - track stuck time
                             let missing: Vec<PublicKey> = expected_authors
                                 .difference(&seen)
                                 .cloned()
                                 .collect();
-                            info!(
-                                "[Core][E{}] Quorum watchdog: R{} missing {} author(s) for C{} aggregation. Missing: {:?}",
-                                self.epoch, r, missing.len(), r, missing
-                            );
-                            // Request a small range sync for this round
-                            self.request_sync_chunk(r, r).await;
 
-                            // Proactively re-broadcast known certificates for this round to all peers (vote nudge)
-                            let key = bincode::serialize(&(self.epoch, r)).expect("serialize round index key");
-                            if let Ok(Some(digests_bytes)) = self.store.read_cf(ROUND_INDEX_CF.to_string(), key).await {
-                                if let Ok(digests) = bincode::deserialize::<Vec<Digest>>(&digests_bytes) {
-                                    let mut certs = Vec::new();
-                                    for d in digests {
-                                        if let Ok(Some(cert_bytes)) = self.store.read(d.to_vec()).await {
-                                            if let Ok(cert) = bincode::deserialize::<Certificate>(&cert_bytes) {
-                                                // Chỉ re-broadcast cert đúng epoch hiện tại
-                                                if cert.epoch() == self.epoch {
-                                                    certs.push(cert);
+                            // Record when this round first became stuck (if not already recorded)
+                            let now = Instant::now();
+                            let is_newly_stuck = !self.round_stuck_since.contains_key(&r);
+                            if is_newly_stuck {
+                                info!(
+                                    "[Core][E{}] Quorum watchdog: R{} missing {} author(s) for C{} aggregation. Tracking stuck time. Missing: {:?}",
+                                    self.epoch, r, missing.len(), r, missing
+                                );
+                                self.round_stuck_since.insert(r, now);
+                            }
+
+                            // Only trigger proactive actions after timeout
+                            if let Some(stuck_since) = self.round_stuck_since.get(&r) {
+                                if stuck_since.elapsed() >= Duration::from_millis(self.quorum_timeout_ms) {
+                                warn!(
+                                    "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing {} author(s): {:?}. Triggering proactive assistance.",
+                                    self.epoch, r, stuck_since.elapsed(), self.quorum_timeout_ms, missing.len(), missing
+                                );
+
+                                // 1) Request a small range sync for this round (to all peers)
+                                self.request_sync_chunk(r, r).await;
+
+                                // 2) Proactively request certificates from missing authors specifically
+                                let committee_guard = self.committee.read().await;
+                                let missing_authors_with_addresses: Vec<(PublicKey, SocketAddr)> = missing
+                                    .iter()
+                                    .filter_map(|missing_author| {
+                                        committee_guard
+                                            .primary(missing_author)
+                                            .ok()
+                                            .map(|addrs| (missing_author.clone(), addrs.primary_to_primary))
+                                    })
+                                    .collect();
+                                drop(committee_guard);
+
+                                if !missing_authors_with_addresses.is_empty() {
+                                    info!(
+                                        "[Core][E{}] Quorum watchdog: requesting certificates for R{} from {} missing author(s): {:?}",
+                                        self.epoch, r, missing_authors_with_addresses.len(),
+                                        missing_authors_with_addresses.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                                    );
+                                    // Send CertificateRangeRequest directly to missing authors
+                                    let range_request = PrimaryMessage::CertificateRangeRequest {
+                                        start_round: r,
+                                        end_round: r,
+                                        requestor: self.name.clone(),
+                                    };
+                                    let bytes = bincode::serialize(&range_request)
+                                        .expect("Failed to serialize cert range request");
+                                    for (missing_author, address) in missing_authors_with_addresses {
+                                        info!(
+                                            "[Core][E{}] Quorum watchdog: requesting R{} certificates from {} at {}",
+                                            self.epoch, r, missing_author, address
+                                        );
+                                        let _ = self.network.send(address, Bytes::from(bytes.clone())).await;
+                                    }
+                                }
+
+                                // 3) Proactively re-broadcast known certificates for this round to all peers (vote nudge)
+                                let key = bincode::serialize(&(self.epoch, r)).expect("serialize round index key");
+                                if let Ok(Some(digests_bytes)) = self.store.read_cf(ROUND_INDEX_CF.to_string(), key).await {
+                                    if let Ok(digests) = bincode::deserialize::<Vec<Digest>>(&digests_bytes) {
+                                        let mut certs = Vec::new();
+                                        for d in digests {
+                                            if let Ok(Some(cert_bytes)) = self.store.read(d.to_vec()).await {
+                                                if let Ok(cert) = bincode::deserialize::<Certificate>(&cert_bytes) {
+                                                    // Chỉ re-broadcast cert đúng epoch hiện tại
+                                                    if cert.epoch() == self.epoch {
+                                                        certs.push(cert);
+                                                    }
                                                 }
                                             }
                                         }
-                                    }
 
-                                    if !certs.is_empty() {
-                                        let addresses: Vec<SocketAddr> = {
-                                            let committee_guard = self.committee.read().await;
-                                            committee_guard
-                                                .others_primaries(&self.name)
-                                                .iter()
-                                                .map(|(_, x)| x.primary_to_primary)
-                                                .collect()
-                                        };
-                                        info!(
-                                            "[Core][E{}] Quorum watchdog: re-broadcasting {} certificate(s) for R{} to {} peers.",
-                                            self.epoch, certs.len(), r, addresses.len()
-                                        );
-                                        for cert in certs {
-                                            let cert_bytes_msg = bincode::serialize(&PrimaryMessage::Certificate(cert.clone()))
-                                                .expect("serialize certificate message");
-                                            let _ = self.network.broadcast(addresses.clone(), Bytes::from(cert_bytes_msg)).await;
+                                        if !certs.is_empty() {
+                                            let addresses: Vec<SocketAddr> = {
+                                                let committee_guard = self.committee.read().await;
+                                                committee_guard
+                                                    .others_primaries(&self.name)
+                                                    .iter()
+                                                    .map(|(_, x)| x.primary_to_primary)
+                                                    .collect()
+                                            };
+                                            info!(
+                                                "[Core][E{}] Quorum watchdog: re-broadcasting {} certificate(s) for R{} to {} peers to nudge votes.",
+                                                self.epoch, certs.len(), r, addresses.len()
+                                            );
+                                            for cert in certs {
+                                                let cert_bytes_msg = bincode::serialize(&PrimaryMessage::Certificate(cert.clone()))
+                                                    .expect("serialize certificate message");
+                                                let _ = self.network.broadcast(addresses.clone(), Bytes::from(cert_bytes_msg)).await;
+                                            }
+                                        } else {
+                                            info!("[Core][E{}] Quorum watchdog: no local certificates to re-broadcast for R{}.", self.epoch, r);
                                         }
-                                    } else {
-                                        info!("[Core][E{}] Quorum watchdog: no local certificates to re-broadcast for R{}.", self.epoch, r);
                                     }
                                 }
+
+                                // Reset stuck timer to avoid spamming (will re-trigger if still stuck after next timeout)
+                                self.round_stuck_since.insert(r, Instant::now());
+                                }
+                            }
+                        } else {
+                            // Round has quorum now - remove from stuck tracking
+                            if self.round_stuck_since.remove(&r).is_some() {
+                                debug!(
+                                    "[Core][E{}] Quorum watchdog: R{} now has quorum ({} authors). Removed from stuck tracking.",
+                                    self.epoch, r, seen.len()
+                                );
                             }
                         }
                     }
 
                     // 2) Consensus liveness watchdog: if commit round hasn't advanced for too long
                     let current_committed = self.consensus_round.load(Ordering::Relaxed) as Round;
-                    if current_committed > self.last_commit_observed_round {
-                        self.last_commit_observed_round = current_committed;
-                        self.last_commit_observed_at = Instant::now();
-                    } else if self.last_commit_observed_at.elapsed() >= Duration::from_millis(self.commit_stall_timeout_ms) {
-                        warn!(
-                            "[Core][E{}] Consensus-liveness watchdog: no commit progress for {:?}. last_committed_round={}, dag_round={}. Triggering assistance (range request).",
-                            self.epoch, self.last_commit_observed_at.elapsed(), current_committed, self.dag_round
-                        );
-                        let start = current_committed.saturating_add(1);
-                        let end = self.dag_round;
-                        if end >= start {
-                            self.request_sync_chunk(start, end).await;
+
+                    // If consensus_round is 0, it might be that GC hasn't updated it yet (no certificates committed since epoch transition)
+                    // In this case, check if we've sent certificates to consensus but haven't seen commits
+                    if current_committed == 0 && self.highest_round_sent_to_consensus > 0 {
+                        // We've sent certificates but haven't seen any commits. Check if it's been too long.
+                        // Use a longer timeout for the first commit after epoch transition
+                        let first_commit_timeout = self.commit_stall_timeout_ms * 2; // Give more time for first commit
+                        if self.last_commit_observed_at.elapsed() >= Duration::from_millis(first_commit_timeout) {
+                            warn!(
+                                "[Core][E{}] Consensus-liveness watchdog: consensus_round=0 but we've sent certificates up to R{} for {:?} (>{}ms). DAG at R{}. Consensus may be stuck waiting for certificates. Triggering assistance.",
+                                self.epoch, self.highest_round_sent_to_consensus, self.last_commit_observed_at.elapsed(), first_commit_timeout, self.dag_round
+                            );
+                            // Request sync for rounds we've sent but not committed yet
+                            let start = 1; // Start from round 1
+                            let end = self.highest_round_sent_to_consensus.min(self.dag_round);
+                            if end >= start {
+                                self.request_sync_chunk(start, end).await;
+                            }
+                            self.last_commit_observed_at = Instant::now();
                         }
-                        self.last_commit_observed_at = Instant::now();
+                    } else if current_committed > 0 {
+                        // Normal case: consensus_round is > 0
+                        if current_committed > self.last_commit_observed_round {
+                            self.last_commit_observed_round = current_committed;
+                            self.last_commit_observed_at = Instant::now();
+                        } else if self.last_commit_observed_at.elapsed() >= Duration::from_millis(self.commit_stall_timeout_ms) {
+                            warn!(
+                                "[Core][E{}] Consensus-liveness watchdog: no commit progress for {:?} (>{}ms). last_committed_round={}, dag_round={}. Triggering assistance (range request).",
+                                self.epoch, self.last_commit_observed_at.elapsed(), self.commit_stall_timeout_ms, current_committed, self.dag_round
+                            );
+                            let start = current_committed.saturating_add(1);
+                            let end = self.dag_round;
+                            if end >= start {
+                                self.request_sync_chunk(start, end).await;
+                            }
+                            self.last_commit_observed_at = Instant::now();
+                        }
                     }
+                    // If current_committed == 0 and highest_round_sent_to_consensus == 0,
+                    // we haven't sent anything yet, so no need to check for stall
                     Ok(())
                 },
 
