@@ -118,9 +118,9 @@ impl Helper {
                             end_round,
                             requestor,
                         } => {
-                            debug!(
-                                "Received certificate range request from {} for rounds {} to {}",
-                                requestor, start_round, end_round
+                            info!(
+                                "[Helper][E{}] Received certificate range request from {} for rounds {} to {}",
+                                current_epoch, requestor, start_round, end_round
                             );
 
                             let mut certificates_to_send = Vec::new();
@@ -187,10 +187,19 @@ impl Helper {
                                     warn!("[Helper] ⚠️ SENDING FINAL CERTIFICATE BUNDLE TO INVALID ADDRESS: {}", address);
                                 }
 
+                                info!(
+                                    "[Helper][E{}] Sending {} certificate(s) for rounds {} to {} to requestor {} at {}",
+                                    current_epoch, certificates_to_send.len(), start_round, end_round, requestor, address
+                                );
                                 let final_bundle = PrimaryMessage::CertificateBundle(certificates_to_send);
                                 let bytes = bincode::serialize(&final_bundle)
                                     .expect("Failed to serialize final bundle");
                                 self.network.send(address, Bytes::from(bytes)).await;
+                            } else {
+                                warn!(
+                                    "[Helper][E{}] No certificates found for rounds {} to {} to send to requestor {}",
+                                    current_epoch, start_round, end_round, requestor
+                                );
                             }
                         }
                         _ => {}

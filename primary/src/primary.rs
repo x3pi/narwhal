@@ -47,6 +47,13 @@ pub enum PrimaryMessage {
     Header(Header),
     Vote(Vote),
     Certificate(Certificate),
+    // Yêu cầu peer xem xét bỏ phiếu lại cho một header cụ thể (cùng epoch)
+    VoteNudge {
+        epoch: u64,
+        round: Round,
+        header_id: Digest,
+        origin: PublicKey,
+    },
     CertificatesRequest(Vec<Digest>, PublicKey),
     CertificateRangeRequest {
         start_round: Round,
@@ -63,6 +70,18 @@ impl fmt::Debug for PrimaryMessage {
             Self::Header(h) => f.debug_tuple("Header").field(h).finish(),
             Self::Vote(v) => f.debug_tuple("Vote").field(v).finish(),
             Self::Certificate(c) => f.debug_tuple("Certificate").field(c).finish(),
+            Self::VoteNudge {
+                epoch,
+                round,
+                header_id,
+                origin,
+            } => f
+                .debug_struct("VoteNudge")
+                .field("epoch", epoch)
+                .field("round", round)
+                .field("header_id", header_id)
+                .field("origin", origin)
+                .finish(),
             Self::CertificatesRequest(d, p) => f
                 .debug_tuple("CertificatesRequest")
                 .field(d)

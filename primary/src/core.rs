@@ -101,11 +101,13 @@ pub struct Core {
     // --- Quorum watchdog state ---
     authors_seen_per_round: HashMap<Round, HashSet<PublicKey>>, // Authors whose C_r we have seen
     round_stuck_since: HashMap<Round, Instant>, // Track when a round started being stuck (missing quorum)
-    last_commit_observed_round: Round,          // Last consensus round observed locally
-    last_commit_observed_at: Instant,           // Timestamp when last commit round was observed
+    last_proactive_request: HashMap<Round, Instant>, // Track when last proactive request was sent for a round (rate limiting)
+    last_commit_observed_round: Round,               // Last consensus round observed locally
+    last_commit_observed_at: Instant, // Timestamp when last commit round was observed
     highest_round_sent_to_consensus: Round, // Highest round of certificate sent to consensus (for watchdog when consensus_round=0)
     quorum_timeout_ms: u64,                 // Timeout to consider quorum stuck for a round
     commit_stall_timeout_ms: u64,           // Timeout to consider consensus stalled
+    proactive_request_cooldown_ms: u64, // Cooldown between proactive requests for the same round
 }
 
 impl Core {
@@ -161,11 +163,13 @@ impl Core {
                 pending_votes: HashMap::new(),
                 authors_seen_per_round: HashMap::new(),
                 round_stuck_since: HashMap::new(),
+                last_proactive_request: HashMap::new(),
                 last_commit_observed_round: 0,
                 last_commit_observed_at: Instant::now(),
                 highest_round_sent_to_consensus: 0,
-                quorum_timeout_ms: 3_000,
+                quorum_timeout_ms: 5_000, // Tăng từ 3s lên 5s để giảm spam
                 commit_stall_timeout_ms: 10_000,
+                proactive_request_cooldown_ms: 10_000, // Cooldown 10s giữa các proactive requests
             }
             .run()
             .await;
@@ -305,38 +309,73 @@ impl Core {
         self.current_header = header.clone();
         self.votes_aggregator = VotesAggregator::new();
         // Drain any pending votes queued for this round (same epoch)
+        // These are votes that arrived BEFORE the own header was created
         if let Some(mut votes) = self.pending_votes.remove(&header.round) {
+            info!(
+                "[Core][E{}] Draining {} queued vote(s) for round {} when initializing own header H{}({}). Votes were stored earlier and will now be processed.",
+                self.epoch, votes.len(), header.round, header.id, header.author
+            );
+            let mut processed_count = 0;
+            let mut discarded_count = 0;
+            let mut verified_count = 0;
+            let mut failed_verification_count = 0;
+            
             for v in votes.drain(..) {
                 // Only append if still same epoch and matches current header
                 if v.epoch == self.epoch
                     && v.round == self.current_header.round
                     && v.origin == self.current_header.author
+                    && v.id == self.current_header.id
                 {
                     let committee_guard = self.committee.read().await;
-                    if let Ok(Some(_)) = v.verify(&committee_guard).map(|_| Some(())) {
-                        if let Some(cert) = self.votes_aggregator.append(
-                            v,
-                            &committee_guard,
-                            &self.current_header,
-                        )? {
-                            drop(committee_guard);
-                            // If certificate formed immediately, process it
-                            info!(
-                                "[Core][E{}] Assembled Certificate C{}({}) from queued votes",
-                                self.epoch,
-                                cert.round(),
-                                cert.origin()
+                    // Verify vote signature before appending
+                    match v.verify(&committee_guard) {
+                        Ok(_) => {
+                            verified_count += 1;
+                            if let Some(cert) = self.votes_aggregator.append(
+                                v,
+                                &committee_guard,
+                                &self.current_header,
+                            )? {
+                                drop(committee_guard);
+                                // If certificate formed immediately, process it
+                                info!(
+                                    "[Core][E{}] Assembled Certificate C{}({}) from queued votes that arrived early",
+                                    self.epoch,
+                                    cert.round(),
+                                    cert.origin()
+                                );
+                                self.process_certificate(cert, false).await?;
+                            }
+                            processed_count += 1;
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[Core][E{}] Queued vote V{}({}) failed verification: {}",
+                                self.epoch, v.round, v.author, e
                             );
-                            self.process_certificate(cert, false).await?;
+                            failed_verification_count += 1;
                         }
                     }
                 } else {
-                    debug!(
-                        "[Core][E{}] Discarding queued vote not matching current header.",
-                        self.epoch
+                    warn!(
+                        "[Core][E{}] Discarding queued vote V{}({}) for H{}({}) - does not match current_header H{}({}). Vote round={}, vote.origin={}, vote.id={:?}",
+                        self.epoch, v.round, v.author, v.round, v.origin,
+                        self.current_header.round, self.current_header.author,
+                        v.round, v.origin, v.id
                     );
+                    discarded_count += 1;
                 }
             }
+            info!(
+                "[Core][E{}] Queue drain result for R{}: {} processed ({} verified, {} failed verification), {} discarded",
+                self.epoch, header.round, processed_count, verified_count, failed_verification_count, discarded_count
+            );
+        } else {
+            debug!(
+                "[Core][E{}] No queued votes found for round {} when initializing own header H{}",
+                self.epoch, header.round, header.id
+            );
         }
         debug!(
             "[Core][E{}] Initialized votes aggregator for own H{}",
@@ -639,39 +678,73 @@ impl Core {
         // Ensure vote epoch matches current core epoch. Sanitize should catch this.
         ensure!(vote.epoch == self.epoch, DagError::InvalidEpoch);
 
-        // If not for current header/round, queue it to be processed when we reach that round
+        // If not for current header/round, decide whether to queue or discard
         if vote.round != self.current_header.round
             || vote.origin != self.current_header.author
             || vote.id != self.current_header.id
         {
             if vote.epoch == self.epoch {
-                self.pending_votes.entry(vote.round).or_default().push(vote);
-                debug!(
-                    "[Core][E{}] Queued vote for future round {}.",
-                    self.epoch, self.current_header.round
-                );
-                return Ok(());
+                // Only queue votes for rounds >= current_header.round (future rounds or current round but different header)
+                // Votes for rounds < current_header.round are too old and own header for those rounds already created
+                if vote.round >= self.current_header.round {
+                    // Queue vote to be processed when own header for this round is created
+                    // Votes are stored by round, and will be drained when process_own_header is called for that round
+                    let queue_entry = self.pending_votes.entry(vote.round).or_default();
+                    queue_entry.push(vote.clone());
+                    let queue_size = queue_entry.len();
+                    
+                    info!(
+                        "[Core][E{}] Queued vote V{}({}) for H{}({}) - current_header is H{}({}). Total queued votes for R{}: {}. Vote will be processed when own header for R{} arrives.",
+                        self.epoch, vote.round, vote.author, vote.round, vote.origin, 
+                        self.current_header.round, self.current_header.author, vote.round, queue_size, vote.round
+                    );
+                    return Ok(());
+                } else {
+                    // Vote is for a round that has already passed (vote.round < current_header.round)
+                    // Own header for that round was already created, so this vote is stale
+                    warn!(
+                        "[Core][E{}] Dropping stale vote V{}({}) for H{}({}) - vote round {} is older than current_header round {}. Own header for R{} already created.",
+                        self.epoch, vote.round, vote.author, vote.round, vote.origin,
+                        vote.round, self.current_header.round, vote.round
+                    );
+                    return Ok(());
+                }
             } else {
                 debug!(
-                    "[Core][E{}] Dropping vote from different epoch.",
-                    self.epoch
+                    "[Core][E{}] Dropping vote from different epoch (vote epoch {}, current epoch {}).",
+                    self.epoch, vote.epoch, self.epoch
                 );
                 return Ok(());
             }
         }
 
         // Try appending the vote to the aggregator.
+        let vote_round = vote.round;
+        let vote_author = vote.author.clone();
+        let current_header_round = self.current_header.round;
+        let current_header_author = self.current_header.author.clone();
         let certificate_option = {
             // Acquire committee lock briefly to check quorum.
             let committee_guard = self.committee.read().await;
             // Check epoch consistency before aggregating.
             if committee_guard.epoch != self.epoch {
-                warn!("[Core][E{}] Committee epoch changed while processing V{}({}). Aborting aggregation.", self.epoch, vote.round, vote.author);
+                warn!("[Core][E{}] Committee epoch changed while processing V{}({}). Aborting aggregation.", self.epoch, vote_round, vote_author);
                 return Ok(());
             }
-            self.votes_aggregator
-                .append(vote, &committee_guard, &self.current_header)? // Pass committee ref
-                                                                       // Lock released here
+            info!(
+                "[Core][E{}] Appending vote V{}({}) for H{}({}) to aggregator. Current weight: checking quorum...",
+                self.epoch, vote_round, vote_author, current_header_round, current_header_author
+            );
+            let result = self.votes_aggregator
+                .append(vote, &committee_guard, &self.current_header)?; // Pass committee ref
+            // Lock released here
+            if result.is_none() {
+                info!(
+                    "[Core][E{}] Vote V{}({}) appended for H{}({}). Quorum not reached yet.",
+                    self.epoch, vote_round, vote_author, current_header_round, current_header_author
+                );
+            }
+            result
         };
 
         // If aggregation resulted in a new certificate...
@@ -1082,30 +1155,34 @@ impl Core {
     }
 
     // Validates a received vote.
+    // NOTE: This function only checks epoch, GC round, and signature.
+    // Votes that don't match current_header are NOT rejected here - they will be queued in process_vote.
     async fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
         // Acquire read lock for committee checks.
         let committee_guard = self.committee.read().await;
         // Check 1: Epoch must match.
-        ensure!(vote.epoch == self.epoch, DagError::InvalidEpoch);
-        // Check 2: Vote round must not be older than the header we are currently aggregating votes for.
-        // Allows votes for the current header even if dag_round advanced slightly.
+        if vote.epoch != self.epoch {
+            warn!(
+                "[Core][E{}] Rejecting vote V{}({}) for H{}({}): epoch mismatch (vote epoch {}, current epoch {})",
+                self.epoch, vote.round, vote.author, vote.round, vote.origin, vote.epoch, self.epoch
+            );
+            ensure!(vote.epoch == self.epoch, DagError::InvalidEpoch);
+        }
+        // Check 2: Vote round must not be older than GC round (but can be older than current_header.round).
+        // This allows votes for future rounds to be queued.
         ensure!(
-            self.current_header.round <= vote.round, // Allow votes for current or slightly future rounds? Strict check is better.
-            // Let's be strict: vote must be for the *exact* round of the current header.
-            // self.current_header.round == vote.round,
-            // Relaxed: Allow votes for current header even if parents for next round arrived.
+            self.gc_round <= vote.round,
             DagError::TooOld(vote.digest(), vote.round)
         );
-        // Check 3: Vote must be for the specific header ID and origin we are currently processing.
-        ensure!(
-            vote.id == self.current_header.id
-                && vote.origin == self.current_header.author
-                && vote.round == self.current_header.round,
-            DagError::UnexpectedVote(vote.id.clone()) // Vote is for a different header.
-        );
-        // Check 4: Verify vote signature.
+        // Check 3: Verify vote signature.
         vote.verify(&committee_guard)?; // Propagate verification errors.
                                         // Lock released here
+        
+        // Don't check if vote matches current_header here - let process_vote handle queueing.
+        debug!(
+            "[Core][E{}] Vote V{}({}) for H{}({}) passed sanitization (epoch, GC round, signature). Will check current_header match in process_vote.",
+            self.epoch, vote.round, vote.author, vote.round, vote.origin
+        );
         Ok(())
     }
 
@@ -1296,10 +1373,24 @@ impl Core {
             }
             // Received Vote from peer
             PrimaryMessage::Vote(vote) => {
-                // Sanitize first (checks epoch, GC round, matches current_header, signature).
-                self.sanitize_vote(&vote).await?;
-                // Full processing (aggregates votes, potentially creates/processes certificate).
-                self.process_vote(vote).await
+                info!(
+                    "[Core][E{}] Received vote message V{}({}) for H{}({}) from network",
+                    self.epoch, vote.round, vote.author, vote.round, vote.origin
+                );
+                // Sanitize first (checks epoch, GC round, signature - does NOT check current_header match).
+                match self.sanitize_vote(&vote).await {
+                    Ok(_) => {
+                        // Full processing (aggregates votes, potentially creates/processes certificate).
+                        self.process_vote(vote).await
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[Core][E{}] Vote V{}({}) for H{}({}) failed sanitization: {}",
+                            self.epoch, vote.round, vote.author, vote.round, vote.origin, e
+                        );
+                        Err(e)
+                    }
+                }
             }
             // Received Certificate from peer or loopback (after dependencies met)
             PrimaryMessage::Certificate(certificate) => {
@@ -1337,6 +1428,44 @@ impl Core {
                 }
                 Ok(())
             }
+            // Received VoteNudge from peer: try to vote again for the specified header if conditions match
+            PrimaryMessage::VoteNudge { epoch, round, header_id, origin } => {
+                // Chỉ xử lý nếu cùng epoch và không bị lag quá xa
+                if epoch != self.epoch {
+                    debug!("[Core][E{}] Ignoring VoteNudge for different epoch {}.", self.epoch, epoch);
+                    return Ok(());
+                }
+                if round + self.gc_depth < self.dag_round.saturating_sub(self.gc_depth) {
+                    debug!("[Core][E{}] Ignoring VoteNudge R{} too old for dag_round {}.", self.epoch, round, self.dag_round);
+                    return Ok(());
+                }
+
+                // Tìm header trong store theo header_id; nếu có thì process_header để tạo vote nếu phù hợp
+                if let Ok(Some(bytes)) = self.store.read(header_id.to_vec()).await {
+                    if let Ok(header) = bincode::deserialize::<Header>(&bytes) {
+                        if header.epoch == self.epoch && header.round == round && header.author == origin {
+                            info!(
+                                "[Core][E{}] Received VoteNudge for H{}({}). Attempting to process and vote.",
+                                self.epoch, round, origin
+                            );
+                            // process_header sẽ tự thực hiện dependency checks và gửi vote nếu không ở syncing
+                            let _ = self.process_header(&header, false).await;
+                        } else {
+                            debug!(
+                                "[Core][E{}] VoteNudge header meta mismatch. Ignoring.",
+                                self.epoch
+                            );
+                        }
+                    }
+                } else {
+                    debug!(
+                        "[Core][E{}] VoteNudge header {} not found locally. Ignoring.",
+                        self.epoch, header_id
+                    );
+                }
+                Ok(())
+            }
+
             // Ignore Reconfigure messages received directly from peers. Reconfiguration is driven internally.
             PrimaryMessage::Reconfigure(_) => {
                 info!(
@@ -1345,12 +1474,69 @@ impl Core {
                 );
                 Ok(())
             }
-            // Ignore Certificate Bundles when not in Syncing state.
-            PrimaryMessage::CertificateBundle(_) => {
-                warn!(
-                    "[Core][E{}] Received CertificateBundle while not in Syncing state. Ignoring.",
-                    self.epoch
+            // Accept Certificate Bundles in Running state if they are narrowly scoped to current epoch/rounds
+            PrimaryMessage::CertificateBundle(certificates) => {
+                if certificates.is_empty() {
+                    warn!(
+                        "[Core][E{}] Received empty CertificateBundle in Running state. Ignoring.",
+                        self.epoch
+                    );
+                    return Ok(());
+                }
+
+                // Define a narrow acceptance window around our current dag_round to help liveness
+                let current_epoch_local = self.epoch;
+                let min_round = self.dag_round.saturating_sub(self.gc_depth);
+                let max_round = self.dag_round.saturating_add(5);
+
+                // Verify and filter bundle (epoch matches, round in window)
+                let committee_clone = self.committee.clone();
+                let (accepted, rejected): (Vec<_>, Vec<_>) = {
+                    let committee_guard = committee_clone.blocking_read();
+                    certificates
+                        .into_iter()
+                        .partition(|cert| {
+                            let ok_epoch = cert.epoch() == current_epoch_local;
+                            let r = cert.round();
+                            let ok_round = r >= min_round && r <= max_round;
+                            let verified = ok_epoch && ok_round && cert.verify(&committee_guard).is_ok();
+                            verified
+                        })
+                };
+
+                if !rejected.is_empty() {
+                    debug!(
+                        "[Core][E{}] Rejected {} certificate(s) from bundle (epoch/round window/verify mismatch).",
+                        self.epoch,
+                        rejected.len()
+                    );
+                }
+
+                if accepted.is_empty() {
+                    debug!(
+                        "[Core][E{}] No acceptable certificates in bundle for window [{}, {}] at dag_round {}.",
+                        self.epoch,
+                        min_round,
+                        max_round,
+                        self.dag_round
+                    );
+                    return Ok(());
+                }
+
+                info!(
+                    "[Core][E{}] Processing {} certificate(s) from bundle in Running state (window [{}, {}], dag_round {}).",
+                    self.epoch,
+                    accepted.len(),
+                    min_round,
+                    max_round,
+                    self.dag_round
                 );
+
+                // Process accepted certificates using syncing=true to avoid extra side-effects
+                for certificate in accepted {
+                    let _ = self.process_certificate(certificate, true).await;
+                }
+
                 Ok(())
             }
             // Certificate Request messages are handled by Helper, not Core.
@@ -1383,6 +1569,7 @@ impl Core {
         self.pending_votes.clear(); // Clear pending votes from old epoch
         self.authors_seen_per_round.clear(); // Clear quorum tracking
         self.round_stuck_since.clear(); // Clear stuck round tracking
+        self.last_proactive_request.clear(); // Clear proactive request tracking
         self.last_commit_observed_round = 0; // Reset consensus commit tracking
         self.last_commit_observed_at = Instant::now(); // Reset timestamp
         self.highest_round_sent_to_consensus = 0; // Reset highest round sent to consensus
@@ -1518,95 +1705,147 @@ impl Core {
                                 self.round_stuck_since.insert(r, now);
                             }
 
-                            // Only trigger proactive actions after timeout
+                            // Only trigger proactive actions after timeout and cooldown
                             if let Some(stuck_since) = self.round_stuck_since.get(&r) {
-                                if stuck_since.elapsed() >= Duration::from_millis(self.quorum_timeout_ms) {
-                                warn!(
-                                    "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing {} author(s): {:?}. Triggering proactive assistance.",
-                                    self.epoch, r, stuck_since.elapsed(), self.quorum_timeout_ms, missing.len(), missing
-                                );
+                                let elapsed = stuck_since.elapsed();
+                                let last_request = self.last_proactive_request.get(&r);
 
-                                // 1) Request a small range sync for this round (to all peers)
-                                self.request_sync_chunk(r, r).await;
+                                // Check both timeout and cooldown
+                                let timeout_expired = elapsed >= Duration::from_millis(self.quorum_timeout_ms);
+                                let cooldown_expired = last_request
+                                    .map(|t| t.elapsed() >= Duration::from_millis(self.proactive_request_cooldown_ms))
+                                    .unwrap_or(true); // If no previous request, allow it
 
-                                // 2) Proactively request certificates from missing authors specifically
-                                let committee_guard = self.committee.read().await;
-                                let missing_authors_with_addresses: Vec<(PublicKey, SocketAddr)> = missing
-                                    .iter()
-                                    .filter_map(|missing_author| {
-                                        committee_guard
-                                            .primary(missing_author)
-                                            .ok()
-                                            .map(|addrs| (missing_author.clone(), addrs.primary_to_primary))
-                                    })
-                                    .collect();
-                                drop(committee_guard);
-
-                                if !missing_authors_with_addresses.is_empty() {
-                                    info!(
-                                        "[Core][E{}] Quorum watchdog: requesting certificates for R{} from {} missing author(s): {:?}",
-                                        self.epoch, r, missing_authors_with_addresses.len(),
-                                        missing_authors_with_addresses.iter().map(|(name, _)| name).collect::<Vec<_>>()
+                                if timeout_expired && cooldown_expired {
+                                    warn!(
+                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing {} author(s): {:?}. Triggering proactive assistance.",
+                                        self.epoch, r, elapsed, self.quorum_timeout_ms, missing.len(), missing
                                     );
-                                    // Send CertificateRangeRequest directly to missing authors
-                                    let range_request = PrimaryMessage::CertificateRangeRequest {
-                                        start_round: r,
-                                        end_round: r,
-                                        requestor: self.name.clone(),
-                                    };
-                                    let bytes = bincode::serialize(&range_request)
-                                        .expect("Failed to serialize cert range request");
-                                    for (missing_author, address) in missing_authors_with_addresses {
-                                        info!(
-                                            "[Core][E{}] Quorum watchdog: requesting R{} certificates from {} at {}",
-                                            self.epoch, r, missing_author, address
-                                        );
-                                        let _ = self.network.send(address, Bytes::from(bytes.clone())).await;
-                                    }
-                                }
 
-                                // 3) Proactively re-broadcast known certificates for this round to all peers (vote nudge)
-                                let key = bincode::serialize(&(self.epoch, r)).expect("serialize round index key");
-                                if let Ok(Some(digests_bytes)) = self.store.read_cf(ROUND_INDEX_CF.to_string(), key).await {
-                                    if let Ok(digests) = bincode::deserialize::<Vec<Digest>>(&digests_bytes) {
-                                        let mut certs = Vec::new();
-                                        for d in digests {
-                                            if let Ok(Some(cert_bytes)) = self.store.read(d.to_vec()).await {
-                                                if let Ok(cert) = bincode::deserialize::<Certificate>(&cert_bytes) {
-                                                    // Chỉ re-broadcast cert đúng epoch hiện tại
-                                                    if cert.epoch() == self.epoch {
-                                                        certs.push(cert);
+                                    // 1) Request a small range sync for this round (to all peers)
+                                    self.request_sync_chunk(r, r).await;
+
+                                    // 2) Proactively request certificates from missing authors specifically
+                                    let committee_guard = self.committee.read().await;
+                                    let missing_authors_with_addresses: Vec<(PublicKey, SocketAddr)> = missing
+                                        .iter()
+                                        .filter_map(|missing_author| {
+                                            committee_guard
+                                                .primary(missing_author)
+                                                .ok()
+                                                .map(|addrs| (missing_author.clone(), addrs.primary_to_primary))
+                                        })
+                                        .collect();
+                                    drop(committee_guard);
+
+                                    if !missing_authors_with_addresses.is_empty() {
+                                        debug!(
+                                            "[Core][E{}] Quorum watchdog: requesting certificates for R{} from {} missing author(s)",
+                                            self.epoch, r, missing_authors_with_addresses.len()
+                                        );
+                                        // Send CertificateRangeRequest directly to missing authors
+                                        let range_request = PrimaryMessage::CertificateRangeRequest {
+                                            start_round: r,
+                                            end_round: r,
+                                            requestor: self.name.clone(),
+                                        };
+                                        let bytes = bincode::serialize(&range_request)
+                                            .expect("Failed to serialize cert range request");
+                                        for (_missing_author, address) in missing_authors_with_addresses {
+                                            let _ = self.network.send(address, Bytes::from(bytes.clone())).await;
+                                        }
+                                    }
+
+                                    // 3) Re-broadcast own header cho đúng peer còn thiếu và chỉ khi không bị lag quá nhiều
+                                    // Điều kiện: current_header là H_r của chính node, không ở Syncing, và r nằm gần dag_round
+                                    if self.sync_state.is_none()
+                                        && self.current_header.round == r
+                                        && self.current_header.author == self.name
+                                        && r >= self.dag_round.saturating_sub(self.gc_depth)
+                                        && r <= self.dag_round.saturating_add(5)
+                                    {
+                                        let missing_authors_with_addresses: Vec<(PublicKey, SocketAddr)> = {
+                                            let committee_guard = self.committee.read().await;
+                                            missing
+                                                .iter()
+                                                .filter_map(|author| {
+                                                    committee_guard
+                                                        .primary(author)
+                                                        .ok()
+                                                        .map(|addrs| (author.clone(), addrs.primary_to_primary))
+                                                })
+                                                .collect()
+                                        };
+                                        if !missing_authors_with_addresses.is_empty() {
+                                            info!(
+                                                "[Core][E{}] Quorum watchdog: re-broadcasting own header H{} có mục tiêu tới {} peer(s) còn thiếu để thúc đẩy vote.",
+                                                self.epoch, r, missing_authors_with_addresses.len()
+                                            );
+                                            let header_bytes_msg = bincode::serialize(&PrimaryMessage::Header(self.current_header.clone()))
+                                                .expect("serialize header message");
+                                            for (_auth, addr) in &missing_authors_with_addresses {
+                                                let _ = self
+                                                    .network
+                                                    .send(*addr, Bytes::from(header_bytes_msg.clone()))
+                                                    .await;
+                                            }
+
+                                            // Gửi VoteNudge tới các peer còn thiếu (cùng epoch và cửa sổ round)
+                                            let nudge_msg = PrimaryMessage::VoteNudge {
+                                                epoch: self.epoch,
+                                                round: r,
+                                                header_id: self.current_header.id.clone(),
+                                                origin: self.current_header.author.clone(),
+                                            };
+                                            let nudge_bytes = bincode::serialize(&nudge_msg)
+                                                .expect("serialize vote nudge");
+                                            for (_auth, addr) in missing_authors_with_addresses {
+                                                let _ = self.network.send(addr, Bytes::from(nudge_bytes.clone())).await;
+                                            }
+                                        }
+                                    }
+
+                                    // 4) Proactively re-broadcast known certificates for this round to all peers (vote nudge)
+                                    let key = bincode::serialize(&(self.epoch, r)).expect("serialize round index key");
+                                    if let Ok(Some(digests_bytes)) = self.store.read_cf(ROUND_INDEX_CF.to_string(), key).await {
+                                        if let Ok(digests) = bincode::deserialize::<Vec<Digest>>(&digests_bytes) {
+                                            let mut certs = Vec::new();
+                                            for d in digests {
+                                                if let Ok(Some(cert_bytes)) = self.store.read(d.to_vec()).await {
+                                                    if let Ok(cert) = bincode::deserialize::<Certificate>(&cert_bytes) {
+                                                        // Chỉ re-broadcast cert đúng epoch hiện tại
+                                                        if cert.epoch() == self.epoch {
+                                                            certs.push(cert);
+                                                        }
                                                     }
                                                 }
                                             }
-                                        }
 
-                                        if !certs.is_empty() {
-                                            let addresses: Vec<SocketAddr> = {
-                                                let committee_guard = self.committee.read().await;
-                                                committee_guard
-                                                    .others_primaries(&self.name)
-                                                    .iter()
-                                                    .map(|(_, x)| x.primary_to_primary)
-                                                    .collect()
-                                            };
-                                            info!(
-                                                "[Core][E{}] Quorum watchdog: re-broadcasting {} certificate(s) for R{} to {} peers to nudge votes.",
-                                                self.epoch, certs.len(), r, addresses.len()
-                                            );
-                                            for cert in certs {
-                                                let cert_bytes_msg = bincode::serialize(&PrimaryMessage::Certificate(cert.clone()))
-                                                    .expect("serialize certificate message");
-                                                let _ = self.network.broadcast(addresses.clone(), Bytes::from(cert_bytes_msg)).await;
+                                            if !certs.is_empty() {
+                                                let addresses: Vec<SocketAddr> = {
+                                                    let committee_guard = self.committee.read().await;
+                                                    committee_guard
+                                                        .others_primaries(&self.name)
+                                                        .iter()
+                                                        .map(|(_, x)| x.primary_to_primary)
+                                                        .collect()
+                                                };
+                                                debug!(
+                                                    "[Core][E{}] Quorum watchdog: re-broadcasting {} certificate(s) for R{} to {} peers to nudge votes.",
+                                                    self.epoch, certs.len(), r, addresses.len()
+                                                );
+                                                for cert in certs {
+                                                    let cert_bytes_msg = bincode::serialize(&PrimaryMessage::Certificate(cert.clone()))
+                                                        .expect("serialize certificate message");
+                                                    let _ = self.network.broadcast(addresses.clone(), Bytes::from(cert_bytes_msg)).await;
+                                                }
                                             }
-                                        } else {
-                                            info!("[Core][E{}] Quorum watchdog: no local certificates to re-broadcast for R{}.", self.epoch, r);
                                         }
                                     }
-                                }
 
-                                // Reset stuck timer to avoid spamming (will re-trigger if still stuck after next timeout)
-                                self.round_stuck_since.insert(r, Instant::now());
+                                    // Record that we sent a proactive request for rate limiting
+                                    self.last_proactive_request.insert(r, Instant::now());
+                                    // Don't reset stuck timer - keep tracking until quorum is achieved
                                 }
                             }
                         } else {
