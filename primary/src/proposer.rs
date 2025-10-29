@@ -356,7 +356,20 @@ impl Proposer {
                     // Only accept parents if they are exactly for the round preceding the one we are currently trying to build.
                     // `self.round` is the round we are *about* to propose.
                     // The parents received should be from `self.round - 1`.
-                    if round == self.round - 1 {
+                    // Also check: round should be reasonable (not from a completely different epoch)
+                    let expected_parent_round = if self.round > 1 { self.round - 1 } else { 0 };
+
+                    // If the received round is much larger than current round, it's likely from an old epoch
+                    // and should be ignored
+                    if round > RECONFIGURE_INTERVAL && self.round < 10 {
+                        warn!(
+                            "[Proposer][E{}] Ignoring parents from round {} (likely from old epoch). Current round: {}.",
+                            self.epoch, round, self.round
+                        );
+                        continue;
+                    }
+
+                    if round == expected_parent_round {
                         // Accept these parents for the header of `self.round`.
                         if self.last_parents.is_empty() { // Only replace if we don't have parents yet for this round
                            self.last_parents = parents;

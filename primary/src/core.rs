@@ -893,6 +893,15 @@ impl Core {
                         self.epoch
                     );
                 }
+
+                // Do NOT send parents for the reconfiguration trigger round to the Proposer.
+                // This avoids delivering round-RECONFIGURE parents from the old epoch,
+                // which the Proposer (already resetting to round 1) would reject and can cause stalls.
+                debug!(
+                    "[Core][E{}] Skipping sending parents for trigger round {} to Proposer to avoid cross-epoch leakage.",
+                    self.epoch, formed_round
+                );
+                return Ok(());
             }
             // *** THAY ĐỔI KẾT THÚC ***
 
