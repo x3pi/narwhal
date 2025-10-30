@@ -2279,33 +2279,57 @@ impl Core {
                     match result {
                         Ok(notification) => {
                              // --- Anti-Race Condition Logic for Core ---
-                            if notification.committee.epoch != self.epoch {
+                             // Accept reconfigure if notification epoch >= current epoch
+                             // This allows nodes that missed previous epochs to catch up
+                            if notification.committee.epoch < self.epoch {
                                 warn!(
-                                    "[Core] Ignoring stale reconfigure signal for epoch {} (current is {})",
-                                    notification.committee.epoch, self.epoch
+                                    "[Core][E{}] Ignoring stale reconfigure signal for epoch {} (current is {})",
+                                    self.epoch, notification.committee.epoch, self.epoch
                                 );
+                                Ok(())
                             } else {
                                 // Wait for the shared Committee Arc to be updated.
-                                info!("[Core] Received reconfigure signal for end of epoch {}. Waiting for committee update...", self.epoch);
+                                let target_epoch = notification.committee.epoch;
+                                info!("[Core][E{}] Received reconfigure signal for epoch {}. Waiting for committee update...", self.epoch, target_epoch);
                                 let mut updated_committee_epoch = self.epoch;
-                                while updated_committee_epoch <= self.epoch {
+                                let mut wait_count = 0;
+                                const MAX_WAIT_COUNT: u32 = 100; // Wait up to 10 seconds
+                                while updated_committee_epoch < target_epoch && wait_count < MAX_WAIT_COUNT {
                                     sleep(Duration::from_millis(100)).await;
                                     let committee_guard = self.committee.read().await;
                                     updated_committee_epoch = committee_guard.epoch;
                                     drop(committee_guard);
+                                    wait_count += 1;
                                 }
-                                info!("[Core] Committee Arc updated to epoch {}. Resetting internal state.", updated_committee_epoch);
-                                // Perform the state reset for the new epoch.
-                                self.reset_state_for_new_epoch(updated_committee_epoch);
-                                // (Không cần cờ epoch_transitioning nữa)
-                                info!("[Core][E{}] State reset for new epoch complete.", self.epoch); // <-- SỬA LOG
-
+                                
+                                if updated_committee_epoch < target_epoch {
+                                    warn!(
+                                        "[Core][E{}] Committee Arc not updated to epoch {} after waiting (current: {}). May need manual intervention.",
+                                        self.epoch, target_epoch, updated_committee_epoch
+                                    );
+                                } else {
+                                    info!("[Core][E{}] Committee Arc updated to epoch {}. Resetting internal state.", self.epoch, updated_committee_epoch);
+                                    // Perform the state reset for the new epoch.
+                                    self.reset_state_for_new_epoch(updated_committee_epoch);
+                                    info!("[Core][E{}] State reset for new epoch complete.", self.epoch);
+                                }
+                                Ok(()) // Continue loop after handling signal
                             }
-                            Ok(()) // Continue loop after handling signal
                         },
                         Err(broadcast::error::RecvError::Lagged(n)) => {
-                            warn!("[Core] Reconfigure receiver lagged by {}. Missed epoch transitions!", n);
-                            // Consider shutdown or requesting full state sync.
+                            warn!("[Core][E{}] Reconfigure receiver lagged by {} messages. Missed epoch transitions! Checking current committee epoch...", self.epoch, n);
+                            // Check if committee has been updated to a newer epoch
+                            let committee_guard = self.committee.read().await;
+                            let current_committee_epoch = committee_guard.epoch;
+                            drop(committee_guard);
+                            
+                            if current_committee_epoch > self.epoch {
+                                info!("[Core][E{}] Detected committee at epoch {} after lag. Resetting state.", self.epoch, current_committee_epoch);
+                                self.reset_state_for_new_epoch(current_committee_epoch);
+                                info!("[Core][E{}] State reset complete after lag recovery.", self.epoch);
+                            } else {
+                                warn!("[Core][E{}] Committee still at epoch {} after lag. May need manual sync.", self.epoch, current_committee_epoch);
+                            }
                             Ok(())
                         },
                         Err(broadcast::error::RecvError::Closed) => {
@@ -2339,15 +2363,29 @@ impl Core {
 
                 // --- Quorum watchdog & Consensus liveness watchdog (only when not syncing) ---
                 _ = quorum_check_interval.tick(), if self.sync_state.is_none() => {
-                    // 1) Quorum watchdog: detect rounds lagging quorum
+                    // 0) Epoch mismatch check: detect if committee has been updated but Core hasn't reset
                     let committee_guard = self.committee.read().await;
-                    let expected_authors: HashSet<PublicKey> = committee_guard
-                        .others_primaries(&self.name)
-                        .iter()
-                        .map(|(name, _)| name.clone())
-                        .chain(std::iter::once(self.name.clone()))
-                        .collect();
+                    let committee_epoch = committee_guard.epoch;
                     drop(committee_guard);
+                    
+                    if committee_epoch > self.epoch {
+                        warn!(
+                            "[Core][E{}] Detected epoch mismatch: committee at epoch {} but Core still at epoch {}. Auto-resetting state.",
+                            self.epoch, committee_epoch, self.epoch
+                        );
+                        self.reset_state_for_new_epoch(committee_epoch);
+                        info!("[Core][E{}] State reset complete after epoch mismatch detection.", self.epoch);
+                        Ok(()) // Skip rest of watchdog this iteration
+                    } else {
+                        // 1) Quorum watchdog: detect rounds lagging quorum
+                        let committee_guard = self.committee.read().await;
+                        let expected_authors: HashSet<PublicKey> = committee_guard
+                            .others_primaries(&self.name)
+                            .iter()
+                            .map(|(name, _)| name.clone())
+                            .chain(std::iter::once(self.name.clone()))
+                            .collect();
+                        drop(committee_guard);
 
                     let r = self.dag_round;
                     // Skip quorum check if dag_round is from previous epoch (should be reset but wasn't)
@@ -2749,6 +2787,7 @@ impl Core {
                     // If current_committed == 0 and highest_round_sent_to_consensus == 0,
                     // we haven't sent anything yet, so no need to check for stall
                     Ok(())
+                    } // Close else block
                 },
 
                 // Handle certificates returned by CertificateWaiter (dependencies met)
