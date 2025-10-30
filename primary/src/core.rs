@@ -423,7 +423,7 @@ impl Core {
                 );
                 // Clear sync state and reset epoch
                 self.set_sync_state(None).await;
-                self.reset_state_for_new_epoch(committee_epoch);
+                self.reset_and_initialize_epoch(committee_epoch).await;
                 info!("[Core][E{}] State reset complete after epoch mismatch detection during sync.", self.epoch);
                 return;
             }
@@ -1807,7 +1807,7 @@ impl Core {
                     );
                     // Clear sync state and reset epoch
                     self.set_sync_state(None).await;
-                    self.reset_state_for_new_epoch(committee_epoch);
+                    self.reset_and_initialize_epoch(committee_epoch).await;
                     info!("[Core][E{}] State reset complete after epoch mismatch detection during sync.", self.epoch);
                     // Message will be processed in next iteration with new epoch
                     return Ok(());
@@ -1832,7 +1832,7 @@ impl Core {
                                 self.epoch, committee_epoch, self.epoch
                             );
                             self.set_sync_state(None).await;
-                            self.reset_state_for_new_epoch(committee_epoch);
+                            self.reset_and_initialize_epoch(committee_epoch).await;
                             info!("[Core][E{}] State reset complete after epoch mismatch detection in sync bundle.", self.epoch);
                             return Ok(()); // Process will continue with new epoch
                         }
@@ -1964,7 +1964,7 @@ impl Core {
                             self.epoch, cert_epoch, self.epoch
                         );
                         self.set_sync_state(None).await;
-                        self.reset_state_for_new_epoch(cert_epoch);
+                        self.reset_and_initialize_epoch(cert_epoch).await;
                         info!("[Core][E{}] State reset complete after higher-epoch certificate detection during sync.", self.epoch);
                         return Ok(()); // Process will continue with new epoch
                     }
@@ -2063,7 +2063,7 @@ impl Core {
                                     self.epoch, header.epoch, self.epoch
                                 );
                                 self.set_sync_state(None).await;
-                                self.reset_state_for_new_epoch(header.epoch);
+                                self.reset_and_initialize_epoch(header.epoch).await;
                                 info!("[Core][E{}] State reset complete after higher-epoch header detection during sync.", self.epoch);
                             }
                             
@@ -2109,7 +2109,7 @@ impl Core {
                                 self.epoch, vote.epoch, self.epoch
                             );
                             self.set_sync_state(None).await;
-                            self.reset_state_for_new_epoch(vote.epoch);
+                            self.reset_and_initialize_epoch(vote.epoch).await;
                             info!("[Core][E{}] State reset complete after higher-epoch vote detection during sync.", self.epoch);
                         }
                         Err(e)
@@ -2384,10 +2384,88 @@ impl Core {
 
         // Note: `consensus_round` (Arc<AtomicU64>) is reset by GarbageCollector.
         // Note: `committee` (Arc<RwLock<Committee>>) is updated by the main node loop.
+    }
+
+    // Helper: Reset epoch and initialize genesis certificates (async wrapper)
+    async fn reset_and_initialize_epoch(&mut self, new_epoch: Epoch) {
+        self.reset_state_for_new_epoch(new_epoch);
+        self.initialize_genesis_certificates().await;
+    }
+
+    // Process genesis certificates after epoch reset to ensure all nodes have parents for round 1
+    async fn initialize_genesis_certificates(&mut self) {
+        let genesis_certs = {
+            let committee_guard = self.committee.read().await;
+            // Verify we're processing for the correct epoch
+            if committee_guard.epoch != self.epoch {
+                warn!(
+                    "[Core][E{}] Skipping genesis initialization: committee epoch {} != core epoch {}",
+                    self.epoch, committee_guard.epoch, self.epoch
+                );
+                return;
+            }
+            Certificate::genesis(&committee_guard)
+        };
 
         info!(
-            "[Core] State reset complete for epoch {}. Ready.",
-            new_epoch
+            "[Core][E{}] Initializing {} genesis certificates for epoch start",
+            self.epoch, genesis_certs.len()
+        );
+
+        // Process each genesis certificate to store it and track authors
+        for genesis_cert in genesis_certs {
+            // Skip if already stored
+            if let Ok(Some(_)) = self.store.read(genesis_cert.digest().to_vec()).await {
+                debug!(
+                    "[Core][E{}] Genesis certificate C{}({}) already stored, skipping",
+                    self.epoch, genesis_cert.round(), genesis_cert.origin()
+                );
+                // Still track the author even if cert already stored
+                self.authors_seen_per_round
+                    .entry(genesis_cert.round())
+                    .or_insert_with(HashSet::new)
+                    .insert(genesis_cert.origin());
+                continue;
+            }
+
+            // Store genesis certificate
+            let cert_bytes = bincode::serialize(&genesis_cert)
+                .expect("Failed to serialize genesis certificate");
+            self.store.write(genesis_cert.digest().to_vec(), cert_bytes).await;
+
+            // Update round index
+            let round_key = bincode::serialize(&(self.epoch, genesis_cert.round()))
+                .expect("Failed to serialize round key");
+            let mut existing_digests: Vec<Digest> = self
+                .store
+                .read_cf(ROUND_INDEX_CF.to_string(), round_key.clone())
+                .await
+                .ok()
+                .flatten()
+                .and_then(|b| bincode::deserialize(&b).ok())
+                .unwrap_or_default();
+            if !existing_digests.contains(&genesis_cert.digest()) {
+                existing_digests.push(genesis_cert.digest());
+                let digests_bytes = bincode::serialize(&existing_digests)
+                    .expect("Failed to serialize digest list");
+                let _ = self.store.write_cf(ROUND_INDEX_CF.to_string(), round_key, digests_bytes).await;
+            }
+
+            // Track genesis certificate author for quorum calculation
+            self.authors_seen_per_round
+                .entry(genesis_cert.round())
+                .or_insert_with(HashSet::new)
+                .insert(genesis_cert.origin());
+
+            debug!(
+                "[Core][E{}] Initialized genesis certificate C{}({})",
+                self.epoch, genesis_cert.round(), genesis_cert.origin()
+            );
+        }
+
+        info!(
+            "[Core][E{}] Genesis initialization complete. {} certificates tracked for round 0",
+            self.epoch, self.authors_seen_per_round.get(&0).map(|s| s.len()).unwrap_or(0)
         );
     }
 
@@ -2441,8 +2519,8 @@ impl Core {
                                     );
                                 } else {
                                     info!("[Core][E{}] Committee Arc updated to epoch {}. Resetting internal state.", self.epoch, updated_committee_epoch);
-                                    // Perform the state reset for the new epoch.
-                                    self.reset_state_for_new_epoch(updated_committee_epoch);
+                                    // Perform the state reset and genesis initialization for the new epoch.
+                                    self.reset_and_initialize_epoch(updated_committee_epoch).await;
                                     info!("[Core][E{}] State reset for new epoch complete.", self.epoch);
                                 }
                                 Ok(()) // Continue loop after handling signal
@@ -2457,7 +2535,7 @@ impl Core {
                             
                             if current_committee_epoch > self.epoch {
                                 info!("[Core][E{}] Detected committee at epoch {} after lag. Resetting state.", self.epoch, current_committee_epoch);
-                                self.reset_state_for_new_epoch(current_committee_epoch);
+                                self.reset_and_initialize_epoch(current_committee_epoch).await;
                                 info!("[Core][E{}] State reset complete after lag recovery.", self.epoch);
                             } else {
                                 warn!("[Core][E{}] Committee still at epoch {} after lag. May need manual sync.", self.epoch, current_committee_epoch);
@@ -2505,7 +2583,7 @@ impl Core {
                             "[Core][E{}] Detected epoch mismatch: committee at epoch {} but Core still at epoch {}. Auto-resetting state.",
                             self.epoch, committee_epoch, self.epoch
                         );
-                        self.reset_state_for_new_epoch(committee_epoch);
+                        self.reset_and_initialize_epoch(committee_epoch).await;
                         info!("[Core][E{}] State reset complete after epoch mismatch detection.", self.epoch);
                         Ok(()) // Skip rest of watchdog this iteration
                     } else {
@@ -2637,7 +2715,8 @@ impl Core {
                             continue; // Skip quorum check for this iteration
                         }
                         
-                        // Calculate dynamic quorum based on previous round's active certificates
+                        // Calculate dynamic quorum based on ACTUAL participants in current round
+                        // This is more accurate than using previous round's cert count
                         let prev_round = r.saturating_sub(1);
                         
                         // Read cert_seen and headers_seen first
@@ -2653,16 +2732,29 @@ impl Core {
                             .unwrap_or_default();
                         
                         // Calculate dynamic quorum and current certificate stake
+                        // IMPORTANT: Use headers_seen.len() as active count if we have headers but fewer certs
+                        // This accounts for nodes that are creating headers but haven't formed certificates yet
                         let (active_cert_count, dynamic_quorum_required, current_cert_stake) = {
                             let committee_guard = self.committee.read().await;
+                            
+                            // Determine active participant count:
+                            // 1. If we have headers, use max(headers_seen, cert_seen) to account for in-progress certificates
+                            // 2. Otherwise, use previous round's cert count
+                            // 3. For round 0, use committee size
                             let acc = if prev_round == 0 {
                                 committee_guard.authorities.len()
+                            } else if !headers_seen.is_empty() {
+                                // Use headers_seen if available (shows who's actually participating)
+                                // This is more accurate than using prev round count when nodes go offline
+                                headers_seen.len().max(cert_seen.len())
                             } else {
+                                // Fallback to previous round's cert count
                                 self.authors_seen_per_round
                                     .get(&prev_round)
                                     .map(|s| s.len())
                                     .unwrap_or(0)
                             };
+                            
                             let dq = if acc > 0 {
                                 committee_guard.quorum_threshold_dynamic(acc)
                             } else {
@@ -2678,9 +2770,27 @@ impl Core {
                         };
                         
                         // Check if we have enough certificates for dynamic quorum
-                        // Instead of checking if cert_seen.len() < expected_authors.len()
-                        // We check if current_cert_stake < dynamic_quorum_required
-                        if current_cert_stake < dynamic_quorum_required {
+                        // IMPORTANT: Adjust expected quorum if it seems unrealistic based on actual participation
+                        // If we've been stuck for a while and only have a few certs/headers, lower the bar
+                        let stuck_duration = self.round_stuck_since.get(&r)
+                            .map(|t| t.elapsed())
+                            .unwrap_or(Duration::ZERO);
+                        
+                        // If stuck for >10s and have very few participants, adjust quorum expectation
+                        let adjusted_quorum_required = if stuck_duration > Duration::from_secs(10) 
+                            && headers_seen.len() < 3 
+                            && cert_seen.len() < 3 {
+                            // Lower the quorum requirement: use actual participants instead of prev round count
+                            let actual_participants = headers_seen.len().max(cert_seen.len()).max(1);
+                            let committee_guard = self.committee.read().await;
+                            let adjusted = committee_guard.quorum_threshold_dynamic(actual_participants);
+                            drop(committee_guard);
+                            adjusted.min(dynamic_quorum_required) // Don't increase quorum, only decrease
+                        } else {
+                            dynamic_quorum_required
+                        };
+                        
+                        if current_cert_stake < adjusted_quorum_required {
                             // Round is missing certificates to reach dynamic quorum - track stuck time
                             let missing_certs: Vec<PublicKey> = expected_authors
                                 .difference(&cert_seen)
@@ -2704,8 +2814,8 @@ impl Core {
                             let is_newly_stuck = !self.round_stuck_since.contains_key(&r);
                             if is_newly_stuck {
                                 info!(
-                                    "[Core][E{}] Quorum watchdog: R{} missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} based on {} active certs in R{}). {} author(s) have headers but no cert yet: {:?}. {} author(s) missing headers: {:?}",
-                                    self.epoch, r, cert_seen.len(), current_cert_stake, dynamic_quorum_required, active_cert_count, prev_round,
+                                    "[Core][E{}] Quorum watchdog: R{} missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} [adjusted: {}] based on {} active participants). {} author(s) have headers but no cert yet: {:?}. {} author(s) missing headers: {:?}",
+                                    self.epoch, r, cert_seen.len(), current_cert_stake, dynamic_quorum_required, adjusted_quorum_required, active_cert_count,
                                     missing_with_headers.len(), missing_with_headers,
                                     missing_without_headers.len(), missing_without_headers
                                 );
@@ -2725,9 +2835,9 @@ impl Core {
 
                                 if timeout_expired && cooldown_expired {
                                     warn!(
-                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} based on {} active certs in R{}). {} with headers but no cert: {:?}. {} missing headers: {:?}. Triggering proactive assistance.",
+                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} [adjusted: {}] based on {} active participants). {} with headers but no cert: {:?}. {} missing headers: {:?}. Triggering proactive assistance.",
                                         self.epoch, r, elapsed, self.quorum_timeout_ms, 
-                                        cert_seen.len(), current_cert_stake, dynamic_quorum_required, active_cert_count, prev_round,
+                                        cert_seen.len(), current_cert_stake, dynamic_quorum_required, adjusted_quorum_required, active_cert_count,
                                         missing_with_headers.len(), missing_with_headers,
                                         missing_without_headers.len(), missing_without_headers
                                     );
@@ -2900,9 +3010,9 @@ impl Core {
                         } else {
                             // Round has quorum now - remove from stuck tracking
                             if self.round_stuck_since.remove(&r).is_some() {
-                                debug!(
-                                    "[Core][E{}] Quorum watchdog: R{} now has quorum ({} certificates from {} authors). Removed from stuck tracking.",
-                                    self.epoch, r, cert_seen.len(), cert_seen.len()
+                                info!(
+                                    "[Core][E{}] Quorum watchdog: R{} now has quorum ({} certificates with stake {} >= required {}). Removed from stuck tracking.",
+                                    self.epoch, r, cert_seen.len(), current_cert_stake, adjusted_quorum_required
                                 );
                             }
                         }
@@ -2993,7 +3103,7 @@ impl Core {
                              self.epoch, committee_epoch, self.epoch
                          );
                          self.set_sync_state(None).await;
-                         self.reset_state_for_new_epoch(committee_epoch);
+                         self.reset_and_initialize_epoch(committee_epoch).await;
                          info!("[Core][E{}] State reset complete after epoch mismatch detection during sync timeout.", self.epoch);
                          Ok(()) // Continue loop after epoch reset
                      } else {
