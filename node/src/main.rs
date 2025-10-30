@@ -79,34 +79,65 @@ async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Resul
         block_number,
         socket_path
     );
-    let mut stream = tokio::net::UnixStream::connect(socket_path)
-        .await
-        .context(format!("Failed to connect to UDS path '{}'", socket_path))?;
+    
+    const UDS_CONNECT_TIMEOUT_MS: u64 = 5000;
+    const UDS_READ_TIMEOUT_MS: u64 = 10000;
+    
+    // Connect to UDS with timeout
+    let mut stream = tokio::time::timeout(
+        Duration::from_millis(UDS_CONNECT_TIMEOUT_MS),
+        tokio::net::UnixStream::connect(socket_path)
+    )
+    .await
+    .context(format!("UDS connection timeout ({}ms)", UDS_CONNECT_TIMEOUT_MS))?
+    .context(format!("Failed to connect to UDS path '{}'", socket_path))?;
+    
     let block_req = validator::BlockRequest { block_number };
     let request = validator::Request {
         payload: Some(validator::request::Payload::BlockRequest(block_req)),
     };
     let request_bytes = request.encode_to_vec();
     let request_len = request_bytes.len() as u32;
-    stream
-        .write_all(&request_len.to_be_bytes())
-        .await
-        .context("Failed to write request length to UDS")?;
-    stream
-        .write_all(&request_bytes)
-        .await
-        .context("Failed to write request payload to UDS")?;
+    
+    // Write request with timeout
+    tokio::time::timeout(
+        Duration::from_millis(UDS_READ_TIMEOUT_MS),
+        stream.write_all(&request_len.to_be_bytes())
+    )
+    .await
+    .context(format!("UDS write timeout ({}ms)", UDS_READ_TIMEOUT_MS))?
+    .context("Failed to write request length to UDS")?;
+    
+    tokio::time::timeout(
+        Duration::from_millis(UDS_READ_TIMEOUT_MS),
+        stream.write_all(&request_bytes)
+    )
+    .await
+    .context(format!("UDS write timeout ({}ms)", UDS_READ_TIMEOUT_MS))?
+    .context("Failed to write request payload to UDS")?;
+    
+    // Read response length with timeout
     let mut len_buf = [0u8; 4];
-    stream
-        .read_exact(&mut len_buf)
-        .await
-        .context("Failed to read response length from UDS. Connection likely closed.")?;
+    tokio::time::timeout(
+        Duration::from_millis(UDS_READ_TIMEOUT_MS),
+        stream.read_exact(&mut len_buf)
+    )
+    .await
+    .context(format!("UDS read timeout ({}ms) - server may not be responding", UDS_READ_TIMEOUT_MS))?
+    .context("Failed to read response length from UDS. Connection likely closed.")?;
+    
     let response_len = u32::from_be_bytes(len_buf) as usize;
     let mut response_buf = vec![0u8; response_len];
-    stream
-        .read_exact(&mut response_buf)
-        .await
-        .context("Failed to read response payload from UDS")?;
+    
+    // Read response payload with timeout
+    tokio::time::timeout(
+        Duration::from_millis(UDS_READ_TIMEOUT_MS),
+        stream.read_exact(&mut response_buf)
+    )
+    .await
+    .context(format!("UDS read timeout ({}ms) - server may not be responding", UDS_READ_TIMEOUT_MS))?
+    .context("Failed to read response payload from UDS")?;
+    
     let wrapped_response = validator::Response::decode(&response_buf[..])
         .context("Failed to decode wrapped Response Protobuf")?;
     let proto_list = match wrapped_response.payload {

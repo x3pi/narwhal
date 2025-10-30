@@ -16,7 +16,7 @@ use bytes::Bytes;
 use config::{Committee, NodeConfig, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use dashmap::DashMap;
-use log::info;
+use log::{info, warn};
 use network::{
     quic::QuicTransport, transport::Transport, MessageHandler, Receiver as NetworkReceiver, Writer,
 };
@@ -62,6 +62,15 @@ pub enum PrimaryMessage {
     },
     CertificateBundle(Vec<Certificate>),
     Reconfigure(Committee),
+    HeaderRequest {
+        round: Round,
+        epoch: u64,
+        author: PublicKey,
+        requestor: PublicKey,
+    },
+    CommitteeRequest {
+        requestor: PublicKey,
+    },
 }
 
 impl fmt::Debug for PrimaryMessage {
@@ -99,6 +108,22 @@ impl fmt::Debug for PrimaryMessage {
                 .finish(),
             Self::CertificateBundle(c) => f.debug_tuple("CertificateBundle").field(c).finish(),
             Self::Reconfigure(_) => f.debug_tuple("Reconfigure").field(&"[Committee]").finish(),
+            Self::HeaderRequest {
+                round,
+                epoch,
+                author,
+                requestor,
+            } => f
+                .debug_struct("HeaderRequest")
+                .field("round", round)
+                .field("epoch", epoch)
+                .field("author", author)
+                .field("requestor", requestor)
+                .finish(),
+            Self::CommitteeRequest { requestor } => f
+                .debug_struct("CommitteeRequest")
+                .field("requestor", requestor)
+                .finish(),
         }
     }
 }
@@ -332,10 +357,13 @@ impl MessageHandler for PrimaryReceiverHandler {
                     .expect("Failed to send request to Helper");
             }
             msg => {
-                self.tx_primary_messages
-                    .send(msg)
-                    .await
-                    .expect("Failed to send message to Core");
+                if let Err(e) = self.tx_primary_messages.send(msg).await {
+                    warn!(
+                        "[PrimaryReceiver] Dropping message destined for Core: channel send failed: {}. Core may be shutting down or restarting.",
+                        e
+                    );
+                    // Do not panic: keep primary receiver alive to continue serving network/Helper.
+                }
             }
         }
         Ok(())

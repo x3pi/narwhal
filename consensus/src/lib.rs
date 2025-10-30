@@ -10,6 +10,7 @@ use crypto::{Digest, PublicKey};
 use log::{debug, error, info, log_enabled, trace, warn};
 use primary::{Certificate, Epoch, ReconfigureNotification, Round}; // Import ReconfigureNotification
 use serde::{Deserialize, Serialize};
+use sha3::{Digest as Sha3Digest, Sha3_512};
 use std::cmp::max;
 use std::collections::{HashMap, HashSet}; // Đảm bảo HashSet được import
 use std::sync::Arc;
@@ -22,6 +23,9 @@ use tokio::time::{sleep, Duration}; // <-- THÊM sleep, Duration
 
 // Key used to store the consensus state in the persistent store.
 pub const STATE_KEY: &'static [u8] = b"consensus_state";
+
+// Interval for triggering committee reconfiguration checks (must match primary/src/core.rs)
+pub const RECONFIGURE_INTERVAL: Round = 500;
 
 // Errors that can occur within the consensus module.
 #[derive(Error, Debug)]
@@ -830,6 +834,88 @@ impl Bullshark {
         );
         dag.get(&round).and_then(|x| x.get(leader_pk))
     }
+
+    // Determines the leader with fallback mechanism for RECONFIGURE_INTERVAL rounds.
+    // If designated leader fails, uses common coin (hash of round) to select fallback leader.
+    // This ensures round RECONFIGURE_INTERVAL can be committed even if designated leader is offline.
+    fn leader_with_fallback<'a>(
+        &self,
+        round: Round,
+        dag: &'a Dag,
+    ) -> Option<&'a (Digest, Certificate)> {
+        // First, try designated leader (round-robin)
+        if let Some(leader_entry) = self.leader(round, dag) {
+            return Some(leader_entry);
+        }
+
+        // If designated leader fails and this is RECONFIGURE_INTERVAL round, use fallback mechanism
+        if round == RECONFIGURE_INTERVAL {
+            warn!(
+                "[Bullshark][E{}] Designated leader for round {} (RECONFIGURE_INTERVAL) failed. Using fallback leader mechanism.",
+                self.committee.epoch, round
+            );
+
+            let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
+            keys.sort();
+            let committee_size = keys.len();
+
+            // Use common coin: hash of round to deterministically select fallback leader
+            // This ensures all nodes choose the same fallback leader
+            let round_bytes = round.to_be_bytes();
+            let mut hash_input = Vec::new();
+            hash_input.extend_from_slice(&round_bytes);
+            hash_input.extend_from_slice(&self.committee.epoch.to_be_bytes());
+            let hash_bytes = Sha3_512::digest(&hash_input);
+            let mut hash_array: [u8; 32] = [0u8; 32];
+            hash_array.copy_from_slice(&hash_bytes[..32]);
+            let hash = Digest(hash_array);
+
+            // Use hash to select fallback leader index
+            let fallback_index = (hash.as_ref()[0] as usize) % committee_size;
+            let fallback_leader_pk = &keys[fallback_index];
+
+            info!(
+                "[Bullshark][E{}] Fallback leader selected for round {} (RECONFIGURE_INTERVAL): {:?} (index {})",
+                self.committee.epoch, round, fallback_leader_pk, fallback_index
+            );
+
+            // Try fallback leader
+            if let Some(leader_entry) = dag.get(&round).and_then(|x| x.get(fallback_leader_pk)) {
+                info!(
+                    "[Bullshark][E{}] Found fallback leader certificate for round {} (RECONFIGURE_INTERVAL)",
+                    self.committee.epoch, round
+                );
+                return Some(leader_entry);
+            }
+
+            // If fallback leader also fails, try all other leaders in deterministic order
+            warn!(
+                "[Bullshark][E{}] Fallback leader for round {} (RECONFIGURE_INTERVAL) also failed. Trying all available leaders.",
+                self.committee.epoch, round
+            );
+
+            if let Some(round_certs) = dag.get(&round) {
+                // IMPORTANT: Sort keys to ensure deterministic selection across all nodes
+                // This prevents forks by ensuring all nodes choose the same leader
+                let mut sorted_keys: Vec<_> = round_certs.keys().collect();
+                sorted_keys.sort(); // Deterministic order
+
+                // Try all leaders in sorted order (deterministic)
+                // This ensures all nodes choose the same certificate if they have the same DAG state
+                for pk in sorted_keys {
+                    if let Some(cert_entry) = round_certs.get(pk) {
+                        info!(
+                            "[Bullshark][E{}] Found alternative leader certificate for round {} (RECONFIGURE_INTERVAL): {:?}",
+                            self.committee.epoch, round, pk
+                        );
+                        return Some(cert_entry);
+                    }
+                }
+            }
+        }
+
+        None
+    }
 }
 
 impl ConsensusAlgorithm for Bullshark {
@@ -916,7 +1002,12 @@ impl ConsensusAlgorithm for Bullshark {
         }
 
         // --- Leader Identification ---
-        let (leader_digest, leader_cert) = match self.leader(leader_round_to_check, &state.dag) {
+        // Use fallback mechanism for RECONFIGURE_INTERVAL rounds to ensure commit even if leader is offline
+        let (leader_digest, leader_cert) = match if leader_round_to_check == RECONFIGURE_INTERVAL {
+            self.leader_with_fallback(leader_round_to_check, &state.dag)
+        } else {
+            self.leader(leader_round_to_check, &state.dag)
+        } {
             Some(leader_entry) => {
                 debug!(
                     "[Bullshark][E{}] Found potential leader {} at round {}",

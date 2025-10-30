@@ -127,56 +127,58 @@ impl Helper {
                             let mut current_bundle_size = 0;
 
                             for round in start_round..=end_round {
-                                // *** THAY ĐỔI: Thêm epoch vào key tra cứu ***
-                                let round_key = bincode::serialize(&(current_epoch, round))
-                                    .expect("Failed to serialize round index key");
+                                // Tra cứu trước ở epoch hiện tại; nếu không có dữ liệu, thử epoch trước đó (hỗ trợ node chậm)
+                                for epoch_to_try in [current_epoch, current_epoch.saturating_sub(1)] {
+                                    let round_key = bincode::serialize(&(epoch_to_try, round))
+                                        .expect("Failed to serialize round index key");
 
-                                if let Ok(Some(digests_bytes)) = self
-                                    .store
-                                    .read_cf(ROUND_INDEX_CF.to_string(), round_key)
-                                    .await
-                                {
-                                    let digests: Vec<Digest> = match bincode::deserialize(&digests_bytes) {
-                                        Ok(d) => d,
-                                        Err(e) => {
-                                            error!(
-                                                "Failed to deserialize digest list for epoch {} round {}: {}",
-                                                current_epoch, round, e
-                                            );
-                                            continue;
-                                        }
-                                    };
-
-                                    for digest in digests {
-                                        if let Ok(Some(cert_bytes)) = self.store.read(digest.to_vec()).await
-                                        {
-                                            if current_bundle_size + cert_bytes.len() > MAX_BUNDLE_SIZE
-                                                && !certificates_to_send.is_empty()
-                                            {
-                                                // DEBUG: Log địa chỉ trước khi gửi certificate bundle
-                                                if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
-                                                    warn!("[Helper] ⚠️ SENDING CERTIFICATE BUNDLE TO INVALID ADDRESS: {}", address);
-                                                }
-
-                                                let bundle_to_send = PrimaryMessage::CertificateBundle(
-                                                    certificates_to_send.drain(..).collect(),
+                                    if let Ok(Some(digests_bytes)) = self
+                                        .store
+                                        .read_cf(ROUND_INDEX_CF.to_string(), round_key)
+                                        .await
+                                    {
+                                        let digests: Vec<Digest> = match bincode::deserialize(&digests_bytes) {
+                                            Ok(d) => d,
+                                            Err(e) => {
+                                                error!(
+                                                    "Failed to deserialize digest list for epoch {} round {}: {}",
+                                                    epoch_to_try, round, e
                                                 );
-                                                let bytes = bincode::serialize(&bundle_to_send)
-                                                    .expect("Failed to serialize bundle");
-                                                self.network.send(address, Bytes::from(bytes)).await;
-                                                current_bundle_size = 0;
+                                                continue;
                                             }
+                                        };
 
-                                            // Filter by epoch before adding to bundle (defense in depth)
-                                            if let Ok(certificate) = bincode::deserialize::<Certificate>(&cert_bytes) {
-                                                if certificate.epoch() == current_epoch {
-                                                    certificates_to_send.push(certificate);
-                                                    current_bundle_size += cert_bytes.len();
-                                                } else {
-                                                    trace!("Helper skipping certificate {} from epoch {} in range request (current: {})", digest, certificate.epoch(), current_epoch);
+                                        for digest in digests {
+                                            if let Ok(Some(cert_bytes)) = self.store.read(digest.to_vec()).await
+                                            {
+                                                if current_bundle_size + cert_bytes.len() > MAX_BUNDLE_SIZE
+                                                    && !certificates_to_send.is_empty()
+                                                {
+                                                    if address.ip().to_string() == "0.0.0.0" || address.port() == 0 {
+                                                        warn!("[Helper] ⚠️ SENDING CERTIFICATE BUNDLE TO INVALID ADDRESS: {}", address);
+                                                    }
+
+                                                    let bundle_to_send = PrimaryMessage::CertificateBundle(
+                                                        certificates_to_send.drain(..).collect(),
+                                                    );
+                                                    let bytes = bincode::serialize(&bundle_to_send)
+                                                        .expect("Failed to serialize bundle");
+                                                    self.network.send(address, Bytes::from(bytes)).await;
+                                                    current_bundle_size = 0;
+                                                }
+
+                                                if let Ok(certificate) = bincode::deserialize::<Certificate>(&cert_bytes) {
+                                                    // Chỉ gửi đúng epoch đang tra cứu (current hoặc previous), tránh lẫn epoch khác
+                                                    if certificate.epoch() == epoch_to_try {
+                                                        certificates_to_send.push(certificate);
+                                                        current_bundle_size += cert_bytes.len();
+                                                    }
                                                 }
                                             }
                                         }
+
+                                        // Nếu đã có dữ liệu cho epoch hiện tại, không cần thử epoch trước nữa cho round này
+                                        if epoch_to_try == current_epoch { break; }
                                     }
                                 }
                             }

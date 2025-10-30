@@ -27,6 +27,7 @@ impl VotesAggregator {
         vote: Vote,
         committee: &Committee,
         header: &Header,
+        active_cert_count: usize,
     ) -> DagResult<Option<Certificate>> {
         let author = vote.author;
 
@@ -35,7 +36,15 @@ impl VotesAggregator {
 
         self.votes.push((author, vote.signature));
         self.weight += committee.stake(&author);
-        if self.weight >= committee.quorum_threshold() {
+
+        // *** THAY ĐỔI: Sử dụng quorum động dựa trên số certificate đã có trong round trước đó ***
+        let quorum_threshold = if active_cert_count > 0 {
+            committee.quorum_threshold_dynamic(active_cert_count)
+        } else {
+            committee.quorum_threshold()
+        };
+
+        if self.weight >= quorum_threshold {
             self.weight = 0; // Ensures quorum is only reached once.
             return Ok(Some(Certificate {
                 header: header.clone(),
@@ -66,6 +75,7 @@ impl CertificatesAggregator {
         &mut self,
         certificate: Certificate,
         committee: &Committee,
+        active_cert_count: usize,
     ) -> DagResult<Option<Vec<Digest>>> {
         let origin = certificate.origin();
 
@@ -76,7 +86,15 @@ impl CertificatesAggregator {
 
         self.certificates.push(certificate.digest());
         self.weight += committee.stake(&origin);
-        if self.weight >= committee.quorum_threshold() {
+
+        // *** THAY ĐỔI: Sử dụng quorum động dựa trên số certificate đã có trong round trước đó ***
+        let quorum_threshold = if active_cert_count > 0 {
+            committee.quorum_threshold_dynamic(active_cert_count)
+        } else {
+            committee.quorum_threshold()
+        };
+
+        if self.weight >= quorum_threshold {
             self.weight = 0; // Ensures quorum is only reached once.
             return Ok(Some(self.certificates.drain(..).collect()));
         }

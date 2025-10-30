@@ -37,7 +37,9 @@ const SYNC_MAX_RETRIES: u32 = 10; // Maximum retries for a sync chunk before giv
 const LAG_THRESHOLD: Round = 50; // Round difference triggering sync mode
 
 // Interval for triggering committee reconfiguration checks
-pub const RECONFIGURE_INTERVAL: Round = 100;
+pub const RECONFIGURE_INTERVAL: Round = 10000;
+// Local CF for mapping (epoch, round, author) -> header_id (Digest)
+const AUTHOR_ROUND_CF: &str = "author_round_index";
 
 // *** THAY ĐỔI BẮT ĐẦU: Giảm grace period và thêm quiet period ***
 // Số round đệm (rỗng) để chạy trước khi kích hoạt reconfigure.
@@ -109,6 +111,11 @@ pub struct Core {
     quorum_timeout_ms: u64,                 // Timeout to consider quorum stuck for a round
     commit_stall_timeout_ms: u64,           // Timeout to consider consensus stalled
     proactive_request_cooldown_ms: u64, // Cooldown between proactive requests for the same round
+    // --- Epoch start suspicious-dag guard ---
+    last_suspicious_epoch_sync: Option<Instant>, // last time we triggered the small epoch-start sync
+    suspicious_epoch_sync_cooldown_ms: u64,      // cooldown to avoid spamming small syncs
+    // --- Epoch upgrade guard: when seeing higher-epoch traffic, suspend voting until reconfigure ---
+    epoch_upgrade_pending: Option<Epoch>,
 }
 
 impl Core {
@@ -172,6 +179,9 @@ impl Core {
                 quorum_timeout_ms: 5_000, // Tăng từ 3s lên 5s để giảm spam
                 commit_stall_timeout_ms: 10_000,
                 proactive_request_cooldown_ms: 10_000, // Cooldown 10s giữa các proactive requests
+                last_suspicious_epoch_sync: None,
+                suspicious_epoch_sync_cooldown_ms: 10_000,
+                epoch_upgrade_pending: None,
             }
             .run()
             .await;
@@ -306,6 +316,14 @@ impl Core {
         // Store own header immediately (we trust it).
         let bytes = bincode::serialize(&header).expect("Failed to serialize own header");
         self.store.write(header.id.to_vec(), bytes).await;
+        // Write index: (epoch, round, author) -> header_id
+        let idx_key = bincode::serialize(&(self.epoch, header.round, header.author.clone()))
+            .expect("serialize author_round index key");
+        let idx_val = bincode::serialize(&header.id).expect("serialize header id for index");
+        let _ = self
+            .store
+            .write_cf(AUTHOR_ROUND_CF.to_string(), idx_key, idx_val)
+            .await;
 
         // Reset votes aggregator for this new header.
         self.current_header = header.clone();
@@ -338,6 +356,10 @@ impl Core {
                                 v,
                                 &committee_guard,
                                 &self.current_header,
+                                self.authors_seen_per_round
+                                    .get(&header.round.saturating_sub(1))
+                                    .map(|s| s.len())
+                                    .unwrap_or(0),
                             )? {
                                 drop(committee_guard);
                                 // If certificate formed immediately, process it
@@ -488,7 +510,7 @@ impl Core {
         if parents.is_empty() && header.round > 0 {
             // Genesis (R0) has no parents.
             // If parents are missing, synchronizer will request them. Suspend processing.
-            debug!(
+            warn!(
                 "[Core][E{}] Processing of H{}({}) suspended: missing parent(s). Synchronizer notified.",
                  self.epoch, header.round, header.author
             );
@@ -535,16 +557,41 @@ impl Core {
 
         // If parent rounds were invalid, we already bailed.
         // Check if the combined stake of parents meets the quorum threshold.
-        let quorum_threshold = self.committee.read().await.quorum_threshold(); // Re-acquire lock briefly
+        // *** THAY ĐỔI: Sử dụng quorum động dựa trên số certificate đã có trong round trước đó ***
+        let prev_round = header.round.saturating_sub(1);
+        let active_cert_count = self
+            .authors_seen_per_round
+            .get(&prev_round)
+            .map(|s| s.len())
+            .unwrap_or(0);
+        
+        let (quorum_threshold, static_quorum) = {
+            let committee_guard = self.committee.read().await;
+            let static_q = committee_guard.quorum_threshold();
+            // Nếu round trước đó có ít nhất 1 certificate, sử dụng quorum động
+            // Ngược lại, fallback về quorum ban đầu
+            let dynamic_q = if active_cert_count > 0 {
+                committee_guard.quorum_threshold_dynamic(active_cert_count)
+            } else {
+                static_q // Fallback về quorum ban đầu cho round đầu tiên hoặc khi không có certificate nào
+            };
+            (dynamic_q, static_q)
+        };
+        
+        debug!(
+            "[Core][E{}] Checking parents stake for H{}({}): stake={}, dynamic_quorum={} (based on {} certs in R{}), static_quorum={}",
+            self.epoch, header.round, header.author, stake, quorum_threshold, active_cert_count, prev_round, static_quorum
+        );
+        
         ensure!(
-            stake >= quorum_threshold, // <-- Corrected variable name
+            stake >= quorum_threshold,
             DagError::HeaderRequiresQuorum(header.id.clone())  // Not enough parent stake.
         );
 
         // 3. Check Payload: Ensure all referenced batch digests are available locally.
         if self.synchronizer.missing_payload(header).await? {
             // If payload is missing, synchronizer will request it. Suspend processing.
-            debug!(
+            warn!(
                 "[Core][E{}] Processing of H{}({}) suspended: missing payload. Synchronizer notified.",
                  self.epoch, header.round, header.author
             );
@@ -562,18 +609,47 @@ impl Core {
         // Use read-modify-write on store? For now, simple write is likely okay.
         let header_bytes = bincode::serialize(header).expect("Failed to serialize header");
         self.store.write(header.id.to_vec(), header_bytes).await;
+        // Write index for peer header
+        let idx_key = bincode::serialize(&(self.epoch, header.round, header.author.clone()))
+            .expect("serialize author_round index key");
+        let idx_val = bincode::serialize(&header.id).expect("serialize header id for index");
+        let _ = self
+            .store
+            .write_cf(AUTHOR_ROUND_CF.to_string(), idx_key, idx_val)
+            .await;
         // Track header author for quorum watchdog (even if certificate not formed yet)
         self.headers_seen_per_round
             .entry(header.round)
             .or_insert_with(HashSet::new)
             .insert(header.author.clone());
+        
+        // Lag detection: if we receive a header from a round much higher than dag_round, trigger sync
+        if self.sync_state.is_none() 
+            && header.round > self.dag_round.saturating_add(LAG_THRESHOLD)
+        {
+            warn!(
+                "[Core][E{}] Lag detection in process_header: Received H{} from round {} >> dag_round {} (diff: {}). Entering syncing to catch up.",
+                self.epoch, header.author, header.round, self.dag_round, header.round.saturating_sub(self.dag_round)
+            );
+            let target = header.round.saturating_add(5);
+            self.sync_state = Some(SyncState {
+                final_target_round: target,
+                current_chunk_target: 0,
+                retry_count: 0,
+                last_request_time: Instant::now(),
+            });
+            // Note: We continue processing this header even if we enter sync mode
+            // The header will be stored and processed normally
+        }
+        
         debug!(
             "[Core][E{}] Stored valid H{}({})",
             self.epoch, header.round, header.author
         );
 
-        // Only vote if we are not in sync mode.
-        if !syncing {
+        // Only vote if we are not in sync mode OR if we are syncing but header is for current epoch.
+        // IMPORTANT: Vote even when syncing IF epoch matches - this ensures progress during catch-up.
+        if !syncing || (syncing && header.epoch == self.epoch) {
             // Check if we already voted for *any* header by this author at this round.
             // Prevents voting multiple times if equivocating headers arrive.
             let not_already_voted = self
@@ -585,8 +661,8 @@ impl Core {
             if not_already_voted {
                 // If true, this is the first time voting for this author at this round
                 info!(
-                    "[Core][E{}] Creating vote for H{}({})",
-                    self.epoch, header.round, header.author
+                    "[Core][E{}] Creating vote for H{}({}) (syncing={})",
+                    self.epoch, header.round, header.author, syncing
                 ); // <-- ADD LOG
                 let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
                 debug!(
@@ -681,9 +757,9 @@ impl Core {
                 debug!("[Core][E{}] Already voted for author {} at round {}. Ignoring H{}({}) for voting.", self.epoch, header.author, header.round, header.round, header.author);
             }
         } else {
-            debug!(
-                "[Core][E{}] In sync mode. Skipping vote for H{}({}).",
-                self.epoch, header.round, header.author
+            warn!(
+                "[Core][E{}] Skipping vote for H{}({}): syncing={} and epoch mismatch (header epoch {}, current epoch {})",
+                self.epoch, header.round, header.author, syncing, header.epoch, self.epoch
             );
         }
         Ok(())
@@ -791,8 +867,15 @@ impl Core {
                 "[Core][E{}] Appending vote V{}({}) for H{}({}) to aggregator. Current weight: checking quorum...",
                 self.epoch, vote_round, vote_author, current_header_round, current_header_author
             );
+            let prev_round = self.current_header.round.saturating_sub(1);
+            let active_cert_count = self
+                .authors_seen_per_round
+                .get(&prev_round)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            
             let result = self.votes_aggregator
-                .append(vote, &committee_guard, &self.current_header)?; // Pass committee ref
+                .append(vote, &committee_guard, &self.current_header, active_cert_count)?; // Pass committee ref
             // Lock released here
             if result.is_none() {
                 info!(
@@ -1062,7 +1145,14 @@ impl Core {
             self.certificates_aggregators
                 .entry(certificate.round()) // Get or create aggregator for this round
                 .or_insert_with(|| Box::new(CertificatesAggregator::new()))
-                .append(certificate.clone(), &committee_guard)? // Append cert, check for quorum
+                .append(
+                    certificate.clone(), 
+                    &committee_guard,
+                    self.authors_seen_per_round
+                        .get(&certificate.round().saturating_sub(1))
+                        .map(|s| s.len())
+                        .unwrap_or(0),
+                )? // Append cert, check for quorum
                                                                 // Lock released here
         };
 
@@ -1114,6 +1204,136 @@ impl Core {
                     "[Core][E{}] Round {} IS the reconfiguration trigger round {}. Signaling committee reconfiguration.", // Sửa log
                      self.epoch, proposing_round, reconfigure_trigger_round
                 );
+                
+                // IMPORTANT: Delay reconfiguration trigger để đảm bảo round (proposing_round - 1) được commit trước
+                // Round 500 cần được commit trước khi trigger reconfiguration ở round 501
+                // Để round 500 commit, cần có round 501 certificates support nó
+                // Vì vậy cần đợi:
+                // 1. Round 501 certificates được gửi đến consensus (để có thể support round 500)
+                // 2. Round 500 được commit
+                let leader_round_to_commit = proposing_round.saturating_sub(1); // Round cần được commit trước
+                let current_committed = self.consensus_round.load(Ordering::Relaxed) as Round;
+                
+                // Đợi tối đa 10 giây để round 500 được commit
+                let mut waited = 0;
+                let max_wait_ms = 10000;
+                let check_interval_ms = 100;
+                
+                // First, đợi round 501 certificates được gửi đến consensus
+                // (Để có thể support round 500 commit)
+                let support_round = proposing_round;
+                info!(
+                    "[Core][E{}] Round {} is reconfiguration trigger. Waiting for round {} certificates to be sent to consensus (to support round {} commit)...",
+                    self.epoch, proposing_round, support_round, leader_round_to_commit
+                );
+                
+                let mut check_sent = self.highest_round_sent_to_consensus;
+                while check_sent < support_round && waited < max_wait_ms / 2 {
+                    tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                    waited += check_interval_ms;
+                    check_sent = self.highest_round_sent_to_consensus;
+                    if check_sent >= support_round {
+                        info!(
+                            "[Core][E{}] Round {} certificates now sent to consensus (highest sent: {}). Waiting for round {} commit...",
+                            self.epoch, support_round, check_sent, leader_round_to_commit
+                        );
+                        break;
+                    }
+                }
+                
+                // Then, đợi round 500 được commit
+                // NOTE: Nếu leader của round 500 fail và không tạo certificate, 
+                // consensus sẽ không thể commit round 500 (cần leader certificate trong DAG).
+                // Trong trường hợp này, vẫn đợi nhưng có warning nếu không commit được.
+                if current_committed < leader_round_to_commit {
+                    // Kiểm tra xem có leader certificate của round 500 không
+                    let leader_pk = {
+                        let committee_guard = self.committee.read().await;
+                        let mut keys: Vec<_> = committee_guard.authorities.keys().cloned().collect();
+                        keys.sort();
+                        let leader_index = leader_round_to_commit as usize % committee_guard.size();
+                        keys[leader_index].clone()
+                    };
+                    
+                    let has_leader_cert = self.authors_seen_per_round
+                        .get(&leader_round_to_commit)
+                        .map(|authors| authors.contains(&leader_pk))
+                        .unwrap_or(false);
+                    
+                    if !has_leader_cert {
+                        warn!(
+                            "[Core][E{}] Leader {} of round {} may have failed (no certificate seen). Round {} may not be able to commit. Waiting longer ({})...",
+                            self.epoch, leader_pk, leader_round_to_commit, leader_round_to_commit, max_wait_ms * 2
+                        );
+                        // Đợi lâu hơn nếu leader fail (tối đa 20 giây)
+                        let mut check_committed = current_committed;
+                        let max_wait_for_failed_leader_ms = max_wait_ms * 2;
+                        while check_committed < leader_round_to_commit && waited < max_wait_for_failed_leader_ms {
+                            tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                            waited += check_interval_ms;
+                            check_committed = self.consensus_round.load(Ordering::Relaxed) as Round;
+                            if check_committed >= leader_round_to_commit {
+                                info!(
+                                    "[Core][E{}] Leader round {} now committed (current: {}) despite leader failure. Proceeding with reconfiguration trigger.",
+                                    self.epoch, leader_round_to_commit, check_committed
+                                );
+                                break;
+                            }
+                        }
+                    } else {
+                        info!(
+                            "[Core][E{}] Round {} certificates sent, but leader round {} not yet committed (current: {}). Waiting for commit before triggering reconfiguration...",
+                            self.epoch, support_round, leader_round_to_commit, current_committed
+                        );
+                    }
+                    
+                    let mut check_committed = current_committed;
+                    while check_committed < leader_round_to_commit && waited < max_wait_ms {
+                        tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                        waited += check_interval_ms;
+                        check_committed = self.consensus_round.load(Ordering::Relaxed) as Round;
+                        if check_committed >= leader_round_to_commit {
+                            info!(
+                                "[Core][E{}] Leader round {} now committed (current: {}). Proceeding with reconfiguration trigger.",
+                                self.epoch, leader_round_to_commit, check_committed
+                            );
+                            break;
+                        }
+                    }
+                    
+                    let final_committed = self.consensus_round.load(Ordering::Relaxed) as Round;
+                    if final_committed < leader_round_to_commit {
+                        let leader_pk_check = {
+                            let committee_guard = self.committee.read().await;
+                            let mut keys: Vec<_> = committee_guard.authorities.keys().cloned().collect();
+                            keys.sort();
+                            let leader_index = leader_round_to_commit as usize % committee_guard.size();
+                            keys[leader_index].clone()
+                        };
+                        let final_has_leader_cert = self.authors_seen_per_round
+                            .get(&leader_round_to_commit)
+                            .map(|authors| authors.contains(&leader_pk_check))
+                            .unwrap_or(false);
+                        
+                        if !final_has_leader_cert {
+                            warn!(
+                                "[Core][E{}] Leader {} of round {} failed (no certificate). Round {} cannot be committed (consensus requires leader certificate). Triggering reconfiguration anyway (block {} will be missing).",
+                                self.epoch, leader_pk_check, leader_round_to_commit, leader_round_to_commit, leader_round_to_commit / 2
+                            );
+                        } else {
+                            warn!(
+                                "[Core][E{}] Leader round {} still not committed after {}ms wait (current: {}, highest sent: {}). Triggering reconfiguration anyway (may cause block {} to be missing).",
+                                self.epoch, leader_round_to_commit, waited, final_committed, self.highest_round_sent_to_consensus, leader_round_to_commit / 2
+                            );
+                        }
+                    }
+                } else {
+                    info!(
+                        "[Core][E{}] Leader round {} already committed (current: {}). Proceeding with reconfiguration trigger.",
+                        self.epoch, leader_round_to_commit, current_committed
+                    );
+                }
+                
                 // Send notification *before* sending parents to proposer for this round.
                 // The notification includes the *current* committee (epoch N).
                 let notification = ReconfigureNotification {
@@ -1449,13 +1669,43 @@ impl Core {
                 match self.sanitize_header(&header).await {
                     Ok(_) => {
                         // Full processing (checks parents, payload, votes).
-                        self.process_header(&header, false).await
+                        // IMPORTANT: Only suspend voting if epoch_upgrade_pending (different epoch).
+                        // If just syncing in same epoch, still vote to ensure progress.
+                        let suspend = self.epoch_upgrade_pending.is_some();
+                        if suspend {
+                            warn!(
+                                "[Core][E{}] Processing header H{}({}) but suspending vote due to epoch_upgrade_pending",
+                                self.epoch, header.round, header.author
+                            );
+                        } else if self.sync_state.is_some() {
+                            info!(
+                                "[Core][E{}] Processing header H{}({}) while syncing - will still vote if dependencies met",
+                                self.epoch, header.round, header.author
+                            );
+                        }
+                        self.process_header(&header, suspend).await
                     }
                     Err(e) => {
                         warn!(
                             "[Core][E{}] Header H{}({}) failed sanitization: {}",
                             self.epoch, header.round, header.author, e
                         );
+                        // Nếu header có epoch mới hơn, chủ động yêu cầu committee để bắt kịp epoch
+                        if header.epoch > self.epoch {
+                            // Mark that an epoch upgrade is pending; suspend voting until reconfigure
+                            self.epoch_upgrade_pending = Some(header.epoch);
+                            let committee_guard = self.committee.read().await;
+                            if let Ok(addresses) = committee_guard.primary(&header.author) {
+                                let req = PrimaryMessage::CommitteeRequest { requestor: self.name.clone() };
+                                if let Ok(bytes) = bincode::serialize(&req) {
+                                    let _ = self.network.send(addresses.primary_to_primary, Bytes::from(bytes)).await;
+                                    info!(
+                                        "[Core][E{}] Detected higher-epoch header ({}> {}). Requested Committee from {} at {}",
+                                        self.epoch, header.epoch, self.epoch, header.author, addresses.primary_to_primary
+                                    );
+                                }
+                            }
+                        }
                         Err(e)
                     }
                 }
@@ -1514,6 +1764,64 @@ impl Core {
                     }
                     // Full processing (stores cert, updates round index, aggregates for parents, sends to consensus).
                     self.process_certificate(certificate, false).await?;
+                }
+                Ok(())
+            }
+            // Handle HeaderRequest: peer asks for specific (epoch, round, author) header
+            PrimaryMessage::HeaderRequest { round, epoch, author, requestor } => {
+                info!(
+                    "[Core][E{}] Received HeaderRequest for H{}({}) epoch {} from {}",
+                    self.epoch, round, author, epoch, requestor
+                );
+                if epoch != self.epoch {
+                    debug!(
+                        "[Core][E{}] Ignoring HeaderRequest for epoch {} (current epoch {})",
+                        self.epoch, epoch, self.epoch
+                    );
+                    return Ok(());
+                }
+                // Lookup header id by (epoch, round, author)
+                let key = bincode::serialize(&(epoch, round, author.clone()))
+                    .expect("serialize author_round index key");
+                if let Ok(Some(id_bytes)) = self.store.read_cf(AUTHOR_ROUND_CF.to_string(), key).await {
+                    if let Ok(header_id) = bincode::deserialize::<Digest>(&id_bytes) {
+                        if let Ok(Some(header_bytes)) = self.store.read(header_id.to_vec()).await {
+                            if let Ok(header) = bincode::deserialize::<Header>(&header_bytes) {
+                                // Send back the header to requester
+                                let committee_guard = self.committee.read().await;
+                                if let Ok(addresses) = committee_guard.primary(&requestor) {
+                                    let msg = PrimaryMessage::Header(header);
+                                    let bytes = bincode::serialize(&msg)
+                                        .expect("serialize header to respond HeaderRequest");
+                                    let _ = self.network.send(addresses.primary_to_primary, Bytes::from(bytes)).await;
+                                    info!(
+                                        "[Core][E{}] Responded HeaderRequest with H{}({}) to {}",
+                                        self.epoch, round, author, addresses.primary_to_primary
+                                    );
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    debug!(
+                        "[Core][E{}] HeaderRequest: no index for H{}({}) epoch {}",
+                        self.epoch, round, author, epoch
+                    );
+                }
+                Ok(())
+            }
+            // Reply with current committee to help lagging peers catch up epoch
+            PrimaryMessage::CommitteeRequest { requestor } => {
+                let committee_guard = self.committee.read().await;
+                if let Ok(addresses) = committee_guard.primary(&requestor) {
+                    let msg = PrimaryMessage::Reconfigure(committee_guard.clone());
+                    if let Ok(bytes) = bincode::serialize(&msg) {
+                        let _ = self.network.send(addresses.primary_to_primary, Bytes::from(bytes)).await;
+                        info!(
+                            "[Core][E{}] Responded CommitteeRequest: sent Reconfigure(committee) to {} at {}",
+                            self.epoch, requestor, addresses.primary_to_primary
+                        );
+                    }
                 }
                 Ok(())
             }
@@ -1578,18 +1886,16 @@ impl Core {
                 let min_round = self.dag_round.saturating_sub(self.gc_depth);
                 let max_round = self.dag_round.saturating_add(5);
 
-                // Verify and filter bundle (epoch matches, round in window)
-                let committee_clone = self.committee.clone();
+                // Verify and filter bundle (epoch matches, round in window) without blocking the runtime
                 let (accepted, rejected): (Vec<_>, Vec<_>) = {
-                    let committee_guard = committee_clone.blocking_read();
+                    let committee_guard = self.committee.read().await;
                     certificates
                         .into_iter()
                         .partition(|cert| {
                             let ok_epoch = cert.epoch() == current_epoch_local;
                             let r = cert.round();
                             let ok_round = r >= min_round && r <= max_round;
-                            let verified = ok_epoch && ok_round && cert.verify(&committee_guard).is_ok();
-                            verified
+                            ok_epoch && ok_round && cert.verify(&committee_guard).is_ok()
                         })
                 };
 
@@ -1663,6 +1969,8 @@ impl Core {
         self.last_commit_observed_round = 0; // Reset consensus commit tracking
         self.last_commit_observed_at = Instant::now(); // Reset timestamp
         self.highest_round_sent_to_consensus = 0; // Reset highest round sent to consensus
+        self.last_suspicious_epoch_sync = None; // Reset epoch-start sync guard
+        self.epoch_upgrade_pending = None; // Clear epoch upgrade pending
 
         // Reset current header and aggregators.
         self.current_header = Header::default();
@@ -1774,20 +2082,107 @@ impl Core {
                     // Skip quorum check if dag_round is from previous epoch (should be reset but wasn't)
                     // This happens when epoch transition occurs but dag_round wasn't properly reset
                     // Typical symptom: dag_round is very high (e.g., 100) but we're at a low round in new epoch
-                    if r > 0 {
-                        // Check if dag_round seems suspicious (very high round suggests old epoch)
-                        // Normal rounds in new epoch should be small initially (1, 2, 3, ...)
-                        // If dag_round is > 50 and we just started new epoch, it's likely stale
-                        let committee_guard = self.committee.read().await;
-                        let is_suspicious_dag_round = r > 50 && self.epoch > 0; // Simple heuristic
-                        drop(committee_guard);
+            if r > 0 {
+                // *** THAY ĐỔI BẮT ĐẦU: Backup leader mechanism cho round RECONFIGURE_INTERVAL ***
+                // Kiểm tra xem có phải round RECONFIGURE_INTERVAL không và leader có fail không
+                // NOTE: Consensus chỉ commit leader certificate cụ thể, nên backup leader không thể tạo header thay thế
+                // Thay vào đó, chúng ta sẽ khuyến khích leader tạo header bằng cách gửi VoteNudge
+                if r == RECONFIGURE_INTERVAL {
+                    let committee_guard = self.committee.read().await;
+                    let mut keys: Vec<_> = committee_guard.authorities.keys().cloned().collect();
+                    keys.sort();
+                    let leader_index = r as usize % committee_guard.size();
+                    let leader_pk = keys[leader_index].clone();
+                    
+                    // Kiểm tra xem có leader certificate không
+                    let has_leader_cert = self.authors_seen_per_round
+                        .get(&r)
+                        .map(|authors| authors.contains(&leader_pk))
+                        .unwrap_or(false);
+                    
+                    // Nếu leader fail và chúng ta không phải leader, gửi VoteNudge đến leader để khuyến khích tạo header
+                    if !has_leader_cert && leader_pk != self.name && self.sync_state.is_none() {
+                        if let Ok(addrs) = committee_guard.primary(&leader_pk) {
+                            warn!(
+                                "[Core][E{}] Leader {} of round {} (RECONFIGURE_INTERVAL) may have failed (no certificate seen). Sending VoteNudge to encourage header creation.",
+                                self.epoch, leader_pk, r
+                            );
+                            // Gửi VoteNudge với round và epoch để signal cho leader rằng cần tạo header
+                            // Sử dụng một header_id giả để signal "need header"
+                            let nudge_msg = PrimaryMessage::VoteNudge {
+                                header_id: Digest::default(), // Empty digest to signal "need header"
+                                round: r,
+                                epoch: self.epoch,
+                                origin: leader_pk.clone(),
+                            };
+                            let nudge_bytes = bincode::serialize(&nudge_msg)
+                                .expect("Failed to serialize VoteNudge");
+                            let _ = self.network.send(addrs.primary_to_primary, Bytes::from(nudge_bytes)).await;
+                        }
+                    }
+                    drop(committee_guard);
+                }
+                // *** THAY ĐỔI KẾT THÚC ***
+                
+                // Check if dag_round seems suspicious (very high round suggests old epoch)
+                // Normal rounds in new epoch should be small initially (1, 2, 3, ...)
+                // If dag_round is > 50 and we just started new epoch, it's likely stale
+                let committee_guard = self.committee.read().await;
+                let is_suspicious_dag_round = r > 50 && self.epoch > 0; // Simple heuristic
+                drop(committee_guard);
                         
                         if is_suspicious_dag_round {
+                            // Chỉ coi là đáng ngờ trong giai đoạn rất sớm sau epoch switch
+                            let just_after_epoch_switch = self.last_commit_observed_round == 0
+                                && self.last_commit_observed_at.elapsed() <= Duration::from_secs(10);
+
+                            if just_after_epoch_switch {
+                                // Tôn trọng cooldown để tránh spam
+                                let can_sync_now = self
+                                    .last_suspicious_epoch_sync
+                                    .map(|t| t.elapsed() >= Duration::from_millis(self.suspicious_epoch_sync_cooldown_ms))
+                                    .unwrap_or(true);
+                                if can_sync_now {
+                                    info!(
+                                        "[Core][E{}] Quorum watchdog: dag_round={} looks high at epoch start. Triggering one small sync [1..=5] (cooldown {}ms) and skipping this check.",
+                                        self.epoch, r, self.suspicious_epoch_sync_cooldown_ms
+                                    );
+                                    self.request_sync_chunk(1, 5).await;
+                                    self.last_suspicious_epoch_sync = Some(Instant::now());
+                                } else {
+                                    debug!(
+                                        "[Core][E{}] Epoch-start small sync on cooldown. Skipping duplicate request.",
+                                        self.epoch
+                                    );
+                                }
+                                continue; // Skip this quorum check iteration
+                            }
+                            // Nếu không còn là giai đoạn đầu epoch, không coi là bất thường nữa.
+                        }
+                        
+                        // Check if we're lagging behind significantly based on headers/certificates seen from other nodes
+                        // If we see headers/certificates from rounds much higher than dag_round, we should sync
+                        let max_round_seen = self.headers_seen_per_round
+                            .keys()
+                            .chain(self.authors_seen_per_round.keys())
+                            .max()
+                            .copied()
+                            .unwrap_or(r);
+                        
+                        if max_round_seen > r.saturating_add(LAG_THRESHOLD) {
                             warn!(
-                                "[Core][E{}] Quorum watchdog: dag_round={} is suspiciously high for new epoch. Possible stale value from previous epoch. Skipping quorum check.",
-                                self.epoch, r
+                                "[Core][E{}] Lag detection: max_round_seen={} >> dag_round={} (diff: {}). Entering syncing to catch up.",
+                                self.epoch, max_round_seen, r, max_round_seen.saturating_sub(r)
                             );
-                            continue; // Skip this quorum check iteration
+                            let target = max_round_seen.saturating_add(5);
+                            self.sync_state = Some(SyncState {
+                                final_target_round: target,
+                                current_chunk_target: 0,
+                                retry_count: 0,
+                                last_request_time: Instant::now(),
+                            });
+                            self.advance_sync().await;
+                            continue; // Skip quorum check for this iteration
                         }
                         
                         let cert_seen = self
@@ -1855,6 +2250,44 @@ impl Core {
 
                                     // 1) Request a small range sync for this round (to all peers)
                                     self.request_sync_chunk(r, r).await;
+
+                                    // 1.1) Request missing headers explicitly from authors lacking headers
+                                    if !missing_without_headers.is_empty() {
+                                        let committee_guard = self.committee.read().await;
+                                        let targets: Vec<(PublicKey, SocketAddr)> = missing_without_headers
+                                            .iter()
+                                            .filter_map(|a| committee_guard.primary(a).ok().map(|addr| (a.clone(), addr.primary_to_primary)))
+                                            .collect();
+                                        drop(committee_guard);
+                                        if !targets.is_empty() {
+                                            info!(
+                                                "[Core][E{}] Quorum watchdog: requesting missing headers for R{} from {} author(s) missing headers: {:?}",
+                                                self.epoch, r, targets.len(), targets.iter().map(|(pk, _)| pk).collect::<Vec<&PublicKey>>()
+                                            );
+                                            let epoch_local = self.epoch;
+                                            let requestor_local = self.name.clone();
+                                            for (auth, addr) in targets {
+                                                let req = PrimaryMessage::HeaderRequest {
+                                                    round: r,
+                                                    epoch: epoch_local,
+                                                    author: auth.clone(),
+                                                    requestor: requestor_local.clone(),
+                                                };
+                                                if let Ok(bytes) = bincode::serialize(&req) {
+                                                    info!(
+                                                        "[Core][E{}] Quorum watchdog: sending HeaderRequest for H{}({}) R{} to {} at {}",
+                                                        self.epoch, r, auth, r, auth, addr
+                                                    );
+                                                    let _ = self.network.send(addr, Bytes::from(bytes)).await;
+                                                } else {
+                                                    warn!(
+                                                        "[Core][E{}] Quorum watchdog: failed to serialize HeaderRequest for H{}({}) R{}",
+                                                        self.epoch, r, auth, r
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
 
                                     // 2) Proactively request certificates from missing authors specifically
                                     let committee_guard = self.committee.read().await;

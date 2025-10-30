@@ -292,6 +292,39 @@ impl Committee {
         2 * total_votes / 3 + 1
     }
 
+    /// Tính quorum động dựa trên số node đang hoạt động (có certificate trong round trước đó)
+    /// Đảm bảo tất cả node tính cùng một cách để tránh fork
+    /// 
+    /// Args:
+    ///   - active_cert_count: Số certificate đã có trong round trước đó (round N-1)
+    /// 
+    /// Returns:
+    ///   - Quorum threshold động: 2 * active_cert_count / 3 + 1
+    ///   - Nếu active_cert_count = 0 hoặc không hợp lệ, fallback về quorum ban đầu
+    pub fn quorum_threshold_dynamic(&self, active_cert_count: usize) -> Stake {
+        if active_cert_count == 0 {
+            // Fallback về quorum ban đầu nếu không có certificate nào
+            return self.quorum_threshold();
+        }
+        
+        // Đảm bảo không vượt quá tổng số node ban đầu
+        let max_active = self.authorities.len();
+        let active_count = active_cert_count.min(max_active);
+        
+        // Tính quorum động: 2 * active_count / 3 + 1
+        // Đảm bảo luôn >= 1 và <= số node ban đầu
+        let dynamic_threshold = 2 * active_count / 3 + 1;
+        
+        // Đảm bảo không nhỏ hơn quorum tối thiểu (nếu có ít nhất 2 node)
+        let result = if active_count >= 2 {
+            dynamic_threshold.max(2)
+        } else {
+            dynamic_threshold
+        };
+        
+        result as Stake
+    }
+
     pub fn validity_threshold(&self) -> Stake {
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         (total_votes + 2) / 3

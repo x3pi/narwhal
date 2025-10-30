@@ -213,13 +213,32 @@ impl Proposer {
                 self.round >= (RECONFIGURE_INTERVAL.saturating_sub(QUIET_PERIOD_ROUNDS)); // 100 - 5 = 95
                                                                                           // *** THAY ĐỔI KẾT THÚC ***
 
+            // *** THAY ĐỔI BẮT ĐẦU: Đảm bảo leader của round RECONFIGURE_INTERVAL luôn tạo header ***
+            // Kiểm tra xem có phải round RECONFIGURE_INTERVAL không và chúng ta có phải leader không
+            let is_reconfigure_round_leader = {
+                let committee_guard = self.committee.read().await;
+                let mut keys: Vec<_> = committee_guard.authorities.keys().cloned().collect();
+                keys.sort();
+                let leader_index = self.round as usize % committee_guard.size();
+                let leader_pk = keys[leader_index].clone();
+                drop(committee_guard);
+                self.round == RECONFIGURE_INTERVAL && leader_pk == self.name
+            };
+
+            // Nếu là leader của round RECONFIGURE_INTERVAL, luôn tạo header ngay cả khi timer chưa expire và không có payload
+            // Điều này đảm bảo round RECONFIGURE_INTERVAL luôn được commit ngay cả khi leader fail ban đầu
+            let should_propose_reconfigure_round = is_reconfigure_round_leader
+                && !self.last_parents.is_empty()
+                && !self.epoch_transitioning.load(Ordering::Relaxed);
+            // *** THAY ĐỔI KẾT THÚC ***
+
             // Check if it's time to propose a header. Conditions:
             // 1. We have parents for the current round (`!last_parents.is_empty()`). Genesis provides parents for R1.
             // 2. EITHER the timer expired OR payload size threshold met OR (***MỚI***) ta đang trong round đệm (để ép tạo header rỗng)
             // 3. We are NOT currently in the middle of an epoch transition.
-            // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period ***
+            // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period và should_propose_reconfigure_round ***
             let should_propose = !self.last_parents.is_empty()
-                && (timer.is_elapsed() || self.payload_size >= self.header_size || is_quiet_period) // <-- THAY ĐỔI
+                && (timer.is_elapsed() || self.payload_size >= self.header_size || is_quiet_period || should_propose_reconfigure_round) // <-- THAY ĐỔI
                 && !self.epoch_transitioning.load(Ordering::Relaxed);
             // *** THAY ĐỔI KẾT THÚC ***
 
@@ -227,9 +246,18 @@ impl Proposer {
             if should_propose {
                 // We only create a header if either the timer expired (forces proposal, possibly empty)
                 // or if we have accumulated payload digests.
-                // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period ***
-                if !self.digests.is_empty() || timer.is_elapsed() || is_quiet_period {
-                    if is_quiet_period && self.digests.is_empty() {
+                // *** THAY ĐỔI BẮT ĐẦU: Sử dụng is_quiet_period và should_propose_reconfigure_round ***
+                if !self.digests.is_empty()
+                    || timer.is_elapsed()
+                    || is_quiet_period
+                    || should_propose_reconfigure_round
+                {
+                    if should_propose_reconfigure_round && self.digests.is_empty() {
+                        info!(
+                            "[Proposer][E{}] Leader of round {} (RECONFIGURE_INTERVAL). Proposing header immediately to ensure commit (empty payload allowed).",
+                            self.epoch, self.round
+                        );
+                    } else if is_quiet_period && self.digests.is_empty() {
                         // Log riêng cho trường hợp tạo header rỗng
                         info!(
                             "[Proposer][E{}] Quiet period (R{}). Timer expired. Proposing empty header.", // <-- THAY ĐỔI
@@ -520,8 +548,19 @@ impl Proposer {
                 }
                 ,
                 // Watchdog: force proposal if no progress and we have parents
+                // Đặc biệt: Nếu là leader của round RECONFIGURE_INTERVAL, force proposal ngay cả khi không có progress
                 _ = watchdog.tick() => {
-                    if !self.epoch_transitioning.load(Ordering::Relaxed)
+                    // Special handling for RECONFIGURE_INTERVAL leader: force proposal if we have parents
+                    // even if no progress was made (to ensure round is committed)
+                    if is_reconfigure_round_leader && !self.last_parents.is_empty() && !self.epoch_transitioning.load(Ordering::Relaxed) {
+                        warn!(
+                            "[Proposer][E{}] RECONFIGURE_INTERVAL watchdog: Leader of round {} has parents but no header created. Forcing proposal to ensure commit.",
+                            self.epoch, self.round
+                        );
+                        self.make_header().await;
+                        let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                        timer.as_mut().reset(deadline);
+                    } else if !self.epoch_transitioning.load(Ordering::Relaxed)
                         && !self.last_parents.is_empty()
                         && self.last_progress.elapsed() >= Duration::from_millis(self.watchdog_interval_ms)
                     {
