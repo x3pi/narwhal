@@ -270,6 +270,14 @@ impl Certificate {
     }
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
+        self.verify_with_active_cert_count(committee, None)
+    }
+
+    pub fn verify_with_active_cert_count(
+        &self,
+        committee: &Committee,
+        active_cert_count: Option<usize>,
+    ) -> DagResult<()> {
         // Genesis certs không cần verify đầy đủ.
         if self.header.round == 0 {
             // SỬA LỖI: Gọi epoch() như một phương thức
@@ -299,8 +307,20 @@ impl Certificate {
             used.insert(name.clone());
             weight += voting_rights;
         }
+
+        // *** THAY ĐỔI: Sử dụng quorum động nếu có active_cert_count, ngược lại dùng quorum cố định ***
+        let quorum_threshold = if let Some(active_count) = active_cert_count {
+            if active_count > 0 {
+                committee.quorum_threshold_dynamic(active_count)
+            } else {
+                committee.quorum_threshold()
+            }
+        } else {
+            committee.quorum_threshold()
+        };
+
         ensure!(
-            weight >= committee.quorum_threshold(),
+            weight >= quorum_threshold,
             DagError::CertificateRequiresQuorum
         );
 

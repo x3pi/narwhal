@@ -1493,7 +1493,14 @@ impl Core {
             DagError::TooOld(certificate.digest(), certificate.round())
         );
         // Check 3: Verify certificate integrity, header, and quorum signatures.
-        certificate.verify(&committee_guard)?; // Propagate verification errors.
+        // *** THAY ĐỔI: Sử dụng quorum động khi verify certificate ***
+        let prev_round = certificate.round().saturating_sub(1);
+        let active_cert_count = self
+            .authors_seen_per_round
+            .get(&prev_round)
+            .map(|s| s.len());
+        
+        certificate.verify_with_active_cert_count(&committee_guard, active_cert_count)?; // Propagate verification errors.
                                                // Lock released here
         Ok(())
     }
@@ -1964,6 +1971,12 @@ impl Core {
         self.pending_votes.clear(); // Clear pending votes from old epoch
         self.authors_seen_per_round.clear(); // Clear quorum tracking
         self.headers_seen_per_round.clear(); // Clear header tracking
+        
+        // *** LƯU Ý: Khi bắt đầu epoch mới, authors_seen_per_round sẽ rỗng ***
+        // Khi tính quorum động cho round 1 (prev_round = 0), active_cert_count = 0
+        // → Sẽ fallback về quorum cố định từ committee (đúng!)
+        // Genesis certificates sẽ được track khi chúng được process qua process_certificate()
+        
         self.round_stuck_since.clear(); // Clear stuck round tracking
         self.last_proactive_request.clear(); // Clear proactive request tracking
         self.last_commit_observed_round = 0; // Reset consensus commit tracking
