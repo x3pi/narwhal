@@ -576,6 +576,11 @@ impl Core {
             (acc, dynamic_q, static_q)
         };
         
+        info!(
+            "[Core][E{}] Quorum for R{}: threshold={} (basis: {} certs in R{}), static_quorum={}",
+            self.epoch, header.round, quorum_threshold, active_cert_count, prev_round, static_quorum
+        );
+
         debug!(
             "[Core][E{}] Checking parents stake for H{}({}): stake={}, dynamic_quorum={} (based on {} certs in R{}), static_quorum={}",
             self.epoch, header.round, header.author, stake, quorum_threshold, active_cert_count, prev_round, static_quorum
@@ -1487,7 +1492,22 @@ impl Core {
         );
         // Check 3: Verify certificate integrity, header, and quorum signatures.
         // *** THAY ĐỔI: Sử dụng quorum động khi verify certificate ***
-        // Ưu tiên để verify dựa trên parents trong header; không cần truyền active_count khi đã có parents
+        // Ưu tiên verify dựa trên parents trong header; log quorum để quan sát
+        let parents_count = certificate.header.parents.len();
+        let threshold_preview = if parents_count > 0 {
+            committee_guard.quorum_threshold_dynamic(parents_count)
+        } else {
+            committee_guard.quorum_threshold()
+        };
+        info!(
+            "[Core][E{}] Quorum verify for C{}({}) in R{}: threshold={} (basis: {} parents)",
+            self.epoch,
+            certificate.round(),
+            certificate.origin(),
+            certificate.round(),
+            threshold_preview,
+            parents_count
+        );
         certificate.verify_with_active_cert_count(&committee_guard, None)?; // Propagate verification errors.
                                                // Lock released here
         Ok(())
