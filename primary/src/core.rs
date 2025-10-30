@@ -37,7 +37,7 @@ const SYNC_MAX_RETRIES: u32 = 10; // Maximum retries for a sync chunk before giv
 const LAG_THRESHOLD: Round = 50; // Round difference triggering sync mode
 
 // Interval for triggering committee reconfiguration checks
-pub const RECONFIGURE_INTERVAL: Round = 10000;
+pub const RECONFIGURE_INTERVAL: Round = 1000;
 // Local CF for mapping (epoch, round, author) -> header_id (Digest)
 const AUTHOR_ROUND_CF: &str = "author_round_index";
 
@@ -397,6 +397,25 @@ impl Core {
 
     // Advances the synchronization process based on the current state.
     async fn advance_sync(&mut self) {
+        // Check epoch mismatch BEFORE continuing sync - critical for nodes lagging behind
+        {
+            let committee_guard = self.committee.read().await;
+            let committee_epoch = committee_guard.epoch;
+            drop(committee_guard);
+            
+            if committee_epoch > self.epoch {
+                warn!(
+                    "[Core][E{}] Detected epoch mismatch during sync: committee at epoch {} but Core still at epoch {}. Aborting sync and resetting state.",
+                    self.epoch, committee_epoch, self.epoch
+                );
+                // Clear sync state and reset epoch
+                self.set_sync_state(None).await;
+                self.reset_state_for_new_epoch(committee_epoch);
+                info!("[Core][E{}] State reset complete after epoch mismatch detection during sync.", self.epoch);
+                return;
+            }
+        }
+        
         // Extract sync parameters while borrowing sync_state
         let (start, end, from_storage, retry_count, final_target, mode_str) = if let Some(state) = &mut self.sync_state {
             // Check if synchronization is complete
@@ -1735,6 +1754,26 @@ impl Core {
     async fn handle_message(&mut self, message: PrimaryMessage) -> DagResult<()> {
         // --- Handling logic when in Syncing State ---
         if self.sync_state.is_some() {
+            // Check epoch mismatch BEFORE processing sync messages - critical for nodes lagging behind
+            {
+                let committee_guard = self.committee.read().await;
+                let committee_epoch = committee_guard.epoch;
+                drop(committee_guard);
+                
+                if committee_epoch > self.epoch {
+                    warn!(
+                        "[Core][E{}] Detected epoch mismatch during sync message handling: committee at epoch {} but Core still at epoch {}. Aborting sync and resetting state.",
+                        self.epoch, committee_epoch, self.epoch
+                    );
+                    // Clear sync state and reset epoch
+                    self.set_sync_state(None).await;
+                    self.reset_state_for_new_epoch(committee_epoch);
+                    info!("[Core][E{}] State reset complete after epoch mismatch detection during sync.", self.epoch);
+                    // Message will be processed in next iteration with new epoch
+                    return Ok(());
+                }
+            }
+            
             match message {
                 // Primary Message specific to Syncing: Certificate Bundle
                 PrimaryMessage::CertificateBundle(certificates) => {
@@ -2818,17 +2857,33 @@ impl Core {
 
                 // Handle Sync Timeout Check (only active if sync_state is Some)
                 _ = sync_check_interval.tick(), if self.sync_state.is_some() => {
-                     // Determine if sync timeout check is needed based on last request time.
-                     let sync_timeout_check = self.sync_state.as_ref().map_or(false, |s| {
-                         s.last_request_time.elapsed() >= Duration::from_millis(SYNC_RETRY_DELAY)
-                     });
+                     // Check epoch mismatch FIRST before checking sync timeout
+                     let committee_guard = self.committee.read().await;
+                     let committee_epoch = committee_guard.epoch;
+                     drop(committee_guard);
+                     
+                     if committee_epoch > self.epoch {
+                         warn!(
+                             "[Core][E{}] Detected epoch mismatch during sync timeout check: committee at epoch {} but Core still at epoch {}. Aborting sync and resetting state.",
+                             self.epoch, committee_epoch, self.epoch
+                         );
+                         self.set_sync_state(None).await;
+                         self.reset_state_for_new_epoch(committee_epoch);
+                         info!("[Core][E{}] State reset complete after epoch mismatch detection during sync timeout.", self.epoch);
+                         Ok(()) // Continue loop after epoch reset
+                     } else {
+                         // Determine if sync timeout check is needed based on last request time.
+                         let sync_timeout_check = self.sync_state.as_ref().map_or(false, |s| {
+                             s.last_request_time.elapsed() >= Duration::from_millis(SYNC_RETRY_DELAY)
+                         });
 
-                     // If sync timeout occurred...
-                     if sync_timeout_check {
-                         warn!("[Core][E{}] Sync request timed out (Round {}). Retrying...", self.epoch, self.sync_state.as_ref().map_or(0, |s| s.current_chunk_target));
-                         self.advance_sync().await; // Retry or advance sync state.
+                         // If sync timeout occurred...
+                         if sync_timeout_check {
+                             warn!("[Core][E{}] Sync request timed out (Round {}). Retrying...", self.epoch, self.sync_state.as_ref().map_or(0, |s| s.current_chunk_target));
+                             self.advance_sync().await; // Retry or advance sync state.
+                         }
+                         Ok(()) // Continue loop after check
                      }
-                    Ok(()) // Continue loop after check
                 }
 
 
