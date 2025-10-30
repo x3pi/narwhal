@@ -821,19 +821,36 @@ impl Core {
             // *** THAY ĐỔI: Tính quorum động dựa trên round ĐÃ COMMIT gần nhất ***
             let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
             
+            // Kiểm tra xem last_committed_round có thuộc epoch hiện tại không
+            // Epoch của round = round / RECONFIGURE_INTERVAL
+            // Epoch hiện tại bắt đầu từ round: (self.epoch - 1) * RECONFIGURE_INTERVAL
+            let current_epoch_start_round = (self.epoch.saturating_sub(1)) * RECONFIGURE_INTERVAL;
+            let current_epoch_end_round = current_epoch_start_round + RECONFIGURE_INTERVAL - 1;
+            let last_committed_round_in_current_epoch = last_committed_round > 0 
+                && last_committed_round >= current_epoch_start_round 
+                && last_committed_round <= current_epoch_end_round;
+            
             // prev_round == 0: dùng kích thước committee làm số active certs (genesis)
             let acc = if prev_round == 0 {
                 committee_guard.authorities.len()
-            } else if last_committed_round > 0 {
-                // Sử dụng số certificates ở round đã commit gần nhất để tính quorum động
+            } else if last_committed_round > 0 && last_committed_round_in_current_epoch {
+                // Sử dụng số certificates ở round đã commit gần nhất (THUỘC EPOCH HIỆN TẠI) để tính quorum động
                 // Điều này đảm bảo quorum được tính dựa trên round đã được commit, không phải round đang chờ commit
+                // Nếu không có certificates ở round đã commit → fallback về committee size
                 self.authors_seen_per_round
                     .get(&last_committed_round)
                     .map(|s| s.len())
-                    .unwrap_or(0)
+                    .unwrap_or(committee_guard.authorities.len())
             } else {
-                // Chưa có round nào được commit → dùng static quorum
-                0
+                // Chưa có round nào được commit HOẶC round đã commit không thuộc epoch hiện tại
+                // → dùng số certificates ở round 0 (genesis) của epoch hiện tại
+                // Điều này đảm bảo quorum động được tính dựa trên số node ban đầu, không phải số certificates ở round trước đó
+                // Vì trong giai đoạn đầu epoch, các round chưa commit nên không đáng tin cậy để tính quorum động
+                // Nếu không có certificates ở round 0 → fallback về committee size
+                self.authors_seen_per_round
+                    .get(&current_epoch_start_round) // Round 0 của epoch hiện tại
+                    .map(|s| s.len())
+                    .unwrap_or(committee_guard.authorities.len())
             };
             
             // Tính quorum threshold dựa trên số certificates ở round đã commit gần nhất
@@ -899,9 +916,25 @@ impl Core {
         };
         
         let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
+        
+        // Kiểm tra xem last_committed_round có thuộc epoch hiện tại không (cho log message)
+        let current_epoch_start_round = (self.epoch.saturating_sub(1)) * RECONFIGURE_INTERVAL;
+        let current_epoch_end_round = current_epoch_start_round + RECONFIGURE_INTERVAL - 1;
+        let last_committed_round_in_current_epoch = last_committed_round > 0 
+            && last_committed_round >= current_epoch_start_round 
+            && last_committed_round <= current_epoch_end_round;
+        
+        // Xác định round được dùng để tính quorum động cho log message
+        let basis_round = if prev_round == 0 {
+            current_epoch_start_round // Genesis của epoch hiện tại
+        } else if last_committed_round > 0 && last_committed_round_in_current_epoch {
+            last_committed_round // Round đã commit gần nhất (THUỘC EPOCH HIỆN TẠI)
+        } else {
+            current_epoch_start_round // Chưa có commit hoặc commit không thuộc epoch hiện tại → dùng genesis
+        };
         info!(
-            "[Core][E{}] Quorum for R{}: threshold={} (basis: {} certs in committed_round R{}, prev_round_has_full_quorum={}, actual_parents={}), static_quorum={}, required_stake={}",
-            self.epoch, header.round, quorum_threshold, active_cert_count, last_committed_round, prev_round_has_full_quorum, actual_parents_count, static_quorum, required_stake
+            "[Core][E{}] Quorum for R{}: threshold={} (basis: {} certs in R{}, prev_round_has_full_quorum={}, actual_parents={}), static_quorum={}, required_stake={}",
+            self.epoch, header.round, quorum_threshold, active_cert_count, basis_round, prev_round_has_full_quorum, actual_parents_count, static_quorum, required_stake
         );
 
         debug!(
@@ -1491,17 +1524,31 @@ impl Core {
                         // *** THAY ĐỔI: Tính quorum động dựa trên round ĐÃ COMMIT gần nhất ***
                         let pr = certificate.round().saturating_sub(1);
                         let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
+                        
+                        // Kiểm tra xem last_committed_round có thuộc epoch hiện tại không
+                        let current_epoch_start_round = (self.epoch.saturating_sub(1)) * RECONFIGURE_INTERVAL;
+                        let current_epoch_end_round = current_epoch_start_round + RECONFIGURE_INTERVAL - 1;
+                        let last_committed_round_in_current_epoch = last_committed_round > 0 
+                            && last_committed_round >= current_epoch_start_round 
+                            && last_committed_round <= current_epoch_end_round;
+                        
                         if pr == 0 {
                             committee_guard.authorities.len()
-                        } else if last_committed_round > 0 {
-                            // Sử dụng số certificates ở round đã commit gần nhất
+                        } else if last_committed_round > 0 && last_committed_round_in_current_epoch {
+                            // Sử dụng số certificates ở round đã commit gần nhất (THUỘC EPOCH HIỆN TẠI)
+                            // Nếu không có certificates ở round đã commit → fallback về committee size
                             self.authors_seen_per_round
                                 .get(&last_committed_round)
                                 .map(|s| s.len())
-                                .unwrap_or(0)
+                                .unwrap_or(committee_guard.authorities.len())
                         } else {
-                            // Chưa có round nào được commit → dùng số certificates ở prev_round
-                            self.authors_seen_per_round.get(&pr).map(|s| s.len()).unwrap_or(0)
+                            // Chưa có round nào được commit HOẶC round đã commit không thuộc epoch hiện tại
+                            // → dùng số certificates ở round 0 (genesis) của epoch hiện tại
+                            // Nếu không có certificates ở round 0 → fallback về committee size
+                            self.authors_seen_per_round
+                                .get(&current_epoch_start_round) // Round 0 của epoch hiện tại
+                                .map(|s| s.len())
+                                .unwrap_or(committee_guard.authorities.len())
                         }
                     },
                 )? // Append cert, check for quorum
@@ -1900,22 +1947,36 @@ impl Core {
         // Ưu tiên verify dựa trên parents trong header; nếu không có, dùng round đã commit gần nhất
         let parents_count = certificate.header.parents.len();
         let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
+        
+        // Kiểm tra xem last_committed_round có thuộc epoch hiện tại không
+        let current_epoch_start_round = (self.epoch.saturating_sub(1)) * RECONFIGURE_INTERVAL;
+        let current_epoch_end_round = current_epoch_start_round + RECONFIGURE_INTERVAL - 1;
+        let last_committed_round_in_current_epoch = last_committed_round > 0 
+            && last_committed_round >= current_epoch_start_round 
+            && last_committed_round <= current_epoch_end_round;
+        
         let threshold_preview = if parents_count > 0 {
             committee_guard.quorum_threshold_dynamic(parents_count)
-        } else if last_committed_round > 0 {
-            // Nếu không có parents, dùng số certificates ở round đã commit gần nhất
+        } else if last_committed_round > 0 && last_committed_round_in_current_epoch {
+            // Nếu không có parents, dùng số certificates ở round đã commit gần nhất (THUỘC EPOCH HIỆN TẠI)
+            // Nếu không có certificates ở round đã commit → fallback về committee size
             let committed_cert_count = self
                 .authors_seen_per_round
                 .get(&last_committed_round)
                 .map(|s| s.len())
-                .unwrap_or(0);
-            if committed_cert_count > 0 {
-                committee_guard.quorum_threshold_dynamic(committed_cert_count)
-            } else {
-                committee_guard.quorum_threshold()
-            }
+                .unwrap_or(committee_guard.authorities.len());
+            committee_guard.quorum_threshold_dynamic(committed_cert_count)
         } else {
-            committee_guard.quorum_threshold()
+            // Chưa có round nào được commit HOẶC round đã commit không thuộc epoch hiện tại
+            // → dùng số certificates ở round 0 (genesis) của epoch hiện tại
+            // Điều này đảm bảo trong giai đoạn đầu epoch, quorum được tính dựa trên genesis
+            // Nếu không có certificates ở round 0 → fallback về committee size
+            let genesis_cert_count = self
+                .authors_seen_per_round
+                .get(&current_epoch_start_round) // Round 0 của epoch hiện tại
+                .map(|s| s.len())
+                .unwrap_or(committee_guard.authorities.len());
+            committee_guard.quorum_threshold_dynamic(genesis_cert_count)
         };
         info!(
             "[Core][E{}] Quorum verify for C{}({}) in R{}: threshold={} (basis: {} parents, last_committed_round={})",
