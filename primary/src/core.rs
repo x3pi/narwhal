@@ -14,6 +14,7 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, info, trace, warn}; // <-- THÊM trace
 use network::{CancelHandler, ReliableSender};
+use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr; // <-- THÊM SocketAddr
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -48,12 +49,52 @@ pub const GRACE_PERIOD_ROUNDS: Round = 1;
 pub const QUIET_PERIOD_ROUNDS: Round = 5;
 // *** THAY ĐỔI KẾT THÚC ***
 
+// Sync mode: StorageSync for deep catch-up (from storage, no gc_depth limit), CatchupSync for near-head sync (with gc_depth)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum SyncMode {
+    StorageSync, // Deep sync from storage: only store/index certificates, no voting, no gc_depth limit
+    CatchupSync, // Near-head sync: full verification + voting, respects gc_depth
+}
+
+// Persistible sync state (without Instant, which cannot be serialized)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SyncStatePersisted {
+    mode: SyncMode,
+    final_target_round: Round,
+    current_chunk_target: Round,
+    retry_count: u32,
+    epoch: Epoch, // Store epoch to ensure sync state matches current epoch
+}
+
 // Internal state structure for synchronization process
 struct SyncState {
+    mode: SyncMode,              // Sync mode: StorageSync or CatchupSync
     final_target_round: Round,   // The ultimate round we aim to sync up to
     current_chunk_target: Round, // The target round for the current sync request chunk
     retry_count: u32,            // Number of retries for the current chunk
     last_request_time: Instant,  // Track when the last request was sent
+}
+
+impl SyncState {
+    fn to_persisted(&self, epoch: Epoch) -> SyncStatePersisted {
+        SyncStatePersisted {
+            mode: self.mode,
+            final_target_round: self.final_target_round,
+            current_chunk_target: self.current_chunk_target,
+            retry_count: self.retry_count,
+            epoch,
+        }
+    }
+    
+    fn from_persisted(persisted: SyncStatePersisted) -> Self {
+        Self {
+            mode: persisted.mode,
+            final_target_round: persisted.final_target_round,
+            current_chunk_target: persisted.current_chunk_target,
+            retry_count: persisted.retry_count,
+            last_request_time: Instant::now(), // Reset timer on restore
+        }
+    }
 }
 
 // Core component managing the DAG, certificate creation, and interaction with other components.
@@ -140,7 +181,7 @@ impl Core {
         tokio::spawn(async move {
             // Read initial epoch from the committee
             let initial_epoch = committee.read().await.epoch;
-            Self {
+            let mut core = Self {
                 name,
                 committee,
                 store,
@@ -166,7 +207,7 @@ impl Core {
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
-                sync_state: None, // Start in Running state
+                sync_state: None, // Will be restored from storage if exists
                 pending_votes: HashMap::new(),
                 authors_seen_per_round: HashMap::new(),
                 headers_seen_per_round: HashMap::new(),
@@ -181,9 +222,21 @@ impl Core {
                 last_suspicious_epoch_sync: None,
                 suspicious_epoch_sync_cooldown_ms: 10_000,
                 epoch_upgrade_pending: None,
+            };
+            
+            // Restore dag_round from storage
+            core.restore_dag_round().await;
+            
+            // Restore sync_state from storage if exists
+            if let Some(restored_state) = core.restore_sync_state().await {
+                info!(
+                    "[Core][E{}] Resuming sync from previous session: target={}, dag_round={}",
+                    core.epoch, restored_state.final_target_round, core.dag_round
+                );
+                core.sync_state = Some(restored_state);
             }
-            .run()
-            .await;
+            
+            core.run().await;
         });
     }
 
@@ -192,17 +245,122 @@ impl Core {
         (current_round / RECONFIGURE_INTERVAL) * RECONFIGURE_INTERVAL
     }
 
+    // Persist sync state to storage so it can be restored after restart
+    async fn persist_sync_state(&mut self) {
+        if let Some(sync_state) = &self.sync_state {
+            let persisted = sync_state.to_persisted(self.epoch);
+            let key = b"core_sync_state";
+            if let Ok(bytes) = bincode::serialize(&persisted) {
+                self.store.write(key.to_vec(), bytes).await;
+                debug!("[Core][E{}] Persisted sync state: mode={:?}, target={}", 
+                    self.epoch, persisted.mode, persisted.final_target_round);
+            } else {
+                warn!("[Core][E{}] Failed to serialize sync state", self.epoch);
+            }
+        }
+        // Note: We don't explicitly "remove" sync state when not syncing,
+        // as it will be ignored if epoch doesn't match during restore
+        
+        // Also persist dag_round to track sync progress
+        let dag_round_key = b"core_dag_round";
+        let dag_round_data = (self.epoch, self.dag_round);
+        if let Ok(bytes) = bincode::serialize(&dag_round_data) {
+            self.store.write(dag_round_key.to_vec(), bytes).await;
+        }
+    }
+
+    // Restore sync state from storage on startup
+    async fn restore_sync_state(&mut self) -> Option<SyncState> {
+        let key = b"core_sync_state";
+        match self.store.read(key.to_vec()).await {
+            Ok(Some(bytes)) => {
+                match bincode::deserialize::<SyncStatePersisted>(&bytes) {
+                    Ok(persisted) => {
+                        // Only restore if epoch matches
+                        if persisted.epoch == self.epoch {
+                            info!(
+                                "[Core][E{}] Restored sync state: mode={:?}, target={}, retry_count={}",
+                                self.epoch, persisted.mode, persisted.final_target_round, persisted.retry_count
+                            );
+                            Some(SyncState::from_persisted(persisted))
+                        } else {
+                            warn!(
+                                "[Core][E{}] Ignoring sync state from epoch {} (current: {})",
+                                self.epoch, persisted.epoch, self.epoch
+                            );
+                            // Note: Stale sync state will be ignored, no need to remove
+                            None
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[Core][E{}] Failed to deserialize sync state: {:?}", self.epoch, e);
+                        None
+                    }
+                }
+            }
+            Ok(None) => {
+                debug!("[Core][E{}] No persisted sync state found", self.epoch);
+                None
+            }
+            Err(e) => {
+                warn!("[Core][E{}] Failed to read sync state: {:?}", self.epoch, e);
+                None
+            }
+        }
+    }
+
+    // Restore dag_round from storage
+    async fn restore_dag_round(&mut self) {
+        let dag_round_key = b"core_dag_round";
+        match self.store.read(dag_round_key.to_vec()).await {
+            Ok(Some(bytes)) => {
+                match bincode::deserialize::<(Epoch, Round)>(&bytes) {
+                    Ok((persisted_epoch, persisted_round)) => {
+                        if persisted_epoch == self.epoch {
+                            if persisted_round > self.dag_round {
+                                info!(
+                                    "[Core][E{}] Restored dag_round: {} (was {})",
+                                    self.epoch, persisted_round, self.dag_round
+                                );
+                                self.dag_round = persisted_round;
+                            }
+                        } else {
+                            debug!(
+                                "[Core][E{}] Ignoring dag_round from epoch {} (current: {})",
+                                self.epoch, persisted_epoch, self.epoch
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        warn!("[Core][E{}] Failed to deserialize dag_round: {:?}", self.epoch, e);
+                    }
+                }
+            }
+            Ok(None) | Err(_) => {
+                debug!("[Core][E{}] No persisted dag_round found, starting from 0", self.epoch);
+            }
+        }
+    }
+
+    // Set sync_state and persist it to storage
+    async fn set_sync_state(&mut self, state: Option<SyncState>) {
+        self.sync_state = state;
+        self.persist_sync_state().await;
+    }
+
     // Requests a chunk of certificates from peers for synchronization.
-    async fn request_sync_chunk(&mut self, start: Round, end: Round) {
+    async fn request_sync_chunk(&mut self, start: Round, end: Round, from_storage: bool) {
         let current_epoch = self.epoch; // Use internal epoch
+        let sync_mode_str = if from_storage { "StorageSync" } else { "CatchupSync" };
         info!(
-            "[Core][E{}] Requesting certificate sync chunk for rounds {} to {}",
-            current_epoch, start, end
+            "[Core][E{}] Requesting certificate sync chunk for rounds {} to {} (mode: {})",
+            current_epoch, start, end, sync_mode_str
         );
         let message = PrimaryMessage::CertificateRangeRequest {
             start_round: start,
             end_round: end,
             requestor: self.name.clone(), // Include own name
+            from_storage,
         };
         // Get peer addresses from the current committee state
         let addresses: Vec<SocketAddr> = {
@@ -239,19 +397,33 @@ impl Core {
 
     // Advances the synchronization process based on the current state.
     async fn advance_sync(&mut self) {
-        if let Some(state) = &mut self.sync_state {
+        // Extract sync parameters while borrowing sync_state
+        let (start, end, from_storage, retry_count, final_target, mode_str) = if let Some(state) = &mut self.sync_state {
             // Check if synchronization is complete
             if self.dag_round >= state.final_target_round {
                 info!(
                     "[Core][E{}] Synchronization complete. Reached round {}. Switching back to Running state.",
                     self.epoch, self.dag_round
                 );
-                self.sync_state = None; // Exit sync mode
-                                        // Clear potentially stale state from sync process
+                // Clear potentially stale state from sync process
                 self.last_voted.clear();
                 self.processing.clear();
                 self.certificates_aggregators.clear(); // Clear aggregators too
+                // Borrow ends here when we exit the if let Some scope
+                self.set_sync_state(None).await; // Exit sync mode and persist
                 return;
+            }
+
+            // Check if we should transition from StorageSync to CatchupSync
+            // Transition when we're within gc_depth/2 of the target (near head)
+            let gap_to_target = state.final_target_round.saturating_sub(self.dag_round);
+            let needs_mode_transition = state.mode == SyncMode::StorageSync && gap_to_target <= self.gc_depth / 2;
+            if needs_mode_transition {
+                info!(
+                    "[Core][E{}] Transitioning from StorageSync to CatchupSync: gap={}, gc_depth={}",
+                    self.epoch, gap_to_target, self.gc_depth
+                );
+                state.mode = SyncMode::CatchupSync;
             }
 
             // Check if maximum retries reached
@@ -260,10 +432,12 @@ impl Core {
                     "[Core][E{}] Sync failed after {} retries for target round {}. Exiting Syncing state at round {}.",
                     self.epoch, SYNC_MAX_RETRIES, state.current_chunk_target, self.dag_round
                 );
-                self.sync_state = None; // Exit sync mode
                 self.last_voted.clear();
                 self.processing.clear();
                 self.certificates_aggregators.clear();
+                // Release borrow by ending scope, then set sync_state to None
+                // (state borrow ends here)
+                self.set_sync_state(None).await; // Exit sync mode and persist
                 return;
             }
 
@@ -271,25 +445,47 @@ impl Core {
             // Start from the round *after* the highest round we've currently processed.
             let start = self.dag_round + 1;
             // End at either start + chunk_size or the final target, whichever is smaller.
-            let end = (start + SYNC_CHUNK_SIZE - 1).min(state.final_target_round);
+            // In CatchupSync, respect gc_depth limit (don't request beyond gc_depth from current round)
+            let end = if state.mode == SyncMode::CatchupSync {
+                let gc_limit = self.dag_round + self.gc_depth;
+                (start + SYNC_CHUNK_SIZE - 1).min(state.final_target_round).min(gc_limit)
+            } else {
+                (start + SYNC_CHUNK_SIZE - 1).min(state.final_target_round)
+            };
 
             // Update sync state for the new chunk request
             state.current_chunk_target = end;
             state.retry_count += 1; // Increment retry count for this chunk attempt
             state.last_request_time = Instant::now(); // Record time of request
 
-            info!(
-                "[Core][E{}] Sync attempt #{}: requesting rounds {} to {} (final target {})",
-                self.epoch, state.retry_count, start, end, state.final_target_round
-            );
-            // Send the actual sync request to peers
-            self.request_sync_chunk(start, end).await;
+            let mode_str = match state.mode {
+                SyncMode::StorageSync => "StorageSync",
+                SyncMode::CatchupSync => "CatchupSync",
+            };
+            let from_storage = state.mode == SyncMode::StorageSync;
+            let retry_count = state.retry_count;
+            let final_target = state.final_target_round;
+            
+            // Borrow ends here when we exit the if let Some scope
+            (start, end, from_storage, retry_count, final_target, mode_str)
         } else {
             warn!(
                 "[Core][E{}] advance_sync called but not in Syncing state.",
                 self.epoch
             );
-        }
+            return;
+        };
+        
+        // Persist state after updates (mode transition or chunk update)
+        // Borrow was released when exiting the if let Some scope above
+        self.persist_sync_state().await;
+        
+        info!(
+            "[Core][E{}] Sync attempt #{} ({}): requesting rounds {} to {} (final target {})",
+            self.epoch, retry_count, mode_str, start, end, final_target
+        );
+        // Send the actual sync request to peers with from_storage flag
+        self.request_sync_chunk(start, end, from_storage).await;
     }
 
     // Processes a header proposed by this node itself.
@@ -635,12 +831,23 @@ impl Core {
                 self.epoch, header.author, header.round, self.dag_round, header.round.saturating_sub(self.dag_round)
             );
             let target = header.round.saturating_add(5);
-            self.sync_state = Some(SyncState {
+            let gap = target.saturating_sub(self.dag_round);
+            let sync_mode = if gap > self.gc_depth {
+                SyncMode::StorageSync
+            } else {
+                SyncMode::CatchupSync
+            };
+            info!(
+                "[Core][E{}] Initializing sync from process_header: target={}, dag_round={}, gap={}, mode={:?}",
+                self.epoch, target, self.dag_round, gap, sync_mode
+            );
+            self.set_sync_state(Some(SyncState {
+                mode: sync_mode,
                 final_target_round: target,
                 current_chunk_target: 0,
                 retry_count: 0,
                 last_request_time: Instant::now(),
-            });
+            })).await;
             // Note: We continue processing this header even if we enter sync mode
             // The header will be stored and processed normally
         }
@@ -1172,12 +1379,23 @@ impl Core {
                 );
                 // Target at least the next proposing round; add small buffer of 5 rounds
                 let target = formed_round.saturating_add(5);
-                self.sync_state = Some(SyncState {
+                let gap = target.saturating_sub(self.dag_round);
+                let sync_mode = if gap > self.gc_depth {
+                    SyncMode::StorageSync
+                } else {
+                    SyncMode::CatchupSync
+                };
+                info!(
+                    "[Core][E{}] Initializing sync from parent aggregation: target={}, dag_round={}, gap={}, mode={:?}",
+                    self.epoch, target, self.dag_round, gap, sync_mode
+                );
+                self.set_sync_state(Some(SyncState {
+                    mode: sync_mode,
                     final_target_round: target,
                     current_chunk_target: 0,
                     retry_count: 0,
                     last_request_time: Instant::now(),
-                });
+                })).await;
                 // Immediately kick sync progress
                 self.advance_sync().await;
             }
@@ -1549,28 +1767,70 @@ impl Core {
                             })
                             .collect();
 
-                        // Process the *verified* certificates.
+                        // Process certificates based on sync mode
                         let mut latest_round_in_bundle = self.dag_round; // Track highest round processed from this bundle.
                         if !verified_certificates.is_empty() {
+                            let mode_str = match state.mode {
+                                SyncMode::StorageSync => "StorageSync",
+                                SyncMode::CatchupSync => "CatchupSync",
+                            };
                             info!(
-                                "[Core][E{}] Processing {} verified certificates from sync bundle.",
+                                "[Core][E{}] Processing {} certificates from sync bundle (mode: {}).",
                                 self.epoch,
-                                verified_certificates.len()
+                                verified_certificates.len(),
+                                mode_str
                             );
                             for certificate in verified_certificates {
-                                // Process each valid certificate using the normal logic, but flag as `syncing = true`.
-                                // This stores the cert, updates round index, but skips voting/consensus sending.
-                                if self
-                                    .process_certificate(certificate.clone(), true)
-                                    .await
-                                    .is_ok()
-                                {
-                                    // Update latest round processed only if processing succeeds.
-                                    latest_round_in_bundle =
-                                        latest_round_in_bundle.max(certificate.round());
-                                } else {
-                                    // Log if processing fails even after verification (should be rare).
-                                    warn!("[Core][E{}] Failed to process verified sync certificate C{}({})", self.epoch, certificate.round(), certificate.origin());
+                                match state.mode {
+                                    SyncMode::StorageSync => {
+                                        // StorageSync: only store/index, verify epoch/round/structure, no quorum check
+                                        if certificate.epoch() == self.epoch {
+                                            // Verify basic structure and signatures (but not quorum)
+                                            // Store certificate
+                                            let cert_bytes = bincode::serialize(&certificate)
+                                                .expect("Failed to serialize certificate");
+                                            self.store.write(certificate.digest().to_vec(), cert_bytes).await;
+                                            
+                                            // Update round index
+                                            let round_key = bincode::serialize(&(self.epoch, certificate.round()))
+                                                .expect("Failed to serialize round key");
+                                            let mut existing_digests: Vec<Digest> = self
+                                                .store
+                                                .read_cf(ROUND_INDEX_CF.to_string(), round_key.clone())
+                                                .await
+                                                .ok()
+                                                .flatten()
+                                                .and_then(|b| bincode::deserialize(&b).ok())
+                                                .unwrap_or_default();
+                                            if !existing_digests.contains(&certificate.digest()) {
+                                                existing_digests.push(certificate.digest());
+                                                let digests_bytes = bincode::serialize(&existing_digests)
+                                                    .expect("Failed to serialize digest list");
+                                                let _ = self.store.write_cf(ROUND_INDEX_CF.to_string(), round_key, digests_bytes).await;
+                                            }
+                                            
+                                            // Update latest round
+                                            latest_round_in_bundle = latest_round_in_bundle.max(certificate.round());
+                                            debug!(
+                                                "[Core][StorageSync][E{}] Stored certificate C{}({}) without quorum verification",
+                                                self.epoch, certificate.round(), certificate.origin()
+                                            );
+                                        }
+                                    }
+                                    SyncMode::CatchupSync => {
+                                        // CatchupSync: full verification + normal processing
+                                        if self.sanitize_certificate(&certificate).await.is_ok() {
+                                            if self.process_certificate(certificate.clone(), true).await.is_ok() {
+                                                latest_round_in_bundle = latest_round_in_bundle.max(certificate.round());
+                                            } else {
+                                                warn!("[Core][CatchupSync][E{}] Failed to process certificate C{}({})", 
+                                                    self.epoch, certificate.round(), certificate.origin());
+                                            }
+                                        } else {
+                                            warn!("[Core][CatchupSync][E{}] Certificate C{}({}) failed sanitization", 
+                                                self.epoch, certificate.round(), certificate.origin());
+                                        }
+                                    }
                                 }
                             }
                             // Update the core's main `dag_round` only if the bundle contained newer rounds.
@@ -1591,7 +1851,7 @@ impl Core {
                         }
                     }
                     // Put sync_state back and potentially request the next chunk.
-                    self.sync_state = Some(state);
+                    self.set_sync_state(Some(state)).await;
                     self.advance_sync().await; // Check completion or request next chunk/retry.
                 }
 
@@ -1738,12 +1998,24 @@ impl Core {
                     // Sanitize the certificate *before* using its round as the target.
                     self.sanitize_certificate(&certificate).await?; // Ensure it's valid first
                                                                     // Initialize sync state.
-                    self.sync_state = Some(SyncState {
-                        final_target_round: certificate.round(), // Target the round of the future certificate.
+                    let target_round = certificate.round();
+                    let gap = target_round.saturating_sub(self.dag_round);
+                    let sync_mode = if gap > self.gc_depth {
+                        SyncMode::StorageSync
+                    } else {
+                        SyncMode::CatchupSync
+                    };
+                    info!(
+                        "[Core][E{}] Initializing sync: target_round={}, dag_round={}, gap={}, mode={:?}",
+                        self.epoch, target_round, self.dag_round, gap, sync_mode
+                    );
+                    self.set_sync_state(Some(SyncState {
+                        mode: sync_mode,
+                        final_target_round: target_round, // Target the round of the future certificate.
                         current_chunk_target: 0,                 // Will be set by advance_sync.
                         retry_count: 0,
                         last_request_time: Instant::now(), // Initialize timer
-                    });
+                    })).await;
                     // Immediately request the first chunk.
                     self.advance_sync().await;
                     // We are now in Syncing state, return.
@@ -2146,7 +2418,7 @@ impl Core {
                                         "[Core][E{}] Quorum watchdog: dag_round={} looks high at epoch start. Triggering one small sync [1..=5] (cooldown {}ms) and skipping this check.",
                                         self.epoch, r, self.suspicious_epoch_sync_cooldown_ms
                                     );
-                                    self.request_sync_chunk(1, 5).await;
+                                    self.request_sync_chunk(1, 5, false).await; // Small sync, use CatchupSync
                                     self.last_suspicious_epoch_sync = Some(Instant::now());
                                 } else {
                                     debug!(
@@ -2174,12 +2446,23 @@ impl Core {
                                 self.epoch, max_round_seen, r, max_round_seen.saturating_sub(r)
                             );
                             let target = max_round_seen.saturating_add(5);
-                            self.sync_state = Some(SyncState {
+                            let gap = target.saturating_sub(r);
+                            let sync_mode = if gap > self.gc_depth {
+                                SyncMode::StorageSync
+                            } else {
+                                SyncMode::CatchupSync
+                            };
+                            info!(
+                                "[Core][E{}] Initializing sync from watchdog: target={}, dag_round={}, gap={}, mode={:?}",
+                                self.epoch, target, r, gap, sync_mode
+                            );
+                            self.set_sync_state(Some(SyncState {
+                                mode: sync_mode,
                                 final_target_round: target,
                                 current_chunk_target: 0,
                                 retry_count: 0,
                                 last_request_time: Instant::now(),
-                            });
+                            })).await;
                             self.advance_sync().await;
                             continue; // Skip quorum check for this iteration
                         }
@@ -2248,7 +2531,7 @@ impl Core {
                                     );
 
                                     // 1) Request a small range sync for this round (to all peers)
-                                    self.request_sync_chunk(r, r).await;
+                                    self.request_sync_chunk(r, r, false).await; // Small sync, use CatchupSync
 
                                     // 1.1) Request missing headers explicitly from authors lacking headers
                                     if !missing_without_headers.is_empty() {
@@ -2311,6 +2594,7 @@ impl Core {
                                             start_round: r,
                                             end_round: r,
                                             requestor: self.name.clone(),
+                                            from_storage: false, // Watchdog sync, use CatchupSync
                                         };
                                         let bytes = bincode::serialize(&range_request)
                                             .expect("Failed to serialize cert range request");
@@ -2440,7 +2724,7 @@ impl Core {
                             let start = 1; // Start from round 1
                             let end = self.highest_round_sent_to_consensus.min(self.dag_round);
                             if end >= start {
-                                self.request_sync_chunk(start, end).await;
+                                self.request_sync_chunk(start, end, false).await; // Watchdog sync, use CatchupSync
                             }
                             self.last_commit_observed_at = Instant::now();
                         }
@@ -2457,7 +2741,7 @@ impl Core {
                             let start = current_committed.saturating_add(1);
                             let end = self.dag_round;
                             if end >= start {
-                                self.request_sync_chunk(start, end).await;
+                                self.request_sync_chunk(start, end, false).await; // Watchdog sync, use CatchupSync
                             }
                             self.last_commit_observed_at = Instant::now();
                         }

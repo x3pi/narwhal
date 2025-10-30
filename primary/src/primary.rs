@@ -59,6 +59,7 @@ pub enum PrimaryMessage {
         start_round: Round,
         end_round: Round,
         requestor: PublicKey,
+        from_storage: bool, // If true, read from storage (ignoring gc_depth); if false, use normal sync
     },
     CertificateBundle(Vec<Certificate>),
     Reconfigure(Committee),
@@ -100,11 +101,13 @@ impl fmt::Debug for PrimaryMessage {
                 start_round,
                 end_round,
                 requestor,
+                from_storage,
             } => f
                 .debug_struct("CertificateRangeRequest")
                 .field("start_round", start_round)
                 .field("end_round", end_round)
                 .field("requestor", requestor)
+                .field("from_storage", from_storage)
                 .finish(),
             Self::CertificateBundle(c) => f.debug_tuple("CertificateBundle").field(c).finish(),
             Self::Reconfigure(_) => f.debug_tuple("Reconfigure").field(&"[Committee]").finish(),

@@ -117,10 +117,12 @@ impl Helper {
                             start_round,
                             end_round,
                             requestor,
+                            from_storage,
                         } => {
+                            let mode_str = if from_storage { "StorageSync" } else { "CatchupSync" };
                             info!(
-                                "[Helper][E{}] Received certificate range request from {} for rounds {} to {}",
-                                current_epoch, requestor, start_round, end_round
+                                "[Helper][E{}] Received certificate range request from {} for rounds {} to {} (mode: {})",
+                                current_epoch, requestor, start_round, end_round, mode_str
                             );
 
                             let mut certificates_to_send = Vec::new();
