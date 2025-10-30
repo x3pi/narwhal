@@ -31,9 +31,13 @@ use tokio::time::{interval, sleep, Duration, Instant}; // <-- THÊM Duration, in
 pub mod core_tests;
 
 // Constants for synchronization logic
-const SYNC_CHUNK_SIZE: Round = 1000; // How many rounds to request in one sync attempt
-const SYNC_RETRY_DELAY: u64 = 10_000; // Delay between sync retries (milliseconds)
-const SYNC_MAX_RETRIES: u32 = 10; // Maximum retries for a sync chunk before giving up
+// Sync parameters optimized for speed
+// IMPORTANT: Chunk sizes should not exceed epoch size to avoid cross-epoch requests
+// One epoch = RECONFIGURE_INTERVAL (1000 rounds), so chunk sizes are limited to ~80% of epoch
+const SYNC_CHUNK_SIZE_STORAGE: Round = 800; // Large chunks for StorageSync, but < epoch size (~1000 rounds)
+const SYNC_CHUNK_SIZE_CATCHUP: Round = 500; // Smaller chunks for CatchupSync, but still < epoch size
+const SYNC_RETRY_DELAY: u64 = 1_000; // Delay between sync retries (milliseconds) - reduced for faster retry
+const SYNC_MAX_RETRIES: u32 = 15; // Maximum retries for a sync chunk before giving up
 const LAG_THRESHOLD: Round = 50; // Round difference triggering sync mode
 
 // Interval for triggering committee reconfiguration checks
@@ -349,6 +353,7 @@ impl Core {
     }
 
     // Requests a chunk of certificates from peers for synchronization.
+    // Optimized: sends parallel requests to multiple peers for faster sync
     async fn request_sync_chunk(&mut self, start: Round, end: Round, from_storage: bool) {
         let current_epoch = self.epoch; // Use internal epoch
         let sync_mode_str = if from_storage { "StorageSync" } else { "CatchupSync" };
@@ -364,7 +369,6 @@ impl Core {
         };
         // Get peer addresses from the current committee state
         let addresses: Vec<SocketAddr> = {
-            // <-- THÊM kiểu dữ liệu
             // Acquire read lock briefly
             let committee_guard = self.committee.read().await;
             // Ensure we only request from peers of the *current* epoch
@@ -381,18 +385,27 @@ impl Core {
             // Lock released here
         };
 
-        // Serialize and broadcast the request
-        if !addresses.is_empty() {
-            let bytes =
-                bincode::serialize(&message).expect("Failed to serialize cert range request");
-            self.network.broadcast(addresses, Bytes::from(bytes)).await;
-            debug!("[Core][E{}] Sync request broadcasted.", current_epoch);
-        } else {
+        if addresses.is_empty() {
             warn!(
                 "[Core][E{}] No peers found to request sync chunk from.",
                 current_epoch
             );
+            return;
         }
+
+        // Serialize the request once
+        let bytes = bincode::serialize(&message)
+            .expect("Failed to serialize cert range request");
+
+        // OPTIMIZATION: Send requests to multiple peers in parallel for faster sync
+        // This increases the chance of getting data quickly and provides redundancy
+        // Broadcast to all peers - network layer handles parallel delivery
+        self.network.broadcast(addresses.clone(), Bytes::from(bytes)).await;
+        
+        info!(
+            "[Core][E{}] Sync request broadcasted to {} peer(s) for parallel fetching",
+            current_epoch, addresses.len()
+        );
     }
 
     // Advances the synchronization process based on the current state.
@@ -434,12 +447,13 @@ impl Core {
             }
 
             // Check if we should transition from StorageSync to CatchupSync
-            // Transition when we're within gc_depth/2 of the target (near head)
+            // OPTIMIZATION: Transition earlier (when gap <= gc_depth) to start verification/voting sooner
+            // This allows faster catch-up and earlier participation in consensus
             let gap_to_target = state.final_target_round.saturating_sub(self.dag_round);
-            let needs_mode_transition = state.mode == SyncMode::StorageSync && gap_to_target <= self.gc_depth / 2;
+            let needs_mode_transition = state.mode == SyncMode::StorageSync && gap_to_target <= self.gc_depth;
             if needs_mode_transition {
                 info!(
-                    "[Core][E{}] Transitioning from StorageSync to CatchupSync: gap={}, gc_depth={}",
+                    "[Core][E{}] Transitioning from StorageSync to CatchupSync: gap={}, gc_depth={} (earlier transition for faster catch-up)",
                     self.epoch, gap_to_target, self.gc_depth
                 );
                 state.mode = SyncMode::CatchupSync;
@@ -463,14 +477,40 @@ impl Core {
             // Calculate the next chunk range to request
             // Start from the round *after* the highest round we've currently processed.
             let start = self.dag_round + 1;
-            // End at either start + chunk_size or the final target, whichever is smaller.
-            // In CatchupSync, respect gc_depth limit (don't request beyond gc_depth from current round)
+            // Use adaptive chunk size: larger for StorageSync, smaller for CatchupSync
+            let chunk_size = match state.mode {
+                SyncMode::StorageSync => SYNC_CHUNK_SIZE_STORAGE,
+                SyncMode::CatchupSync => SYNC_CHUNK_SIZE_CATCHUP,
+            };
+            
+            // CRITICAL: Ensure chunk does not cross epoch boundary
+            // Calculate epoch boundary: rounds in epoch = RECONFIGURE_INTERVAL
+            // Epoch for current round = (round / RECONFIGURE_INTERVAL) * RECONFIGURE_INTERVAL
+            // Next epoch starts at: ((round / RECONFIGURE_INTERVAL) + 1) * RECONFIGURE_INTERVAL
+            let current_epoch_start = (start / RECONFIGURE_INTERVAL) * RECONFIGURE_INTERVAL;
+            let next_epoch_start = current_epoch_start + RECONFIGURE_INTERVAL;
+            let epoch_boundary = next_epoch_start; // Last round of current epoch = next_epoch_start - 1
+            
+            // End at either start + chunk_size, final target, epoch boundary, or gc_limit (for CatchupSync)
             let end = if state.mode == SyncMode::CatchupSync {
                 let gc_limit = self.dag_round + self.gc_depth;
-                (start + SYNC_CHUNK_SIZE - 1).min(state.final_target_round).min(gc_limit)
+                (start + chunk_size - 1)
+                    .min(state.final_target_round)
+                    .min(epoch_boundary.saturating_sub(1)) // Don't cross epoch boundary
+                    .min(gc_limit)
             } else {
-                (start + SYNC_CHUNK_SIZE - 1).min(state.final_target_round)
+                (start + chunk_size - 1)
+                    .min(state.final_target_round)
+                    .min(epoch_boundary.saturating_sub(1)) // Don't cross epoch boundary
             };
+            
+            // Warn if chunk size was limited by epoch boundary
+            if end < start + chunk_size - 1 && end == epoch_boundary.saturating_sub(1) {
+                debug!(
+                    "[Core][E{}] Chunk size limited by epoch boundary: start={}, end={}, epoch_boundary={}",
+                    self.epoch, start, end, epoch_boundary
+                );
+            }
 
             // Update sync state for the new chunk request
             state.current_chunk_target = end;
@@ -1780,6 +1820,24 @@ impl Core {
                     // Temporarily take ownership of sync_state to avoid borrow checker issues.
                     let mut state = self.sync_state.take().unwrap(); // Should always exist if we are here.
 
+                    // CRITICAL: Check epoch mismatch BEFORE processing bundle
+                    {
+                        let committee_guard = self.committee.read().await;
+                        let committee_epoch = committee_guard.epoch;
+                        drop(committee_guard);
+                        
+                        if committee_epoch > self.epoch {
+                            warn!(
+                                "[Core][E{}] Detected epoch mismatch while processing sync bundle: committee at epoch {} but Core still at epoch {}. Aborting sync and resetting state.",
+                                self.epoch, committee_epoch, self.epoch
+                            );
+                            self.set_sync_state(None).await;
+                            self.reset_state_for_new_epoch(committee_epoch);
+                            info!("[Core][E{}] State reset complete after epoch mismatch detection in sync bundle.", self.epoch);
+                            return Ok(()); // Process will continue with new epoch
+                        }
+                    }
+
                     if certificates.is_empty() {
                         warn!("[Core][E{}] Received empty certificate bundle during sync. Will retry.", self.epoch);
                         // No progress made, keep retry count, re-insert state and advance (which will retry).
@@ -1874,7 +1932,9 @@ impl Core {
                             }
                             // Update the core's main `dag_round` only if the bundle contained newer rounds.
                             if latest_round_in_bundle > self.dag_round {
-                                debug!("[Core][E{}] Sync bundle processed. Advanced dag_round from {} to {}.", self.epoch, self.dag_round, latest_round_in_bundle);
+                                info!("[Core][E{}] Sync bundle processed. Advanced dag_round from {} to {} (progress: {}/{} rounds).", 
+                                    self.epoch, self.dag_round, latest_round_in_bundle, 
+                                    latest_round_in_bundle, state.final_target_round);
                                 self.dag_round = latest_round_in_bundle;
                             } else {
                                 debug!(
@@ -1896,10 +1956,22 @@ impl Core {
 
                 // Handling individual Certificates received during Syncing
                 PrimaryMessage::Certificate(certificate) => {
+                    // CRITICAL: If certificate has higher epoch and we're syncing, abort sync and reset epoch immediately
+                    let cert_epoch = certificate.epoch();
+                    if cert_epoch > self.epoch && self.sync_state.is_some() {
+                        warn!(
+                            "[Core][E{}] Detected higher-epoch certificate ({}> {}) while syncing. Aborting sync and resetting epoch immediately.",
+                            self.epoch, cert_epoch, self.epoch
+                        );
+                        self.set_sync_state(None).await;
+                        self.reset_state_for_new_epoch(cert_epoch);
+                        info!("[Core][E{}] State reset complete after higher-epoch certificate detection during sync.", self.epoch);
+                        return Ok(()); // Process will continue with new epoch
+                    }
+                    
                     // Check if this certificate could potentially advance our sync target.
                     let target_round = self.sync_state.as_ref().map_or(0, |s| s.final_target_round);
                     let cert_round = certificate.round();
-                    let cert_epoch = certificate.epoch();
 
                     // If cert is from the current epoch and significantly newer than target...
                     if cert_epoch == self.epoch && cert_round > target_round + LAG_THRESHOLD {
@@ -1984,6 +2056,17 @@ impl Core {
                         );
                         // Nếu header có epoch mới hơn, chủ động yêu cầu committee để bắt kịp epoch
                         if header.epoch > self.epoch {
+                            // CRITICAL: If we're syncing, abort sync immediately and reset epoch
+                            if self.sync_state.is_some() {
+                                warn!(
+                                    "[Core][E{}] Detected higher-epoch header ({}> {}) while syncing. Aborting sync and resetting epoch immediately.",
+                                    self.epoch, header.epoch, self.epoch
+                                );
+                                self.set_sync_state(None).await;
+                                self.reset_state_for_new_epoch(header.epoch);
+                                info!("[Core][E{}] State reset complete after higher-epoch header detection during sync.", self.epoch);
+                            }
+                            
                             // Mark that an epoch upgrade is pending; suspend voting until reconfigure
                             self.epoch_upgrade_pending = Some(header.epoch);
                             let committee_guard = self.committee.read().await;
@@ -2019,6 +2102,16 @@ impl Core {
                             "[Core][E{}] Vote V{}({}) for H{}({}) failed sanitization: {}",
                             self.epoch, vote.round, vote.author, vote.round, vote.origin, e
                         );
+                        // CRITICAL: If vote has higher epoch and we're syncing, abort sync and reset epoch
+                        if vote.epoch > self.epoch && self.sync_state.is_some() {
+                            warn!(
+                                "[Core][E{}] Detected higher-epoch vote ({}> {}) while syncing. Aborting sync and resetting epoch immediately.",
+                                self.epoch, vote.epoch, self.epoch
+                            );
+                            self.set_sync_state(None).await;
+                            self.reset_state_for_new_epoch(vote.epoch);
+                            info!("[Core][E{}] State reset complete after higher-epoch vote detection during sync.", self.epoch);
+                        }
                         Err(e)
                     }
                 }
