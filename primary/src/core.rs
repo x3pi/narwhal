@@ -137,6 +137,7 @@ pub struct Core {
     current_header: Header,     // The latest header proposed by this node
     votes_aggregator: VotesAggregator, // Aggregates votes for the current_header
     certificates_aggregators: HashMap<Round, Box<CertificatesAggregator>>, // Aggregates certs per round for parents
+    parents_sent_per_round: HashSet<Round>, // Track rounds where parents have been sent to Proposer (to avoid duplicate sends)
     last_voted: HashMap<Round, HashSet<PublicKey>>, // Tracks authorities voted for per round
     processing: HashMap<Round, HashSet<Digest>>, // Tracks digests currently being processed (avoid re-processing)
     network: ReliableSender,                     // Network sender for reliable P2P messages
@@ -209,6 +210,7 @@ impl Core {
                 current_header: Header::default(), // Will be replaced by H1
                 votes_aggregator: VotesAggregator::new(),
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
+                parents_sent_per_round: HashSet::new(),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 sync_state: None, // Will be restored from storage if exists
@@ -808,41 +810,107 @@ impl Core {
 
         // If parent rounds were invalid, we already bailed.
         // Check if the combined stake of parents meets the quorum threshold.
-        // *** THAY ĐỔI: Sử dụng quorum động dựa trên số certificate đã có trong round trước đó ***
+        // *** BULLSHARK LOGIC: Trong Bullshark, headers với partial parents vẫn hợp lệ ***
+        // *** THAY ĐỔI: Quorum động tính dựa trên round ĐÃ COMMIT gần nhất (consensus_round) ***
+        // Không tính dựa trên round gần nhất vì có thể chưa được commit
         let prev_round = header.round.saturating_sub(1);
-        let (active_cert_count, quorum_threshold, static_quorum) = {
+        let (active_cert_count, quorum_threshold, static_quorum, actual_parents_count) = {
             let committee_guard = self.committee.read().await;
             let static_q = committee_guard.quorum_threshold();
+            
+            // *** THAY ĐỔI: Tính quorum động dựa trên round ĐÃ COMMIT gần nhất ***
+            let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
+            
             // prev_round == 0: dùng kích thước committee làm số active certs (genesis)
             let acc = if prev_round == 0 {
                 committee_guard.authorities.len()
-            } else {
-                self
-                    .authors_seen_per_round
-                    .get(&prev_round)
+            } else if last_committed_round > 0 {
+                // Sử dụng số certificates ở round đã commit gần nhất để tính quorum động
+                // Điều này đảm bảo quorum được tính dựa trên round đã được commit, không phải round đang chờ commit
+                self.authors_seen_per_round
+                    .get(&last_committed_round)
                     .map(|s| s.len())
                     .unwrap_or(0)
+            } else {
+                // Chưa có round nào được commit → dùng static quorum
+                0
             };
+            
+            // Tính quorum threshold dựa trên số certificates ở round đã commit gần nhất
             let dynamic_q = if acc > 0 {
                 committee_guard.quorum_threshold_dynamic(acc)
             } else {
                 static_q
             };
-            (acc, dynamic_q, static_q)
+            
+            // Số lượng parents THỰC TẾ trong header này
+            let actual_parents = parents.len();
+            
+            (acc, dynamic_q, static_q, actual_parents)
         };
         
+        // *** BULLSHARK LOGIC: Nếu prev_round chưa đạt quorum, chấp nhận headers với partial parents ***
+        // Điều này cho phép DAG tiếp tục phát triển ngay cả khi một round chưa đạt quorum
+        // Kiểm tra xem prev_round đã đạt quorum đầy đủ chưa (dựa trên số certificates đã có)
+        let prev_round_has_full_quorum = if prev_round == 0 {
+            true // Genesis luôn có quorum
+        } else {
+            let committee_guard = self.committee.read().await;
+            let prev_round_cert_count = self
+                .authors_seen_per_round
+                .get(&prev_round)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            let prev_quorum = if prev_round_cert_count > 0 {
+                committee_guard.quorum_threshold_dynamic(prev_round_cert_count)
+            } else {
+                committee_guard.quorum_threshold()
+            };
+            drop(committee_guard);
+            
+            // Tính tổng stake của các certificates đã có ở prev_round
+            // Nếu tổng stake >= quorum threshold → đã đạt quorum đầy đủ
+            let committee_guard = self.committee.read().await;
+            let prev_round_stake: Stake = self
+                .authors_seen_per_round
+                .get(&prev_round)
+                .map(|authors| {
+                    authors.iter().map(|author| committee_guard.stake(author)).sum()
+                })
+                .unwrap_or(0);
+            drop(committee_guard);
+            
+            // Đã đạt quorum đầy đủ nếu tổng stake >= quorum threshold
+            prev_round_stake >= prev_quorum
+        };
+        
+        // *** BULLSHARK LOGIC: Quyết định required_stake ***
+        // - Nếu prev_round đã đạt quorum đầy đủ → yêu cầu quorum đầy đủ cho header
+        // - Nếu prev_round chưa đạt quorum đầy đủ → chấp nhận partial parents (>= 1) để DAG tiếp tục phát triển
+        let required_stake = if prev_round_has_full_quorum {
+            // Quorum đầy đủ được yêu cầu
+            quorum_threshold
+        } else if actual_parents_count > 0 {
+            // Partial parents được chấp nhận: chỉ cần có ít nhất 1 parent
+            1
+        } else {
+            // Không có parents nào → reject
+            quorum_threshold
+        };
+        
+        let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
         info!(
-            "[Core][E{}] Quorum for R{}: threshold={} (basis: {} certs in R{}), static_quorum={}",
-            self.epoch, header.round, quorum_threshold, active_cert_count, prev_round, static_quorum
+            "[Core][E{}] Quorum for R{}: threshold={} (basis: {} certs in committed_round R{}, prev_round_has_full_quorum={}, actual_parents={}), static_quorum={}, required_stake={}",
+            self.epoch, header.round, quorum_threshold, active_cert_count, last_committed_round, prev_round_has_full_quorum, actual_parents_count, static_quorum, required_stake
         );
 
         debug!(
-            "[Core][E{}] Checking parents stake for H{}({}): stake={}, dynamic_quorum={} (based on {} certs in R{}), static_quorum={}",
-            self.epoch, header.round, header.author, stake, quorum_threshold, active_cert_count, prev_round, static_quorum
+            "[Core][E{}] Checking parents stake for H{}({}): stake={}, required_stake={}, dynamic_quorum={} (based on {} certs in R{}), static_quorum={}",
+            self.epoch, header.round, header.author, stake, required_stake, quorum_threshold, active_cert_count, prev_round, static_quorum
         );
         
         ensure!(
-            stake >= quorum_threshold,
+            stake >= required_stake,
             DagError::HeaderRequiresQuorum(header.id.clone())  // Not enough parent stake.
         );
 
@@ -1397,7 +1465,14 @@ impl Core {
         }
 
         // --- Parent Aggregation for Next Round ---
+        // CRITICAL: Trong Bullshark, DAG có thể tiếp tục phát triển ngay cả khi một round chưa đạt quorum.
+        // Round hiện tại có thể được commit sau khi có đủ certificates ở round tiếp theo.
+        // Vì vậy, chúng ta cần gửi parents cho Proposer ngay cả khi chưa đạt quorum,
+        // sử dụng các certificates đã có để cho phép DAG tiếp tục phát triển.
 
+        let cert_round = certificate.round();
+        let formed_round = cert_round;
+        
         // Try appending the certificate to the aggregator for its round.
         let parents_option = {
             let committee_guard = self.committee.read().await;
@@ -1413,18 +1488,79 @@ impl Core {
                     certificate.clone(), 
                     &committee_guard,
                     {
+                        // *** THAY ĐỔI: Tính quorum động dựa trên round ĐÃ COMMIT gần nhất ***
                         let pr = certificate.round().saturating_sub(1);
-                        if pr == 0 { committee_guard.authorities.len() } else { self.authors_seen_per_round.get(&pr).map(|s| s.len()).unwrap_or(0) }
+                        let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
+                        if pr == 0 {
+                            committee_guard.authorities.len()
+                        } else if last_committed_round > 0 {
+                            // Sử dụng số certificates ở round đã commit gần nhất
+                            self.authors_seen_per_round
+                                .get(&last_committed_round)
+                                .map(|s| s.len())
+                                .unwrap_or(0)
+                        } else {
+                            // Chưa có round nào được commit → dùng số certificates ở prev_round
+                            self.authors_seen_per_round.get(&pr).map(|s| s.len()).unwrap_or(0)
+                        }
                     },
                 )? // Append cert, check for quorum
                                                                 // Lock released here
         };
 
-        // If quorum of certificates for this round is reached...
-        if let Some(parents) = parents_option {
-            // Parents are the digests of the quorum of certificates forming round N.
+        // BULLSHARK LOGIC: Gửi parents cho Proposer trong 2 trường hợp:
+        // 1. Đạt quorum certificates (normal case)
+        // 2. Chưa đạt quorum nhưng đã có một số certificates (để DAG tiếp tục phát triển)
+        // Điều này cho phép DAG tiếp tục phát triển ngay cả khi một round chưa đạt quorum,
+        // và round đó có thể được commit sau khi có đủ certificates ở round tiếp theo.
+        let has_quorum = parents_option.is_some();
+        let should_send_parents = if has_quorum {
+            // Case 1: Đạt quorum → gửi parents từ quorum
+            true
+        } else {
+            // Case 2: Chưa đạt quorum → kiểm tra xem có đủ certificates để gửi partial parents không
+            // Chỉ gửi một lần cho mỗi round và khi có ít nhất 1 certificate
+            let aggregator = self.certificates_aggregators.get(&cert_round);
+            if let Some(agg) = aggregator {
+                // Kiểm tra xem đã gửi parents cho round này chưa
+                let already_sent = self.parents_sent_per_round.contains(&cert_round);
+                // Gửi nếu: chưa gửi và có ít nhất 1 certificate
+                !already_sent && !agg.get_certificates().is_empty()
+            } else {
+                false
+            }
+        };
+
+        if should_send_parents {
+            // Lấy parents: từ quorum nếu có, hoặc từ partial certificates
+            let parents = if has_quorum {
+                // Case 1: Đạt quorum → sử dụng parents từ quorum
+                parents_option.unwrap()
+            } else {
+                // Case 2: Chưa đạt quorum → sử dụng certificates đã có
+                let aggregator = self.certificates_aggregators.get(&cert_round)
+                    .expect("Aggregator should exist if should_send_parents is true");
+                aggregator.get_certificates().clone()
+            };
+
+            // Đánh dấu đã gửi parents cho round này
+            self.parents_sent_per_round.insert(cert_round);
+
+            // Log thông tin về parents được gửi
+            if has_quorum {
+                info!(
+                    "[Core][E{}] Quorum reached for round {}. Sending {} parents to Proposer (for R{}).",
+                    self.epoch, formed_round, parents.len(), formed_round + 1
+                );
+            } else {
+                info!(
+                    "[Core][E{}] Partial parents for round {} (quorum not reached yet, but sending {} certificates to allow DAG progress). Sending to Proposer (for R{}).",
+                    self.epoch, formed_round, parents.len(), formed_round + 1
+                );
+            }
+
+            // Parents are the digests of certificates forming round N.
             // These will be used by the Proposer to create Header for round N+1.
-            let formed_round = certificate.round();
             // Note: authors_seen_per_round already updated above when certificate was stored
             // --- Auto-catchup: if this node is lagging behind too much, enter Syncing state ---
             if self.sync_state.is_none()
@@ -1458,14 +1594,6 @@ impl Core {
                 // Immediately kick sync progress
                 self.advance_sync().await;
             }
-            info!(
-                "[Core][E{}] Quorum reached for round {}. Sending {} parents to Proposer (for R{}).", // <-- SỬA LOG
-                self.epoch,
-                formed_round,
-                parents.len(),
-                formed_round + 1 // <-- THÊM
-            );
-
             // *** THAY ĐỔI BẮT ĐẦU: Logic Reconfigure đã được sửa đổi ***
             // --- Reconfiguration Check ---
             // Check if the *next* round (N+1) is a reconfiguration boundary.
@@ -1769,21 +1897,35 @@ impl Core {
         );
         // Check 3: Verify certificate integrity, header, and quorum signatures.
         // *** THAY ĐỔI: Sử dụng quorum động khi verify certificate ***
-        // Ưu tiên verify dựa trên parents trong header; log quorum để quan sát
+        // Ưu tiên verify dựa trên parents trong header; nếu không có, dùng round đã commit gần nhất
         let parents_count = certificate.header.parents.len();
+        let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
         let threshold_preview = if parents_count > 0 {
             committee_guard.quorum_threshold_dynamic(parents_count)
+        } else if last_committed_round > 0 {
+            // Nếu không có parents, dùng số certificates ở round đã commit gần nhất
+            let committed_cert_count = self
+                .authors_seen_per_round
+                .get(&last_committed_round)
+                .map(|s| s.len())
+                .unwrap_or(0);
+            if committed_cert_count > 0 {
+                committee_guard.quorum_threshold_dynamic(committed_cert_count)
+            } else {
+                committee_guard.quorum_threshold()
+            }
         } else {
             committee_guard.quorum_threshold()
         };
         info!(
-            "[Core][E{}] Quorum verify for C{}({}) in R{}: threshold={} (basis: {} parents)",
+            "[Core][E{}] Quorum verify for C{}({}) in R{}: threshold={} (basis: {} parents, last_committed_round={})",
             self.epoch,
             certificate.round(),
             certificate.origin(),
             certificate.round(),
             threshold_preview,
-            parents_count
+            parents_count,
+            last_committed_round
         );
         certificate.verify_with_active_cert_count(&committee_guard, None)?; // Propagate verification errors.
                                                // Lock released here
@@ -2357,6 +2499,7 @@ impl Core {
         self.last_voted.clear();
         self.processing.clear();
         self.certificates_aggregators.clear();
+        self.parents_sent_per_round.clear(); // Clear parents sent tracking
         self.cancel_handlers.clear(); // Cancel pending network requests? Maybe let them timeout. Clearing handlers is safer.
         self.pending_votes.clear(); // Clear pending votes from old epoch
         self.authors_seen_per_round.clear(); // Clear quorum tracking
@@ -2770,27 +2913,49 @@ impl Core {
                         };
                         
                         // Check if we have enough certificates for dynamic quorum
-                        // IMPORTANT: Adjust expected quorum if it seems unrealistic based on actual participation
-                        // If we've been stuck for a while and only have a few certs/headers, lower the bar
-                        let stuck_duration = self.round_stuck_since.get(&r)
-                            .map(|t| t.elapsed())
-                            .unwrap_or(Duration::ZERO);
-                        
-                        // If stuck for >10s and have very few participants, adjust quorum expectation
-                        let adjusted_quorum_required = if stuck_duration > Duration::from_secs(10) 
-                            && headers_seen.len() < 3 
-                            && cert_seen.len() < 3 {
-                            // Lower the quorum requirement: use actual participants instead of prev round count
-                            let actual_participants = headers_seen.len().max(cert_seen.len()).max(1);
+                        // CRITICAL: Adjust quorum based on ACTUAL participation (headers seen) when we have headers but not certs yet
+                        // This ensures progress continues when nodes are actively creating headers but haven't formed certificates
+                        let (adjusted_quorum_required, adjusted_stake_to_check) = {
                             let committee_guard = self.committee.read().await;
-                            let adjusted = committee_guard.quorum_threshold_dynamic(actual_participants);
+                            
+                            // Calculate stake from headers_seen if we have headers but fewer certs
+                            // This is the REAL participation level
+                            let headers_stake: Stake = if !headers_seen.is_empty() && headers_seen.len() > cert_seen.len() {
+                                headers_seen
+                                    .iter()
+                                    .map(|author| committee_guard.stake(author))
+                                    .sum()
+                            } else {
+                                current_cert_stake
+                            };
+                            
+                            // If we have headers from enough nodes to form quorum, use headers-based quorum
+                            // This allows progress even when certificates haven't been formed yet
+                            let adjusted = if !headers_seen.is_empty() {
+                                // Use headers_seen count for quorum calculation (actual participants)
+                                let headers_quorum = committee_guard.quorum_threshold_dynamic(headers_seen.len());
+                                // Use the lower of: headers_quorum or original dynamic_quorum_required
+                                // This ensures we don't artificially inflate requirements
+                                headers_quorum.min(dynamic_quorum_required)
+                            } else {
+                                dynamic_quorum_required
+                            };
+                            
                             drop(committee_guard);
-                            adjusted.min(dynamic_quorum_required) // Don't increase quorum, only decrease
-                        } else {
-                            dynamic_quorum_required
+                            
+                            // Use headers_stake for comparison if we have more headers than certs
+                            let stake_to_check = if !headers_seen.is_empty() && headers_seen.len() > cert_seen.len() {
+                                headers_stake
+                            } else {
+                                current_cert_stake
+                            };
+                            
+                            (adjusted, stake_to_check)
                         };
                         
-                        if current_cert_stake < adjusted_quorum_required {
+                        // CRITICAL: Check against adjusted quorum and use headers_stake if available
+                        // This ensures we recognize progress when headers exist even if certificates aren't formed yet
+                        if adjusted_stake_to_check < adjusted_quorum_required {
                             // Round is missing certificates to reach dynamic quorum - track stuck time
                             let missing_certs: Vec<PublicKey> = expected_authors
                                 .difference(&cert_seen)
@@ -2813,9 +2978,16 @@ impl Core {
                             let now = Instant::now();
                             let is_newly_stuck = !self.round_stuck_since.contains_key(&r);
                             if is_newly_stuck {
+                                let stake_info = if !headers_seen.is_empty() && headers_seen.len() > cert_seen.len() {
+                                    format!("have {} certs (stake {}), {} headers (stake {}), need stake {}", 
+                                        cert_seen.len(), current_cert_stake, headers_seen.len(), adjusted_stake_to_check, adjusted_quorum_required)
+                                } else {
+                                    format!("have {} certs with stake {}, need stake {}", 
+                                        cert_seen.len(), current_cert_stake, adjusted_quorum_required)
+                                };
                                 info!(
-                                    "[Core][E{}] Quorum watchdog: R{} missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} [adjusted: {}] based on {} active participants). {} author(s) have headers but no cert yet: {:?}. {} author(s) missing headers: {:?}",
-                                    self.epoch, r, cert_seen.len(), current_cert_stake, dynamic_quorum_required, adjusted_quorum_required, active_cert_count,
+                                    "[Core][E{}] Quorum watchdog: R{} missing certificates to reach dynamic quorum ({} [adjusted quorum: {}] based on {} active participants). {} author(s) have headers but no cert yet: {:?}. {} author(s) missing headers: {:?}",
+                                    self.epoch, r, stake_info, adjusted_quorum_required, active_cert_count,
                                     missing_with_headers.len(), missing_with_headers,
                                     missing_without_headers.len(), missing_without_headers
                                 );
@@ -2834,10 +3006,17 @@ impl Core {
                                     .unwrap_or(true); // If no previous request, allow it
 
                                 if timeout_expired && cooldown_expired {
+                                    let stake_info = if !headers_seen.is_empty() && headers_seen.len() > cert_seen.len() {
+                                        format!("have {} certs (stake {}), {} headers (stake {}), need stake {}", 
+                                            cert_seen.len(), current_cert_stake, headers_seen.len(), adjusted_stake_to_check, adjusted_quorum_required)
+                                    } else {
+                                        format!("have {} certs with stake {}, need stake {}", 
+                                            cert_seen.len(), current_cert_stake, adjusted_quorum_required)
+                                    };
                                     warn!(
-                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} [adjusted: {}] based on {} active participants). {} with headers but no cert: {:?}. {} missing headers: {:?}. Triggering proactive assistance.",
+                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing certificates to reach dynamic quorum ({} [adjusted quorum: {}] based on {} active participants). {} with headers but no cert: {:?}. {} missing headers: {:?}. Triggering proactive assistance.",
                                         self.epoch, r, elapsed, self.quorum_timeout_ms, 
-                                        cert_seen.len(), current_cert_stake, dynamic_quorum_required, adjusted_quorum_required, active_cert_count,
+                                        stake_info, adjusted_quorum_required, active_cert_count,
                                         missing_with_headers.len(), missing_with_headers,
                                         missing_without_headers.len(), missing_without_headers
                                     );
@@ -3008,11 +3187,16 @@ impl Core {
                                 }
                             }
                         } else {
-                            // Round has quorum now - remove from stuck tracking
+                            // Round has quorum now (either from certs or headers) - remove from stuck tracking
                             if self.round_stuck_since.remove(&r).is_some() {
+                                let quorum_info = if !headers_seen.is_empty() && headers_seen.len() > cert_seen.len() {
+                                    format!("{} headers with stake {} >= required {}", headers_seen.len(), adjusted_stake_to_check, adjusted_quorum_required)
+                                } else {
+                                    format!("{} certificates with stake {} >= required {}", cert_seen.len(), current_cert_stake, adjusted_quorum_required)
+                                };
                                 info!(
-                                    "[Core][E{}] Quorum watchdog: R{} now has quorum ({} certificates with stake {} >= required {}). Removed from stuck tracking.",
-                                    self.epoch, r, cert_seen.len(), current_cert_stake, adjusted_quorum_required
+                                    "[Core][E{}] Quorum watchdog: R{} now has quorum ({}). Removed from stuck tracking.",
+                                    self.epoch, r, quorum_info
                                 );
                             }
                         }

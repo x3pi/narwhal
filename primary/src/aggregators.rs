@@ -100,4 +100,14 @@ impl CertificatesAggregator {
         }
         Ok(None)
     }
+
+    /// Get current certificates collected so far (even if quorum not reached)
+    pub fn get_certificates(&self) -> &Vec<Digest> {
+        &self.certificates
+    }
+
+    /// Get current weight accumulated so far
+    pub fn get_weight(&self) -> Stake {
+        self.weight
+    }
 }

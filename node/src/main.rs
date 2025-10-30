@@ -79,65 +79,74 @@ async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Resul
         block_number,
         socket_path
     );
-    
+
     const UDS_CONNECT_TIMEOUT_MS: u64 = 5000;
     const UDS_READ_TIMEOUT_MS: u64 = 10000;
-    
+
     // Connect to UDS with timeout
     let mut stream = tokio::time::timeout(
         Duration::from_millis(UDS_CONNECT_TIMEOUT_MS),
-        tokio::net::UnixStream::connect(socket_path)
+        tokio::net::UnixStream::connect(socket_path),
     )
     .await
-    .context(format!("UDS connection timeout ({}ms)", UDS_CONNECT_TIMEOUT_MS))?
+    .context(format!(
+        "UDS connection timeout ({}ms)",
+        UDS_CONNECT_TIMEOUT_MS
+    ))?
     .context(format!("Failed to connect to UDS path '{}'", socket_path))?;
-    
+
     let block_req = validator::BlockRequest { block_number };
     let request = validator::Request {
         payload: Some(validator::request::Payload::BlockRequest(block_req)),
     };
     let request_bytes = request.encode_to_vec();
     let request_len = request_bytes.len() as u32;
-    
+
     // Write request with timeout
     tokio::time::timeout(
         Duration::from_millis(UDS_READ_TIMEOUT_MS),
-        stream.write_all(&request_len.to_be_bytes())
+        stream.write_all(&request_len.to_be_bytes()),
     )
     .await
     .context(format!("UDS write timeout ({}ms)", UDS_READ_TIMEOUT_MS))?
     .context("Failed to write request length to UDS")?;
-    
+
     tokio::time::timeout(
         Duration::from_millis(UDS_READ_TIMEOUT_MS),
-        stream.write_all(&request_bytes)
+        stream.write_all(&request_bytes),
     )
     .await
     .context(format!("UDS write timeout ({}ms)", UDS_READ_TIMEOUT_MS))?
     .context("Failed to write request payload to UDS")?;
-    
+
     // Read response length with timeout
     let mut len_buf = [0u8; 4];
     tokio::time::timeout(
         Duration::from_millis(UDS_READ_TIMEOUT_MS),
-        stream.read_exact(&mut len_buf)
+        stream.read_exact(&mut len_buf),
     )
     .await
-    .context(format!("UDS read timeout ({}ms) - server may not be responding", UDS_READ_TIMEOUT_MS))?
+    .context(format!(
+        "UDS read timeout ({}ms) - server may not be responding",
+        UDS_READ_TIMEOUT_MS
+    ))?
     .context("Failed to read response length from UDS. Connection likely closed.")?;
-    
+
     let response_len = u32::from_be_bytes(len_buf) as usize;
     let mut response_buf = vec![0u8; response_len];
-    
+
     // Read response payload with timeout
     tokio::time::timeout(
         Duration::from_millis(UDS_READ_TIMEOUT_MS),
-        stream.read_exact(&mut response_buf)
+        stream.read_exact(&mut response_buf),
     )
     .await
-    .context(format!("UDS read timeout ({}ms) - server may not be responding", UDS_READ_TIMEOUT_MS))?
+    .context(format!(
+        "UDS read timeout ({}ms) - server may not be responding",
+        UDS_READ_TIMEOUT_MS
+    ))?
     .context("Failed to read response payload from UDS")?;
-    
+
     let wrapped_response = validator::Response::decode(&response_buf[..])
         .context("Failed to decode wrapped Response Protobuf")?;
     let proto_list = match wrapped_response.payload {
@@ -657,7 +666,8 @@ async fn analyze_hot_swap(
     tx_shutdown: broadcast::Sender<Shutdown>,
 ) {
     let mut all_committed_txs_by_epoch: HashMap<u64, HashSet<Vec<u8>>> = HashMap::new();
-    // Không cần sent_blocks_current_epoch nữa
+    // Track round chẵn lớn nhất đã commit cho mỗi epoch để tạo fake block rỗng cho round chẵn bị skip
+    let mut last_committed_even_round_per_epoch: HashMap<u64, Round> = HashMap::new();
 
     let socket_path = node_config.uds_block_path.clone();
     if socket_path.is_empty() {
@@ -690,8 +700,15 @@ async fn analyze_hot_swap(
                                 "[ANALYZE] Processing {} committed sub-dag(s) (Epoch {}, Max Leader Round: {}).", // Thêm epoch vào log
                                 dags.len(), message_epoch, representative_round
                             );
-                            // Gọi hàm xử lý dags (không cần truyền sent_blocks...)
-                            finalize_and_send_epoch(message_epoch, dags, &mut store, &socket_path, &mut all_committed_txs_by_epoch).await;
+                            // Gọi hàm xử lý dags với tracking cho fake block rỗng
+                            finalize_and_send_epoch(
+                                message_epoch,
+                                dags,
+                                &mut store,
+                                &socket_path,
+                                &mut all_committed_txs_by_epoch,
+                                &mut last_committed_even_round_per_epoch
+                            ).await;
                          } else if _skipped_round_option.is_some() {
                               // Log cảnh báo nếu nhận được skipped_round (không mong đợi)
                               warn!("[ANALYZE] Received unexpected skipped_round notification: {:?}. Ignoring.", _skipped_round_option);
@@ -713,7 +730,7 @@ async fn analyze_hot_swap(
                         let epoch_to_finalize = notification.committee.epoch;
                         info!("[ANALYZE] Received Reconfigure signal for end of epoch {}. Clearing TX cache.", epoch_to_finalize);
                         all_committed_txs_by_epoch.remove(&epoch_to_finalize);
-                        // Không cần clear sent_blocks...
+                        last_committed_even_round_per_epoch.remove(&epoch_to_finalize);
                     },
                      Err(broadcast::error::RecvError::Lagged(n)) => {
                         warn!("[ANALYZE] Reconfigure receiver lagged by {}. Missed final blocks!", n);
@@ -742,18 +759,19 @@ async fn analyze_hot_swap(
     info!("[ANALYZE] Task finished.");
 }
 
-// *** THAY ĐỔI: Xóa tham số sent_blocks_current_epoch ***
+// *** THAY ĐỔI: Thêm tham số last_committed_even_round_per_epoch để track và tạo fake block rỗng ***
 async fn finalize_and_send_epoch(
     epoch: u64,
     dags: Vec<CommittedSubDag>, // Luôn không rỗng khi được gọi
     store: &mut Store,
     socket_path: &str,
     all_committed_txs_by_epoch: &mut HashMap<u64, HashSet<Vec<u8>>>,
-    // sent_blocks_current_epoch: &mut HashSet<u64>, // <-- XÓA BỎ
+    last_committed_even_round_per_epoch: &mut HashMap<u64, Round>,
 ) {
     let committed_tx_digests = all_committed_txs_by_epoch.entry(epoch).or_default();
     let mut processed_certificates_in_call = HashSet::new();
     let mut blocks_to_send = Vec::new();
+    let mut committed_even_rounds: Vec<Round> = Vec::new(); // Track các round chẵn đã commit trong batch này
 
     let max_leader_round = dags.iter().map(|d| d.leader.round()).max().unwrap_or(0);
     info!(
@@ -771,9 +789,14 @@ async fn finalize_and_send_epoch(
             );
             continue;
         }
+
+        // Track round chẵn đã commit (trong Bullshark, chỉ round chẵn mới được commit làm leader)
+        if consensus_commit_round % 2 == 0 {
+            committed_even_rounds.push(consensus_commit_round);
+        }
+
         let block_number_absolute = (epoch.saturating_sub(1)) * BLOCKS_PER_EPOCH + height_relative;
 
-        // *** THAY ĐỔI: Không cần kiểm tra sent_blocks... nữa ***
         info!(
             "[ANALYZE] Creating block #{} for epoch {} (from consensus round {}).",
             block_number_absolute, epoch, consensus_commit_round
@@ -833,6 +856,53 @@ async fn finalize_and_send_epoch(
             transactions: block_transactions,
         });
     } // end dag loop
+
+    // *** THAY ĐỔI: Tạo fake block rỗng cho các round chẵn bị skip ***
+    // Trong Bullshark, mỗi round chẵn tương ứng với một block (height = round / 2)
+    // Nếu một round chẵn không được commit, vẫn cần tạo fake block rỗng để đảm bảo tính liên tục
+    if !committed_even_rounds.is_empty() {
+        let last_committed_even_round = committed_even_rounds.iter().max().copied().unwrap_or(0);
+        let previous_last_committed_even_round = last_committed_even_round_per_epoch
+            .get(&epoch)
+            .copied()
+            .unwrap_or(0);
+
+        // Tạo fake block rỗng cho các round chẵn bị skip giữa previous và current
+        if last_committed_even_round > previous_last_committed_even_round + 2 {
+            // Có ít nhất một round chẵn bị skip
+            let mut fake_blocks = Vec::new();
+            let mut skipped_round = previous_last_committed_even_round + 2;
+
+            while skipped_round < last_committed_even_round {
+                let skipped_height_relative = skipped_round / 2;
+                let skipped_block_number_absolute =
+                    (epoch.saturating_sub(1)) * BLOCKS_PER_EPOCH + skipped_height_relative;
+
+                // Kiểm tra xem block này đã được tạo chưa (tránh duplicate)
+                let already_exists = blocks_to_send
+                    .iter()
+                    .any(|b| b.height == skipped_block_number_absolute);
+                if !already_exists {
+                    info!(
+                        "[ANALYZE] Creating fake empty block #{} for epoch {} (from skipped even round {}).",
+                        skipped_block_number_absolute, epoch, skipped_round
+                    );
+                    fake_blocks.push(comm::CommittedBlock {
+                        epoch,
+                        height: skipped_block_number_absolute,
+                        transactions: Vec::new(), // Fake block rỗng
+                    });
+                }
+                skipped_round += 2; // Chỉ xử lý round chẵn
+            }
+
+            // Thêm fake blocks vào danh sách
+            blocks_to_send.extend(fake_blocks);
+        }
+
+        // Cập nhật round chẵn lớn nhất đã commit cho epoch này
+        last_committed_even_round_per_epoch.insert(epoch, last_committed_even_round);
+    }
 
     if !blocks_to_send.is_empty() {
         let epoch_data = comm::CommittedEpochData {
