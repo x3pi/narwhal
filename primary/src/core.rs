@@ -100,6 +100,7 @@ pub struct Core {
     pending_votes: HashMap<Round, Vec<Vote>>,
     // --- Quorum watchdog state ---
     authors_seen_per_round: HashMap<Round, HashSet<PublicKey>>, // Authors whose C_r we have seen
+    headers_seen_per_round: HashMap<Round, HashSet<PublicKey>>, // Authors whose H_r we have seen (even without C_r)
     round_stuck_since: HashMap<Round, Instant>, // Track when a round started being stuck (missing quorum)
     last_proactive_request: HashMap<Round, Instant>, // Track when last proactive request was sent for a round (rate limiting)
     last_commit_observed_round: Round,               // Last consensus round observed locally
@@ -162,6 +163,7 @@ impl Core {
                 sync_state: None, // Start in Running state
                 pending_votes: HashMap::new(),
                 authors_seen_per_round: HashMap::new(),
+                headers_seen_per_round: HashMap::new(),
                 round_stuck_since: HashMap::new(),
                 last_proactive_request: HashMap::new(),
                 last_commit_observed_round: 0,
@@ -560,6 +562,11 @@ impl Core {
         // Use read-modify-write on store? For now, simple write is likely okay.
         let header_bytes = bincode::serialize(header).expect("Failed to serialize header");
         self.store.write(header.id.to_vec(), header_bytes).await;
+        // Track header author for quorum watchdog (even if certificate not formed yet)
+        self.headers_seen_per_round
+            .entry(header.round)
+            .or_insert_with(HashSet::new)
+            .insert(header.author.clone());
         debug!(
             "[Core][E{}] Stored valid H{}({})",
             self.epoch, header.round, header.author
@@ -617,43 +624,58 @@ impl Core {
                 if vote.origin == self.name {
                     // If we are voting for our own header, process the vote directly.
                     info!(
-                        "[Core][E{}] Processing own vote for H{}",
-                        self.epoch, header.round
-                    ); // <-- ADD LOG
+                        "[Core][E{}] Processing own vote for H{}({})",
+                        self.epoch, header.round, header.author
+                    );
                     self.process_vote(vote)
                         .await
                         .expect("Failed to process own vote");
-                } else if let Ok(addresses) = target_primary_address_result {
-                    // <-- Corrected pattern matching
-                    // If voting for a peer's header, send the vote reliably.
-
-                    // DEBUG: Log địa chỉ trước khi gửi vote để trace
-                    if addresses.primary_to_primary.ip().to_string() == "0.0.0.0"
-                        || addresses.primary_to_primary.port() == 0
-                    {
-                        warn!("[Core] ⚠️ SENDING VOTE TO INVALID ADDRESS {} for H{}({}), header author: {}, vote origin: {}, epoch: {}", 
-                              addresses.primary_to_primary, header.round, header.author, header.author, vote.origin, self.epoch);
-                    } else {
-                        info!(
-                            "[Core] Sending vote for H{}({}) to {}",
-                            header.round, header.author, addresses.primary_to_primary
-                        );
-                    }
-
-                    let vote_bytes = bincode::serialize(&PrimaryMessage::Vote(vote))
-                        .expect("Failed to serialize vote message");
-                    let handler = self
-                        .network
-                        .send(addresses.primary_to_primary, Bytes::from(vote_bytes))
-                        .await;
-                    // Store cancel handler.
-                    self.cancel_handlers
-                        .entry(header.round)
-                        .or_insert_with(Vec::new)
-                        .push(handler);
                 } else {
-                    // Should not happen if header verification passed, but handle defensively.
-                    error!("[Core][E{}] Author {} of valid H{} not found in committee! Cannot send vote.", self.epoch, header.author, header.round);
+                    // If voting for a peer's header, send the vote reliably.
+                    match target_primary_address_result {
+                        Ok(addresses) => {
+                            // DEBUG: Log địa chỉ trước khi gửi vote để trace
+                            if addresses.primary_to_primary.ip().to_string() == "0.0.0.0"
+                                || addresses.primary_to_primary.port() == 0
+                            {
+                                warn!("[Core][E{}] ⚠️ SENDING VOTE TO INVALID ADDRESS {} for H{}({}), header author: {}, vote origin: {}, epoch: {}", 
+                                      self.epoch, addresses.primary_to_primary, header.round, header.author, header.author, vote.origin, self.epoch);
+                            } else {
+                                info!(
+                                    "[Core][E{}] Sending vote V{}({}) for H{}({}) to {}",
+                                    self.epoch, vote.round, vote.author, header.round, header.author, addresses.primary_to_primary
+                                );
+                            }
+
+                            // Clone vote fields needed for logging before moving vote
+                            let vote_round_for_log = vote.round;
+                            let vote_author_for_log = vote.author.clone();
+                            
+                            let vote_bytes = bincode::serialize(&PrimaryMessage::Vote(vote))
+                                .expect("Failed to serialize vote message");
+                            let handler = self
+                                .network
+                                .send(addresses.primary_to_primary, Bytes::from(vote_bytes))
+                                .await;
+                            // Store cancel handler.
+                            self.cancel_handlers
+                                .entry(header.round)
+                                .or_insert_with(Vec::new)
+                                .push(handler);
+                            debug!(
+                                "[Core][E{}] Vote V{}({}) for H{}({}) sent successfully to {}",
+                                self.epoch, vote_round_for_log, vote_author_for_log, header.round, header.author, addresses.primary_to_primary
+                            );
+                        },
+                        Err(e) => {
+                            // Should not happen if header verification passed, but handle defensively.
+                            // Clone vote fields needed for logging before error (vote may be dropped by caller)
+                            let vote_round_for_log = vote.round;
+                            let vote_author_for_log = vote.author.clone();
+                            error!("[Core][E{}] Author {} of valid H{}({}) not found in committee! Cannot send vote V{}({}). Error: {:?}", 
+                                   self.epoch, header.author, header.round, header.author, vote_round_for_log, vote_author_for_log, e);
+                        }
+                    }
                 }
             } else {
                 debug!("[Core][E{}] Already voted for author {} at round {}. Ignoring H{}({}) for voting.", self.epoch, header.author, header.round, header.round, header.author);
@@ -684,28 +706,62 @@ impl Core {
             || vote.id != self.current_header.id
         {
             if vote.epoch == self.epoch {
-                // Only queue votes for rounds >= current_header.round (future rounds or current round but different header)
-                // Votes for rounds < current_header.round are too old and own header for those rounds already created
-                if vote.round >= self.current_header.round {
-                    // Queue vote to be processed when own header for this round is created
-                    // Votes are stored by round, and will be drained when process_own_header is called for that round
-                    let queue_entry = self.pending_votes.entry(vote.round).or_default();
-                    queue_entry.push(vote.clone());
-                    let queue_size = queue_entry.len();
-                    
-                    info!(
-                        "[Core][E{}] Queued vote V{}({}) for H{}({}) - current_header is H{}({}). Total queued votes for R{}: {}. Vote will be processed when own header for R{} arrives.",
-                        self.epoch, vote.round, vote.author, vote.round, vote.origin, 
-                        self.current_header.round, self.current_header.author, vote.round, queue_size, vote.round
-                    );
-                    return Ok(());
+                // Only discard votes if they are below gc_round (already garbage collected)
+                // Votes >= gc_round should be kept even if current_header has advanced, 
+                // as they may still be useful for forming certificates (e.g., during quiet period)
+                if vote.round >= self.gc_round {
+                    // Queue vote if round >= current_header.round (future rounds or current round but different header)
+                    // OR if round < current_header.round but >= gc_round (still within GC window, may be useful for certificate formation)
+                    if vote.round >= self.current_header.round {
+                        // Queue vote to be processed when own header for this round is created
+                        // Votes are stored by round, and will be drained when process_own_header is called for that round
+                        let queue_entry = self.pending_votes.entry(vote.round).or_default();
+                        queue_entry.push(vote.clone());
+                        let queue_size = queue_entry.len();
+                        
+                        info!(
+                            "[Core][E{}] Queued vote V{}({}) for H{}({}) - current_header is H{}({}). Total queued votes for R{}: {}. Vote will be processed when own header for R{} arrives.",
+                            self.epoch, vote.round, vote.author, vote.round, vote.origin, 
+                            self.current_header.round, self.current_header.author, vote.round, queue_size, vote.round
+                        );
+                        return Ok(());
+                    } else {
+                        // Vote round < current_header.round but >= gc_round
+                        // This vote may still be useful if certificate hasn't been formed yet
+                        // Check if we already have a certificate for this round before discarding
+                        let round_key = bincode::serialize(&(self.epoch, vote.round))
+                            .expect("Failed to serialize round index key");
+                        let has_cert = self.store.read_cf(ROUND_INDEX_CF.to_string(), round_key).await
+                            .ok()
+                            .and_then(|opt| opt)
+                            .is_some();
+                        
+                        if !has_cert {
+                            // No certificate yet - queue the vote as it may still be useful
+                            let queue_entry = self.pending_votes.entry(vote.round).or_default();
+                            queue_entry.push(vote.clone());
+                            debug!(
+                                "[Core][E{}] Queued vote V{}({}) for H{}({}) - round {} < current_header.round {} but >= gc_round {} and no certificate yet. May still form certificate.",
+                                self.epoch, vote.round, vote.author, vote.round, vote.origin,
+                                vote.round, self.current_header.round, self.gc_round
+                            );
+                            return Ok(());
+                        } else {
+                            // Certificate already exists for this round, vote is truly stale
+                            debug!(
+                                "[Core][E{}] Dropping stale vote V{}({}) for H{}({}) - vote round {} < current_header.round {} but certificate for R{} already exists.",
+                                self.epoch, vote.round, vote.author, vote.round, vote.origin,
+                                vote.round, self.current_header.round, vote.round
+                            );
+                            return Ok(());
+                        }
+                    }
                 } else {
-                    // Vote is for a round that has already passed (vote.round < current_header.round)
-                    // Own header for that round was already created, so this vote is stale
-                    warn!(
-                        "[Core][E{}] Dropping stale vote V{}({}) for H{}({}) - vote round {} is older than current_header round {}. Own header for R{} already created.",
+                    // Vote is below gc_round - truly stale and should be discarded
+                    debug!(
+                        "[Core][E{}] Dropping vote V{}({}) for H{}({}) - vote round {} < gc_round {} (already garbage collected).",
                         self.epoch, vote.round, vote.author, vote.round, vote.origin,
-                        vote.round, self.current_header.round, vote.round
+                        vote.round, self.gc_round
                     );
                     return Ok(());
                 }
@@ -846,7 +902,9 @@ impl Core {
 
         // Update internal tracking of the highest round seen/processed.
         // Crucial for sync logic and GC round calculation.
-        if certificate.round() > self.dag_round {
+        // IMPORTANT: Only update if certificate epoch matches current epoch
+        // This prevents dag_round from being set by certificates from previous epoch
+        if certificate.epoch() == self.epoch && certificate.round() > self.dag_round {
             debug!(
                 "[Core][E{}] Advancing internal dag_round from {} to {} upon processing C{}",
                 self.epoch,
@@ -855,6 +913,11 @@ impl Core {
                 certificate.round()
             );
             self.dag_round = certificate.round();
+        } else if certificate.epoch() != self.epoch {
+            warn!(
+                "[Core][E{}] Ignoring certificate C{}({}) from epoch {} when updating dag_round. Current epoch: {}",
+                self.epoch, certificate.round(), certificate.origin(), certificate.epoch(), self.epoch
+            );
         }
 
         // Check if the header embedded in the certificate needs processing
@@ -961,6 +1024,17 @@ impl Core {
                     certificate.round()
                 );
             }
+            // Track certificate author immediately when stored (for quorum watchdog)
+            // This allows watchdog to accurately track which certificates we have, even if quorum not formed yet
+            self.authors_seen_per_round
+                .entry(certificate.round())
+                .or_insert_with(HashSet::new)
+                .insert(certificate.origin());
+            debug!(
+                "[Core][E{}] Tracked certificate C{}({}) author for quorum watchdog. Round {} now has {} certificate(s).",
+                self.epoch, certificate.round(), certificate.origin(), certificate.round(),
+                self.authors_seen_per_round.get(&certificate.round()).map(|s| s.len()).unwrap_or(0)
+            );
         } else {
             trace!(
                 "[Core][E{}] Certificate C{}({}) already in store.",
@@ -968,6 +1042,11 @@ impl Core {
                 certificate.round(),
                 certificate.origin()
             );
+            // Still track author even if certificate was already stored
+            self.authors_seen_per_round
+                .entry(certificate.round())
+                .or_insert_with(HashSet::new)
+                .insert(certificate.origin());
         }
 
         // --- Parent Aggregation for Next Round ---
@@ -992,11 +1071,7 @@ impl Core {
             // Parents are the digests of the quorum of certificates forming round N.
             // These will be used by the Proposer to create Header for round N+1.
             let formed_round = certificate.round();
-            // Track author seen for this round (for quorum watchdog diagnostics)
-            self.authors_seen_per_round
-                .entry(formed_round)
-                .or_insert_with(HashSet::new)
-                .insert(certificate.origin());
+            // Note: authors_seen_per_round already updated above when certificate was stored
             // --- Auto-catchup: if this node is lagging behind too much, enter Syncing state ---
             if self.sync_state.is_none()
                 && formed_round > self.dag_round.saturating_add(LAG_THRESHOLD)
@@ -1366,10 +1441,24 @@ impl Core {
         match message {
             // Received Header from peer or loopback (after dependencies met)
             PrimaryMessage::Header(header) => {
+                info!(
+                    "[Core][E{}] Received header message H{}({}) from network (header epoch: {})",
+                    self.epoch, header.round, header.author, header.epoch
+                );
                 // Sanitize first (checks epoch, GC round, signature).
-                self.sanitize_header(&header).await?;
-                // Full processing (checks parents, payload, votes).
-                self.process_header(&header, false).await
+                match self.sanitize_header(&header).await {
+                    Ok(_) => {
+                        // Full processing (checks parents, payload, votes).
+                        self.process_header(&header, false).await
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[Core][E{}] Header H{}({}) failed sanitization: {}",
+                            self.epoch, header.round, header.author, e
+                        );
+                        Err(e)
+                    }
+                }
             }
             // Received Vote from peer
             PrimaryMessage::Vote(vote) => {
@@ -1568,6 +1657,7 @@ impl Core {
         self.cancel_handlers.clear(); // Cancel pending network requests? Maybe let them timeout. Clearing handlers is safer.
         self.pending_votes.clear(); // Clear pending votes from old epoch
         self.authors_seen_per_round.clear(); // Clear quorum tracking
+        self.headers_seen_per_round.clear(); // Clear header tracking
         self.round_stuck_since.clear(); // Clear stuck round tracking
         self.last_proactive_request.clear(); // Clear proactive request tracking
         self.last_commit_observed_round = 0; // Reset consensus commit tracking
@@ -1681,16 +1771,52 @@ impl Core {
                     drop(committee_guard);
 
                     let r = self.dag_round;
+                    // Skip quorum check if dag_round is from previous epoch (should be reset but wasn't)
+                    // This happens when epoch transition occurs but dag_round wasn't properly reset
+                    // Typical symptom: dag_round is very high (e.g., 100) but we're at a low round in new epoch
                     if r > 0 {
-                        let seen = self
+                        // Check if dag_round seems suspicious (very high round suggests old epoch)
+                        // Normal rounds in new epoch should be small initially (1, 2, 3, ...)
+                        // If dag_round is > 50 and we just started new epoch, it's likely stale
+                        let committee_guard = self.committee.read().await;
+                        let is_suspicious_dag_round = r > 50 && self.epoch > 0; // Simple heuristic
+                        drop(committee_guard);
+                        
+                        if is_suspicious_dag_round {
+                            warn!(
+                                "[Core][E{}] Quorum watchdog: dag_round={} is suspiciously high for new epoch. Possible stale value from previous epoch. Skipping quorum check.",
+                                self.epoch, r
+                            );
+                            continue; // Skip this quorum check iteration
+                        }
+                        
+                        let cert_seen = self
                             .authors_seen_per_round
                             .get(&r)
                             .cloned()
                             .unwrap_or_default();
-                        if seen.len() < expected_authors.len() {
-                            // Round is missing some authors - track stuck time
-                            let missing: Vec<PublicKey> = expected_authors
-                                .difference(&seen)
+                        let headers_seen = self
+                            .headers_seen_per_round
+                            .get(&r)
+                            .cloned()
+                            .unwrap_or_default();
+                        
+                        if cert_seen.len() < expected_authors.len() {
+                            // Round is missing some certificates - track stuck time
+                            let missing_certs: Vec<PublicKey> = expected_authors
+                                .difference(&cert_seen)
+                                .cloned()
+                                .collect();
+                            
+                            // Check which missing authors have headers but no certificates yet
+                            let missing_with_headers: Vec<PublicKey> = missing_certs
+                                .iter()
+                                .filter(|author| headers_seen.contains(*author))
+                                .cloned()
+                                .collect();
+                            let missing_without_headers: Vec<PublicKey> = missing_certs
+                                .iter()
+                                .filter(|author| !headers_seen.contains(*author))
                                 .cloned()
                                 .collect();
 
@@ -1699,8 +1825,10 @@ impl Core {
                             let is_newly_stuck = !self.round_stuck_since.contains_key(&r);
                             if is_newly_stuck {
                                 info!(
-                                    "[Core][E{}] Quorum watchdog: R{} missing {} author(s) for C{} aggregation. Tracking stuck time. Missing: {:?}",
-                                    self.epoch, r, missing.len(), r, missing
+                                    "[Core][E{}] Quorum watchdog: R{} missing {} certificate(s) (have {}). {} author(s) have headers but no cert yet: {:?}. {} author(s) missing headers: {:?}",
+                                    self.epoch, r, missing_certs.len(), cert_seen.len(), 
+                                    missing_with_headers.len(), missing_with_headers,
+                                    missing_without_headers.len(), missing_without_headers
                                 );
                                 self.round_stuck_since.insert(r, now);
                             }
@@ -1718,8 +1846,11 @@ impl Core {
 
                                 if timeout_expired && cooldown_expired {
                                     warn!(
-                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing {} author(s): {:?}. Triggering proactive assistance.",
-                                        self.epoch, r, elapsed, self.quorum_timeout_ms, missing.len(), missing
+                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing {} certificate(s) (have {} certs, {} headers). {} with headers but no cert: {:?}. {} missing headers: {:?}. Triggering proactive assistance.",
+                                        self.epoch, r, elapsed, self.quorum_timeout_ms, 
+                                        missing_certs.len(), cert_seen.len(), headers_seen.len(),
+                                        missing_with_headers.len(), missing_with_headers,
+                                        missing_without_headers.len(), missing_without_headers
                                     );
 
                                     // 1) Request a small range sync for this round (to all peers)
@@ -1727,7 +1858,7 @@ impl Core {
 
                                     // 2) Proactively request certificates from missing authors specifically
                                     let committee_guard = self.committee.read().await;
-                                    let missing_authors_with_addresses: Vec<(PublicKey, SocketAddr)> = missing
+                                    let missing_authors_with_addresses: Vec<(PublicKey, SocketAddr)> = missing_certs
                                         .iter()
                                         .filter_map(|missing_author| {
                                             committee_guard
@@ -1766,7 +1897,7 @@ impl Core {
                                     {
                                         let missing_authors_with_addresses: Vec<(PublicKey, SocketAddr)> = {
                                             let committee_guard = self.committee.read().await;
-                                            missing
+                                            missing_certs
                                                 .iter()
                                                 .filter_map(|author| {
                                                     committee_guard
@@ -1852,8 +1983,8 @@ impl Core {
                             // Round has quorum now - remove from stuck tracking
                             if self.round_stuck_since.remove(&r).is_some() {
                                 debug!(
-                                    "[Core][E{}] Quorum watchdog: R{} now has quorum ({} authors). Removed from stuck tracking.",
-                                    self.epoch, r, seen.len()
+                                    "[Core][E{}] Quorum watchdog: R{} now has quorum ({} certificates from {} authors). Removed from stuck tracking.",
+                                    self.epoch, r, cert_seen.len(), cert_seen.len()
                                 );
                             }
                         }

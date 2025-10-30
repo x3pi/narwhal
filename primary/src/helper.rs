@@ -7,7 +7,7 @@ use crate::Epoch;
 use bytes::Bytes;
 use config::Committee;
 use crypto::Digest;
-use log::{debug, error, info, trace, warn}; // <-- THÊM trace
+use log::{error, info, trace, warn}; // Removed unused debug import
 use network::SimpleSender;
 use std::sync::Arc;
 use store::{Store, ROUND_INDEX_CF};
