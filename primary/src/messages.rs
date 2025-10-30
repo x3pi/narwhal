@@ -308,8 +308,11 @@ impl Certificate {
             weight += voting_rights;
         }
 
-        // *** THAY ĐỔI: Sử dụng quorum động nếu có active_cert_count, ngược lại dùng quorum cố định ***
-        let quorum_threshold = if let Some(active_count) = active_cert_count {
+        // *** ƯU TIÊN: Sử dụng số parents trong header để tính quorum động (quyết định tất định theo header) ***
+        let parents_count = self.header.parents.len();
+        let quorum_threshold = if parents_count > 0 {
+            committee.quorum_threshold_dynamic(parents_count)
+        } else if let Some(active_count) = active_cert_count {
             if active_count > 0 {
                 committee.quorum_threshold_dynamic(active_count)
             } else {

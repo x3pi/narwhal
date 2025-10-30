@@ -14,7 +14,6 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, info, trace, warn}; // <-- THÊM trace
 use network::{CancelHandler, ReliableSender};
-use rayon::prelude::*; // Keep Rayon for parallel verification if used
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr; // <-- THÊM SocketAddr
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -356,10 +355,7 @@ impl Core {
                                 v,
                                 &committee_guard,
                                 &self.current_header,
-                                self.authors_seen_per_round
-                                    .get(&header.round.saturating_sub(1))
-                                    .map(|s| s.len())
-                                    .unwrap_or(0),
+                                self.current_header.parents.len(),
                             )? {
                                 drop(committee_guard);
                                 // If certificate formed immediately, process it
@@ -559,23 +555,25 @@ impl Core {
         // Check if the combined stake of parents meets the quorum threshold.
         // *** THAY ĐỔI: Sử dụng quorum động dựa trên số certificate đã có trong round trước đó ***
         let prev_round = header.round.saturating_sub(1);
-        let active_cert_count = self
-            .authors_seen_per_round
-            .get(&prev_round)
-            .map(|s| s.len())
-            .unwrap_or(0);
-        
-        let (quorum_threshold, static_quorum) = {
+        let (active_cert_count, quorum_threshold, static_quorum) = {
             let committee_guard = self.committee.read().await;
             let static_q = committee_guard.quorum_threshold();
-            // Nếu round trước đó có ít nhất 1 certificate, sử dụng quorum động
-            // Ngược lại, fallback về quorum ban đầu
-            let dynamic_q = if active_cert_count > 0 {
-                committee_guard.quorum_threshold_dynamic(active_cert_count)
+            // prev_round == 0: dùng kích thước committee làm số active certs (genesis)
+            let acc = if prev_round == 0 {
+                committee_guard.authorities.len()
             } else {
-                static_q // Fallback về quorum ban đầu cho round đầu tiên hoặc khi không có certificate nào
+                self
+                    .authors_seen_per_round
+                    .get(&prev_round)
+                    .map(|s| s.len())
+                    .unwrap_or(0)
             };
-            (dynamic_q, static_q)
+            let dynamic_q = if acc > 0 {
+                committee_guard.quorum_threshold_dynamic(acc)
+            } else {
+                static_q
+            };
+            (acc, dynamic_q, static_q)
         };
         
         debug!(
@@ -867,12 +865,7 @@ impl Core {
                 "[Core][E{}] Appending vote V{}({}) for H{}({}) to aggregator. Current weight: checking quorum...",
                 self.epoch, vote_round, vote_author, current_header_round, current_header_author
             );
-            let prev_round = self.current_header.round.saturating_sub(1);
-            let active_cert_count = self
-                .authors_seen_per_round
-                .get(&prev_round)
-                .map(|s| s.len())
-                .unwrap_or(0);
+            let active_cert_count = self.current_header.parents.len();
             
             let result = self.votes_aggregator
                 .append(vote, &committee_guard, &self.current_header, active_cert_count)?; // Pass committee ref
@@ -1148,10 +1141,10 @@ impl Core {
                 .append(
                     certificate.clone(), 
                     &committee_guard,
-                    self.authors_seen_per_round
-                        .get(&certificate.round().saturating_sub(1))
-                        .map(|s| s.len())
-                        .unwrap_or(0),
+                    {
+                        let pr = certificate.round().saturating_sub(1);
+                        if pr == 0 { committee_guard.authorities.len() } else { self.authors_seen_per_round.get(&pr).map(|s| s.len()).unwrap_or(0) }
+                    },
                 )? // Append cert, check for quorum
                                                                 // Lock released here
         };
@@ -1494,13 +1487,8 @@ impl Core {
         );
         // Check 3: Verify certificate integrity, header, and quorum signatures.
         // *** THAY ĐỔI: Sử dụng quorum động khi verify certificate ***
-        let prev_round = certificate.round().saturating_sub(1);
-        let active_cert_count = self
-            .authors_seen_per_round
-            .get(&prev_round)
-            .map(|s| s.len());
-        
-        certificate.verify_with_active_cert_count(&committee_guard, active_cert_count)?; // Propagate verification errors.
+        // Ưu tiên để verify dựa trên parents trong header; không cần truyền active_count khi đã có parents
+        certificate.verify_with_active_cert_count(&committee_guard, None)?; // Propagate verification errors.
                                                // Lock released here
         Ok(())
     }
@@ -1524,44 +1512,22 @@ impl Core {
                              self.epoch, certificates.len(), self.dag_round, state.final_target_round
                         );
 
-                        // *** FIX: Filter and Verify Certificates *Before* Processing ***
+                        // *** FIX: Filter Certificates by Epoch Only; full verification happens in sanitize_certificate() ***
                         let current_epoch_local = self.epoch; // Capture epoch for closure
-                        let committee_clone = self.committee.clone(); // Clone Arc for blocking task
-
-                        // Perform verification in a blocking task to avoid blocking the async runtime.
-                        let verified_certificates = tokio::task::spawn_blocking(move || {
-                            let committee_guard = committee_clone.blocking_read(); // Blocking read inside task
-                            certificates
-                                .into_par_iter() // Use Rayon for parallel iteration
-                                // Filter 1: Keep only certificates belonging to the *current* sync epoch.
-                                .filter(|cert| {
-                                    if cert.epoch() == current_epoch_local {
-                                        true
-                                    } else {
-                                        warn!(
-                                            "[Core][Sync][E{}] Discarding certificate C{}({}) from wrong epoch {} in sync bundle.",
-                                            current_epoch_local, cert.round(), cert.origin(), cert.epoch()
-                                        );
-                                        false
-                                    }
-                                })
-                                // Filter 2: Verify certificate integrity and signatures.
-                                .filter_map(|cert| {
-                                    match cert.verify(&committee_guard) {
-                                        Ok(_) => Some(cert), // Keep valid certificates.
-                                        Err(e) => {
-                                            warn!(
-                                                "[Core][Sync][E{}] Discarding invalid certificate C{}({}) in sync bundle: {}",
-                                                current_epoch_local, cert.round(), cert.origin(), e
-                                            );
-                                            None // Discard invalid certificates.
-                                        }
-                                    }
-                                })
-                                .collect::<Vec<Certificate>>() // Collect valid certificates.
-                        })
-                        .await
-                        .expect("Sync verification task panicked"); // Handle panic in blocking task.
+                        let verified_certificates: Vec<Certificate> = certificates
+                            .into_iter()
+                            .filter(|cert| {
+                                if cert.epoch() == current_epoch_local {
+                                    true
+                                } else {
+                                    warn!(
+                                        "[Core][Sync][E{}] Discarding certificate C{}({}) from wrong epoch {} in sync bundle.",
+                                        current_epoch_local, cert.round(), cert.origin(), cert.epoch()
+                                    );
+                                    false
+                                }
+                            })
+                            .collect();
 
                         // Process the *verified* certificates.
                         let mut latest_round_in_bundle = self.dag_round; // Track highest round processed from this bundle.
