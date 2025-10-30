@@ -9,7 +9,7 @@ use crate::synchronizer::Synchronizer;
 use crate::{Epoch, Round};
 use async_recursion::async_recursion;
 use bytes::Bytes;
-use config::{Committee, PrimaryAddresses}; // <-- THÊM PrimaryAddresses
+use config::{Committee, PrimaryAddresses, Stake}; // <-- THÊM PrimaryAddresses và Stake
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, info, trace, warn}; // <-- THÊM trace
@@ -2544,6 +2544,10 @@ impl Core {
                             continue; // Skip quorum check for this iteration
                         }
                         
+                        // Calculate dynamic quorum based on previous round's active certificates
+                        let prev_round = r.saturating_sub(1);
+                        
+                        // Read cert_seen and headers_seen first
                         let cert_seen = self
                             .authors_seen_per_round
                             .get(&r)
@@ -2555,8 +2559,36 @@ impl Core {
                             .cloned()
                             .unwrap_or_default();
                         
-                        if cert_seen.len() < expected_authors.len() {
-                            // Round is missing some certificates - track stuck time
+                        // Calculate dynamic quorum and current certificate stake
+                        let (active_cert_count, dynamic_quorum_required, current_cert_stake) = {
+                            let committee_guard = self.committee.read().await;
+                            let acc = if prev_round == 0 {
+                                committee_guard.authorities.len()
+                            } else {
+                                self.authors_seen_per_round
+                                    .get(&prev_round)
+                                    .map(|s| s.len())
+                                    .unwrap_or(0)
+                            };
+                            let dq = if acc > 0 {
+                                committee_guard.quorum_threshold_dynamic(acc)
+                            } else {
+                                committee_guard.quorum_threshold()
+                            };
+                            // Calculate current certificate stake
+                            let current_stake: Stake = cert_seen
+                                .iter()
+                                .map(|author| committee_guard.stake(author))
+                                .sum();
+                            drop(committee_guard);
+                            (acc, dq, current_stake)
+                        };
+                        
+                        // Check if we have enough certificates for dynamic quorum
+                        // Instead of checking if cert_seen.len() < expected_authors.len()
+                        // We check if current_cert_stake < dynamic_quorum_required
+                        if current_cert_stake < dynamic_quorum_required {
+                            // Round is missing certificates to reach dynamic quorum - track stuck time
                             let missing_certs: Vec<PublicKey> = expected_authors
                                 .difference(&cert_seen)
                                 .cloned()
@@ -2579,8 +2611,8 @@ impl Core {
                             let is_newly_stuck = !self.round_stuck_since.contains_key(&r);
                             if is_newly_stuck {
                                 info!(
-                                    "[Core][E{}] Quorum watchdog: R{} missing {} certificate(s) (have {}). {} author(s) have headers but no cert yet: {:?}. {} author(s) missing headers: {:?}",
-                                    self.epoch, r, missing_certs.len(), cert_seen.len(), 
+                                    "[Core][E{}] Quorum watchdog: R{} missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} based on {} active certs in R{}). {} author(s) have headers but no cert yet: {:?}. {} author(s) missing headers: {:?}",
+                                    self.epoch, r, cert_seen.len(), current_cert_stake, dynamic_quorum_required, active_cert_count, prev_round,
                                     missing_with_headers.len(), missing_with_headers,
                                     missing_without_headers.len(), missing_without_headers
                                 );
@@ -2600,9 +2632,9 @@ impl Core {
 
                                 if timeout_expired && cooldown_expired {
                                     warn!(
-                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing {} certificate(s) (have {} certs, {} headers). {} with headers but no cert: {:?}. {} missing headers: {:?}. Triggering proactive assistance.",
+                                        "[Core][E{}] Quorum watchdog: R{} stuck for {:?} (>{}ms). Missing certificates to reach dynamic quorum (have {} certs with stake {}, need stake {} based on {} active certs in R{}). {} with headers but no cert: {:?}. {} missing headers: {:?}. Triggering proactive assistance.",
                                         self.epoch, r, elapsed, self.quorum_timeout_ms, 
-                                        missing_certs.len(), cert_seen.len(), headers_seen.len(),
+                                        cert_seen.len(), current_cert_stake, dynamic_quorum_required, active_cert_count, prev_round,
                                         missing_with_headers.len(), missing_with_headers,
                                         missing_without_headers.len(), missing_without_headers
                                     );
