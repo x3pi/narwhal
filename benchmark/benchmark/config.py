@@ -69,7 +69,7 @@ class Committee:
         assert isinstance(base_port, int) and base_port > 1024
 
         port = base_port
-        self.json = {'authorities': OrderedDict()}
+        self.json = {'authorities': OrderedDict(), 'epoch': 1}
         for name, hosts in addresses.items():
             host = hosts.pop(0)
             primary_addr = {
@@ -88,11 +88,17 @@ class Committee:
                 port += 3
             
             consensus_key = key_map[name]
+            # p2p_address: dùng cùng địa chỉ với primary_to_worker của worker 0 để tương thích schema mới
+            # Nếu không có worker (không xảy ra trong benchmark), fallback về primary_to_primary
+            p2p_address = (
+                workers_addr[0]['primary_to_worker'] if len(workers_addr) > 0 else primary_addr['primary_to_primary']
+            )
             self.json['authorities'][name] = {
                 'stake': 1,
                 'consensus_key': consensus_key,
                 'primary': primary_addr,
-                'workers': workers_addr
+                'workers': workers_addr,
+                'p2p_address': p2p_address,
             }
 
     def primary_addresses(self, faults=0):

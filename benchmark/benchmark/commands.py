@@ -1,5 +1,6 @@
 # Copyright(C) Facebook, Inc. and its affiliates.
 from os.path import join
+import os
 
 from benchmark.utils import PathMaker
 
@@ -32,11 +33,13 @@ class CommandMaker:
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
-        # SỬA ĐỔI: Thêm tham số --uds-socket cố định
-        UDS_SOCKET_PATH = '/tmp/get_validator.sock_1'
-        return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters} '
-                f'--uds-socket {UDS_SOCKET_PATH} primary') # <--- Đã thêm
+        # Lấy UDS socket path từ biến môi trường (mặc định nếu không có)
+        uds_socket = os.environ.get('UDS_SOCKET_PATH', '/tmp/get_validator.sock_1')
+        return (
+            f'./node {v} run --keys {keys} --committee {committee} '
+            f'--store {store} --parameters {parameters} '
+            f'--uds-socket {uds_socket} primary'
+        )
 
     @staticmethod
     def run_worker(keys, committee, store, parameters, id, debug=False):
@@ -45,11 +48,13 @@ class CommandMaker:
         assert isinstance(parameters, str)
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
-        # SỬA ĐỔI: Thêm tham số --uds-socket cố định
-        UDS_SOCKET_PATH = '/tmp/get_validator.sock_1'
-        return (f'./node {v} run --keys {keys} --committee {committee} '
-                f'--store {store} --parameters {parameters} '
-                f'--uds-socket {UDS_SOCKET_PATH} worker --id {id}') # <--- Đã thêm
+        # Lấy UDS socket path từ biến môi trường (mặc định nếu không có)
+        uds_socket = os.environ.get('UDS_SOCKET_PATH', '/tmp/get_validator.sock_1')
+        return (
+            f'./node {v} run --keys {keys} --committee {committee} '
+            f'--store {store} --parameters {parameters} '
+            f'--uds-socket {uds_socket} worker --id {id}'
+        )
 
     @staticmethod
     def run_client(address, size, rate, nodes):

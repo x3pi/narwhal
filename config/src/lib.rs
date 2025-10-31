@@ -436,7 +436,7 @@ impl NodeConfig {
             consensus_key,
             consensus_secret,
             uds_get_validators_path: "/tmp/get_validator.sock_1".to_string(),
-            uds_block_path: "/tmp/block.sock_1".to_string(),
+            uds_block_path: "".to_string(),
         }
     }
 }

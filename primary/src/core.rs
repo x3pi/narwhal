@@ -41,7 +41,7 @@ const SYNC_MAX_RETRIES: u32 = 15; // Maximum retries for a sync chunk before giv
 const LAG_THRESHOLD: Round = 50; // Round difference triggering sync mode
 
 // Interval for triggering committee reconfiguration checks
-pub const RECONFIGURE_INTERVAL: Round = 1000;
+pub const RECONFIGURE_INTERVAL: Round = 100000;
 // Local CF for mapping (epoch, round, author) -> header_id (Digest)
 const AUTHOR_ROUND_CF: &str = "author_round_index";
 
