@@ -105,9 +105,4 @@ impl CertificatesAggregator {
     pub fn get_certificates(&self) -> &Vec<Digest> {
         &self.certificates
     }
-
-    /// Get current weight accumulated so far
-    pub fn get_weight(&self) -> Stake {
-        self.weight
-    }
 }

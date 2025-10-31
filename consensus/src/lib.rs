@@ -1608,6 +1608,21 @@ impl Consensus {
                                         }
                                     }
 
+                                    #[cfg(feature = "benchmark")]
+                                    {
+                                        for dag in &committed_sub_dags {
+                                            for certificate in &dag.certificates {
+                                                for digest in certificate.header.payload.keys() {
+                                                    info!(
+                                                        "Committed {} -> {:?}",
+                                                        certificate.header,
+                                                        digest
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     // Luôn gửi None cho skipped_round khi commit
                                     let output_tuple = (committed_sub_dags.clone(), current_committee_for_output.clone(), None);
                                     if self.tx_output.send(output_tuple).is_err() {

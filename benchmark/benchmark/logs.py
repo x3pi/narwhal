@@ -98,11 +98,11 @@ class LogParser:
         if search(r'(?:panicked|Error)', log) is not None:
             raise ParseError('Primary(s) panicked')
 
-        tmp = findall(r'\[(.*Z) .* Created B\d+\([^ ]+\) -> ([^ ]+=)', log)
+        tmp = findall(r'\[(.*Z) .* Created (?:B\d+|E\d+B\d+)\([^ ]+\) -> ([^\s]+)', log)
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         proposals = self._merge_results([tmp])
 
-        tmp = findall(r'\[(.*Z) .* Committed B\d+\([^ ]+\) -> ([^ ]+=)', log)
+        tmp = findall(r'\[(.*Z) .* Committed (?:B\d+|E\d+B\d+)\([^ ]+\) -> ([^\s]+)', log)
         tmp = [(d, self._to_posix(t)) for t, d in tmp]
         commits = self._merge_results([tmp])
 
@@ -130,7 +130,8 @@ class LogParser:
             ),
         }
 
-        ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
+        match = search(r'booted on (\d+.\d+.\d+.\d+)', log)
+        ip = match.group(1) if match else '0.0.0.0'
         
         return proposals, commits, configs, ip
 
@@ -144,7 +145,8 @@ class LogParser:
         tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
         samples = {int(s): d for d, s in tmp}
 
-        ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
+        match = search(r'booted on (\d+.\d+.\d+.\d+)', log)
+        ip = match.group(1) if match else '0.0.0.0'
 
         return sizes, samples, ip
 

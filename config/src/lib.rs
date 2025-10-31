@@ -211,7 +211,7 @@ impl Committee {
                 );
             }
 
-            let (worker_to_primary, _primary_to_worker, transactions) =
+            let (worker_to_primary, primary_to_worker, transactions) =
                 if val.address.to_lowercase() == self_address.to_lowercase() {
                     info!(
                         "Assigning sequential internal ports for self (address: {}).",
@@ -232,12 +232,11 @@ impl Committee {
                     let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
                     (placeholder_addr, placeholder_addr, placeholder_addr)
                 };
-            let primary_to_worker_2: SocketAddr = val.p2p_address.clone().parse().unwrap();
 
             let workers = [(
                 0,
                 WorkerAddresses {
-                    primary_to_worker: primary_to_worker_2,
+                    primary_to_worker,
                     transactions,
                     worker_to_worker: val.worker_address.parse().map_err(|e| {
                         ConfigError::ParseError(format!(
