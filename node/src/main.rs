@@ -679,6 +679,22 @@ async fn analyze_hot_swap(
         return;
     }
 
+    // Tạo background channel để gửi blocks không blocking event loop chính
+    let (tx_blocks, mut rx_blocks) =
+        tokio::sync::mpsc::unbounded_channel::<comm::CommittedEpochData>();
+
+    // Spawn background task để gửi blocks sang UDS một cách không blocking
+    // Background task sẽ xử lý việc gửi blocks một cách tuần tự, không làm gián đoạn event loop chính
+    let socket_path_bg = socket_path.clone();
+    tokio::spawn(async move {
+        let bg_uds_sender = UdsSender::new(socket_path_bg);
+        while let Some(epoch_data) = rx_blocks.recv().await {
+            if let Err(e) = bg_uds_sender.send(epoch_data, "background").await {
+                error!("[ANALYZE] Background UDS send failed: {}", e);
+            }
+        }
+    });
+
     info!("[ANALYZE] Started (Hot-Swap Mode). Waiting for commits."); // Log cập nhật
 
     loop {
@@ -707,7 +723,8 @@ async fn analyze_hot_swap(
                                 &mut store,
                                 &socket_path,
                                 &mut all_committed_txs_by_epoch,
-                                &mut last_committed_even_round_per_epoch
+                                &mut last_committed_even_round_per_epoch,
+                                &tx_blocks,
                             ).await;
                          } else if _skipped_round_option.is_some() {
                               // Log cảnh báo nếu nhận được skipped_round (không mong đợi)
@@ -764,9 +781,10 @@ async fn finalize_and_send_epoch(
     epoch: u64,
     dags: Vec<CommittedSubDag>, // Luôn không rỗng khi được gọi
     store: &mut Store,
-    socket_path: &str,
+    _socket_path: &str, // Keep for backward compatibility but not used anymore
     all_committed_txs_by_epoch: &mut HashMap<u64, HashSet<Vec<u8>>>,
     last_committed_even_round_per_epoch: &mut HashMap<u64, Round>,
+    tx_blocks: &tokio::sync::mpsc::UnboundedSender<comm::CommittedEpochData>,
 ) {
     let committed_tx_digests = all_committed_txs_by_epoch.entry(epoch).or_default();
     let mut processed_certificates_in_call = HashSet::new();
@@ -923,10 +941,14 @@ async fn finalize_and_send_epoch(
         let context = format!("committed block(s) (max leader round {})", max_leader_round);
         // Dùng INFO thay vì WARN cho log gửi thành công
         info!(
-            "[SEND_UDS_ENTRY] Called for Context='{}', Epoch={}, Height(s)={}-{}", // Dùng INFO
+            "[SEND_UDS_ENTRY] Queuing blocks for Context='{}', Epoch={}, Height(s)={}-{}",
             context, epoch, min_h, max_h
         );
-        send_to_uds(epoch_data, socket_path, &context).await;
+
+        // Gửi blocks qua channel (non-blocking) để background task xử lý
+        if let Err(e) = tx_blocks.send(epoch_data) {
+            error!("[ANALYZE] Failed to queue blocks for UDS: {}", e);
+        }
     } else {
         warn!( // Trường hợp này giờ đây không mong muốn
             "[ANALYZE] No valid blocks created from committed dags for epoch {} (Max Leader Round: {}). Investigate.",
@@ -935,71 +957,152 @@ async fn finalize_and_send_epoch(
     }
 }
 
-// --- Hàm send_to_uds (Không đổi) ---
-async fn send_to_uds(epoch_data: comm::CommittedEpochData, socket_path: &str, context: &str) {
-    let epoch_num = epoch_data.blocks.first().map(|b| b.epoch).unwrap_or(0);
-    let block_count = epoch_data.blocks.len();
-    let tx_count: usize = epoch_data.blocks.iter().map(|b| b.transactions.len()).sum();
-    // Lấy height (block number) nhỏ nhất và lớn nhất để log
-    let min_height = epoch_data
-        .blocks
-        .iter()
-        .map(|b| b.height)
-        .min()
-        .unwrap_or(0);
-    let max_height = epoch_data
-        .blocks
-        .iter()
-        .map(|b| b.height)
-        .max()
-        .unwrap_or(0);
+// --- UDS Sender với persistent connection để tối ưu hiệu suất ---
+struct UdsSender {
+    socket_path: String,
+    connection: Arc<tokio::sync::Mutex<Option<UnixStream>>>,
+}
 
-    match UnixStream::connect(socket_path).await {
-        Ok(mut stream) => {
-            let mut proto_buf = BytesMut::new();
-            if let Err(e) = epoch_data.encode(&mut proto_buf) {
-                error!(
-                    "[ANALYZE] UDS ({}) Epoch {}: Failed to encode Protobuf: {}",
-                    context, epoch_num, e
-                );
-                return;
-            }
-
-            let len = proto_buf.len();
-            let mut len_buf = BytesMut::new();
-            len_buf.put_u32(len as u32); // Sửa: Dùng u32 (Big Endian)
-
-            if let Err(e) = stream.write_all(&len_buf).await {
-                error!(
-                    "[ANALYZE] UDS ({}) Epoch {}: Failed to write length ({} bytes): {}",
-                    context,
-                    epoch_num,
-                    len_buf.len(),
-                    e
-                );
-                return;
-            }
-            if let Err(e) = stream.write_all(&proto_buf).await {
-                error!(
-                    "[ANALYZE] UDS ({}) Epoch {}: Failed to write payload ({} bytes): {}",
-                    context,
-                    epoch_num,
-                    proto_buf.len(),
-                    e
-                );
-                return;
-            }
-
-            info!(
-                 "[ANALYZE] UDS ({}) Epoch {}: Successfully sent {} block(s) (Height {}-{}) with {} total transactions (payload size: {} bytes).", // Log range height
-                 context, epoch_num, block_count, min_height, max_height, tx_count, proto_buf.len()
-            );
+impl UdsSender {
+    fn new(socket_path: String) -> Self {
+        Self {
+            socket_path,
+            connection: Arc::new(tokio::sync::Mutex::new(None)),
         }
-        Err(e) => {
-            error!(
-                "[ANALYZE] UDS ({}) Epoch {}: Connection to {} failed: {}",
-                context, epoch_num, socket_path, e
-            );
+    }
+
+    async fn ensure_connected(&self) -> Result<(), String> {
+        let mut conn_guard = self.connection.lock().await;
+
+        // Nếu đã có connection, giữ nguyên (không kiểm tra vì có thể tốn thời gian)
+        if conn_guard.is_some() {
+            return Ok(());
         }
+
+        // Connect nếu chưa có connection
+        match UnixStream::connect(&self.socket_path).await {
+            Ok(stream) => {
+                *conn_guard = Some(stream);
+                debug!(
+                    "[ANALYZE] UDS: Established persistent connection to {}",
+                    self.socket_path
+                );
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "Failed to connect to UDS {}: {}",
+                self.socket_path, e
+            )),
+        }
+    }
+
+    async fn send(
+        &self,
+        epoch_data: comm::CommittedEpochData,
+        context: &str,
+    ) -> Result<(), String> {
+        let epoch_num = epoch_data.blocks.first().map(|b| b.epoch).unwrap_or(0);
+        let block_count = epoch_data.blocks.len();
+        let tx_count: usize = epoch_data.blocks.iter().map(|b| b.transactions.len()).sum();
+        let min_height = epoch_data
+            .blocks
+            .iter()
+            .map(|b| b.height)
+            .min()
+            .unwrap_or(0);
+        let max_height = epoch_data
+            .blocks
+            .iter()
+            .map(|b| b.height)
+            .max()
+            .unwrap_or(0);
+
+        // Ensure connection is established
+        if let Err(e) = self.ensure_connected().await {
+            return Err(e);
+        }
+
+        // Encode data
+        let mut proto_buf = BytesMut::new();
+        epoch_data
+            .encode(&mut proto_buf)
+            .map_err(|e| format!("Failed to encode Protobuf: {}", e))?;
+
+        let len = proto_buf.len();
+        let mut len_buf = BytesMut::new();
+        len_buf.put_u32(len as u32);
+
+        // Write data using persistent connection (retry once if connection broken)
+        let mut retry = false;
+        loop {
+            let mut conn_guard = self.connection.lock().await;
+            if let Some(ref mut stream) = *conn_guard {
+                // Write length
+                if let Err(e) = stream.write_all(&len_buf).await {
+                    warn!(
+                        "[ANALYZE] UDS ({}) Write failed, connection broken: {}. Will reconnect.",
+                        context, e
+                    );
+                    *conn_guard = None;
+                    drop(conn_guard);
+                    if !retry {
+                        retry = true;
+                        if let Err(e) = self.ensure_connected().await {
+                            return Err(format!("Failed to reconnect: {}", e));
+                        }
+                        continue;
+                    } else {
+                        return Err(format!("Failed to write length after retry: {}", e));
+                    }
+                }
+
+                // Write payload
+                if let Err(e) = stream.write_all(&proto_buf).await {
+                    warn!("[ANALYZE] UDS ({}) Write payload failed, connection broken: {}. Will reconnect.", context, e);
+                    *conn_guard = None;
+                    drop(conn_guard);
+                    if !retry {
+                        retry = true;
+                        if let Err(e) = self.ensure_connected().await {
+                            return Err(format!("Failed to reconnect: {}", e));
+                        }
+                        continue;
+                    } else {
+                        return Err(format!("Failed to write payload after retry: {}", e));
+                    }
+                }
+
+                info!(
+                    "[ANALYZE] UDS ({}) Epoch {}: Successfully sent {} block(s) (Height {}-{}) with {} total transactions (payload size: {} bytes).",
+                    context, epoch_num, block_count, min_height, max_height, tx_count, proto_buf.len()
+                );
+                return Ok(());
+            } else {
+                drop(conn_guard);
+                if !retry {
+                    retry = true;
+                    if let Err(e) = self.ensure_connected().await {
+                        return Err(format!("Failed to connect: {}", e));
+                    }
+                    continue;
+                } else {
+                    return Err("Connection not available after retry".to_string());
+                }
+            }
+        }
+    }
+}
+
+// --- Hàm send_to_uds với persistent connection (backward compatible) ---
+// NOTE: Function này không còn được sử dụng trực tiếp, nhưng giữ lại để tương thích
+#[allow(dead_code)]
+async fn send_to_uds(
+    epoch_data: comm::CommittedEpochData,
+    _socket_path: &str, // Keep for backward compatibility but not used
+    context: &str,
+    uds_sender: &Arc<UdsSender>,
+) {
+    if let Err(e) = uds_sender.send(epoch_data, context).await {
+        error!("[ANALYZE] UDS ({}) Failed to send: {}", context, e);
     }
 }

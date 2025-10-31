@@ -978,40 +978,46 @@ impl ConsensusAlgorithm for Bullshark {
         );
 
         // Bullshark commit rule: Check leader of round R-1 based on support in round R.
-        let leader_round_to_check = round.saturating_sub(1); // Round R-1.
+        // Theo mã mẫu: r = round - 1, commit nếu r >= 2 và r % 2 == 0
+        let r = round.saturating_sub(1); // Round R-1
 
         debug!(
             "[Bullshark][E{}] Cert round {}. Checking potential commit for leader round {}",
-            epoch, round, leader_round_to_check
+            epoch, round, r
         );
 
-        // --- Basic Commit Eligibility Checks ---
-        if leader_round_to_check == 0 || leader_round_to_check % 2 != 0 {
+        // --- Basic Commit Eligibility Checks (theo mã mẫu) ---
+        // Bullshark commits leaders every 2 rounds (vs Tusk's 4)
+        // Chỉ commit nếu r >= 2 và r là số chẵn
+        if r % 2 != 0 || r < 2 {
             debug!(
-                "[Bullshark][E{}] Skipping commit check: Leader round {} is genesis or odd.",
-                epoch, leader_round_to_check
+                "[Bullshark][E{}] Skipping commit check: Leader round {} is genesis, odd, or < 2.",
+                epoch, r
             );
             return Ok((Vec::new(), false));
         }
-        if leader_round_to_check <= state.last_committed_round {
+
+        let leader_round = r; // Leader round chính là r (không phải r - 2 như Tusk)
+
+        if leader_round <= state.last_committed_round {
             debug!(
                 "[Bullshark][E{}] Skipping commit check: Leader round {} already committed or earlier (last_committed={})",
-                epoch, leader_round_to_check, state.last_committed_round
+                epoch, leader_round, state.last_committed_round
             );
             return Ok((Vec::new(), false));
         }
 
         // --- Leader Identification ---
         // Use fallback mechanism for RECONFIGURE_INTERVAL rounds to ensure commit even if leader is offline
-        let (leader_digest, leader_cert) = match if leader_round_to_check == RECONFIGURE_INTERVAL {
-            self.leader_with_fallback(leader_round_to_check, &state.dag)
+        let (leader_digest, leader_cert) = match if leader_round == RECONFIGURE_INTERVAL {
+            self.leader_with_fallback(leader_round, &state.dag)
         } else {
-            self.leader(leader_round_to_check, &state.dag)
+            self.leader(leader_round, &state.dag)
         } {
             Some(leader_entry) => {
                 debug!(
                     "[Bullshark][E{}] Found potential leader {} at round {}",
-                    epoch, leader_entry.0, leader_round_to_check
+                    epoch, leader_entry.0, leader_round
                 );
                 leader_entry.clone()
             }
@@ -1019,119 +1025,119 @@ impl ConsensusAlgorithm for Bullshark {
                 metrics.failed_leader_elections += 1;
                 debug!(
                     "[Bullshark][E{}] No leader certificate found in DAG for round {}",
-                    epoch, leader_round_to_check
+                    epoch, leader_round
                 );
                 return Ok((Vec::new(), false));
             }
         };
 
         // --- Support Calculation (Validity Check) ---
-        let support_round = round;
-        let supporting_stake: Stake = match state.dag.get(&support_round) {
-            Some(certs_in_support_round) => certs_in_support_round
-                .values()
-                .filter(|(_, cert)| cert.header.parents.contains(&leader_digest))
-                .map(|(_, cert)| self.committee.stake(&cert.origin()))
-                .sum(),
-            None => {
-                error!(
-                    "[Bullshark][E{}] CRITICAL: Support round (current round) {} missing after adding cert!",
-                    epoch, support_round
-                );
-                0
-            }
-        };
+        // Check support from current round (theo mã mẫu)
+        let supporting_stake: Stake = state
+            .dag
+            .get(&round)
+            .ok_or(ConsensusError::MissingRound(round))?
+            .values()
+            .filter(|(_, x)| x.header.parents.contains(&leader_digest))
+            .map(|(_, x)| self.committee.stake(&x.origin()))
+            .sum();
 
         let required_stake = self.committee.validity_threshold();
 
         if supporting_stake < required_stake {
             debug!(
-                "[Bullshark][E{}] Leader {} at round {} has insufficient support stake ({}/{}) from round {}",
-                 epoch, leader_digest, leader_round_to_check, supporting_stake, required_stake, support_round
+                "[Bullshark][E{}] Leader at round {} has insufficient stake ({}/{})",
+                epoch, leader_round, supporting_stake, required_stake
             );
             return Ok((Vec::new(), false));
         }
 
-        // --- Commit Sequence ---
+        // --- Commit Sequence (theo mã mẫu) ---
+        // Order và commit tất cả leaders trong sequence liên kết
+        // Điều này đảm bảo commit nhiều leaders cùng lúc, không chỉ 1 leader
+        // *** AN TOÀN CHỐNG FORK ***
+        // 1. `order_leaders` chỉ tìm leaders có causal path (`linked` function) - đảm bảo tính nhất quán
+        // 2. Commit từ cũ đến mới (.rev()) - đảm bảo dependencies được commit trước
+        // 3. Check `last_committed_round` trước mỗi commit - ngăn chặn double commit
+        // 4. `state.update` cập nhật `last_committed_round` sau mỗi certificate - đảm bảo tuần tự
         info!(
-            "[Bullshark][E{}] Leader {} at round {} has ENOUGH support stake ({}/{}) from round {}. Initiating commit sequence.",
-             epoch, leader_digest, leader_round_to_check, supporting_stake, required_stake, support_round
+            "[Bullshark][E{}] Committing leader at round {} with stake {}/{}",
+            epoch, leader_round, supporting_stake, required_stake
         );
 
-        let mut committed_sub_dags_result = Vec::new();
+        // Order leaders: tìm tất cả leaders liên kết từ round hiện tại về quá khứ
+        // CRITICAL: `order_leaders` chỉ tìm leaders có causal path (`linked` function)
+        // Điều này đảm bảo tất cả leaders trong sequence đều có quan hệ nhân quả,
+        // ngăn chặn việc commit các leaders không liên kết (có thể gây fork)
         let leaders_in_sequence =
             utils::order_leaders(&leader_cert, state, |r, d| self.leader(r, d));
 
         debug!(
-            "[Bullshark][E{}] Found sequence of {} leaders ending at round {}: {:?}",
+            "[Bullshark][E{}] Found sequence of {} leaders: rounds {:?}",
             epoch,
             leaders_in_sequence.len(),
-            leader_round_to_check,
             leaders_in_sequence
                 .iter()
                 .map(|l| l.round())
                 .collect::<Vec<_>>()
         );
 
-        if let Some(leader_to_commit) = leaders_in_sequence
-            .iter()
-            .find(|l| l.round() > state.last_committed_round)
-        {
-            info!(
-                "[Bullshark][E{}] Attempting to commit newest uncommitted leader: round {}",
-                epoch,
-                leader_to_commit.round()
-            );
-
-            if leader_to_commit.round() % 2 != 0 {
-                warn!("[BUG_TRACE][E{}] CRITICAL: An ODD-numbered leader (round {}) chosen as newest uncommitted is about to be processed!", epoch, leader_to_commit.round());
+        // Commit từng leader trong sequence (theo thứ tự ngược lại: từ cũ đến mới)
+        // CRITICAL: Commit theo thứ tự từ cũ đến mới để đảm bảo dependencies được commit trước
+        // Điều này ngăn chặn fork bằng cách đảm bảo tính nhất quán của causal order
+        let mut committed_sub_dags_result = Vec::new();
+        for leader_to_commit in leaders_in_sequence.iter().rev() {
+            // CRITICAL SAFETY CHECK: Skip nếu đã commit trước đó
+            // Điều này ngăn chặn double commit và đảm bảo idempotency
+            // Lưu ý: `state.last_committed_round` được cập nhật sau mỗi `state.update`,
+            // nên các leaders tiếp theo trong sequence sẽ tự động được check với giá trị mới nhất
+            if leader_to_commit.round() <= state.last_committed_round {
+                debug!(
+                    "[Bullshark][E{}] Skipping leader round {}: already committed (last_committed={})",
+                    epoch, leader_to_commit.round(), state.last_committed_round
+                );
+                continue;
             }
 
-            // [SỬA LỖI] `order_dag` (đã sửa) sẽ lọc ra các certificate đã commit
-            let sub_dag_certificates = utils::order_dag(self.gc_depth, leader_to_commit, state);
+            // Order DAG và commit cho leader này
+            // CRITICAL: `order_dag` sẽ skip các certificates đã commit (check `committed_certificates`)
+            // Điều này đảm bảo không commit lại certificates đã commit trước đó
+            let mut sequence = Vec::new();
+            for x in utils::order_dag(self.gc_depth, leader_to_commit, state) {
+                // CRITICAL: `state.update` cập nhật `last_committed_round` và `committed_certificates`
+                // Điều này đảm bảo các certificates được commit tuần tự và không bị commit lại
+                state.update(&x, self.gc_depth);
+                sequence.push(x);
+            }
 
-            if !sub_dag_certificates.is_empty() {
-                debug!(
-                    "[Bullshark][E{}] Ordered {} certificates for sub-dag of leader {}",
-                    epoch,
-                    sub_dag_certificates.len(),
-                    leader_to_commit.round()
-                );
-
-                // [SỬA LỖI] `state.update` sẽ thêm vào `committed_certificates`
-                for cert in &sub_dag_certificates {
-                    state.update(cert, self.gc_depth);
-                }
-
+            if !sequence.is_empty() {
                 committed_sub_dags_result.push(CommittedSubDag {
                     leader: leader_to_commit.clone(),
-                    certificates: sub_dag_certificates,
+                    certificates: sequence,
                 });
+
                 info!(
                     "[Bullshark][E{}] Successfully committed leader {} at round {}. New last_committed_round: {}",
                     epoch, leader_to_commit.digest(), leader_to_commit.round(), state.last_committed_round
                 );
-            } else {
-                warn!(
-                    "[Bullshark][E{}] Skipping commit for leader {} at round {}: order_dag returned empty list (GC'd or incomplete DAG?)",
-                    epoch, leader_to_commit.digest(), leader_to_commit.round()
-                );
             }
-        } else {
-            debug!(
-                "[Bullshark][E{}] Found leader sequence for round {}, but all leaders in it seem already committed (last_committed={}).",
-                epoch, leader_round_to_check, state.last_committed_round
-            );
         }
 
         let commit_occurred = !committed_sub_dags_result.is_empty();
         if commit_occurred {
-            let total_certs_committed_this_call: u64 = committed_sub_dags_result
+            let total_certs_committed: u64 = committed_sub_dags_result
                 .iter()
                 .map(|d| d.certificates.len() as u64)
                 .sum();
-            metrics.total_certificates_committed += total_certs_committed_this_call;
+            metrics.total_certificates_committed += total_certs_committed;
             metrics.last_committed_round = state.last_committed_round;
+
+            info!(
+                "[Bullshark][E{}] Committed {} leader(s) with {} total certificates",
+                epoch,
+                committed_sub_dags_result.len(),
+                total_certs_committed
+            );
         }
 
         Ok((committed_sub_dags_result, commit_occurred))
@@ -1525,7 +1531,7 @@ impl Consensus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::{Authority, PrimaryAddresses, WorkerAddresses}; // Thêm WorkerAddresses
+    use config::{Authority, PrimaryAddresses};
     use crypto::{
         generate_consensus_keypair, generate_keypair, ConsensusPublicKey, ConsensusSecretKey,
         SecretKey,

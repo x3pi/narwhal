@@ -868,37 +868,53 @@ impl Core {
         
         // *** BULLSHARK LOGIC: Nếu prev_round chưa đạt quorum, chấp nhận headers với partial parents ***
         // Điều này cho phép DAG tiếp tục phát triển ngay cả khi một round chưa đạt quorum
-        // Kiểm tra xem prev_round đã đạt quorum đầy đủ chưa (dựa trên số certificates đã có)
+        // Kiểm tra xem header này có đủ parents để đạt quorum không
+        // QUAN TRỌNG: Kiểm tra dựa trên số parents THỰC TẾ trong header này,
+        // và so sánh với quorum threshold dựa trên số certificates ở round đã commit gần nhất hoặc committee size
         let prev_round_has_full_quorum = if prev_round == 0 {
             true // Genesis luôn có quorum
         } else {
             let committee_guard = self.committee.read().await;
-            let prev_round_cert_count = self
-                .authors_seen_per_round
-                .get(&prev_round)
-                .map(|s| s.len())
-                .unwrap_or(0);
-            let prev_quorum = if prev_round_cert_count > 0 {
-                committee_guard.quorum_threshold_dynamic(prev_round_cert_count)
-            } else {
-                committee_guard.quorum_threshold()
-            };
-            drop(committee_guard);
             
-            // Tính tổng stake của các certificates đã có ở prev_round
-            // Nếu tổng stake >= quorum threshold → đã đạt quorum đầy đủ
-            let committee_guard = self.committee.read().await;
-            let prev_round_stake: Stake = self
-                .authors_seen_per_round
-                .get(&prev_round)
-                .map(|authors| {
-                    authors.iter().map(|author| committee_guard.stake(author)).sum()
+            // Tính tổng stake của các parents THỰC TẾ trong header này (từ prev_round)
+            let parents_stake: Stake = parents
+                .iter()
+                .map(|cert| {
+                    let author = cert.origin();
+                    committee_guard.stake(&author)
                 })
-                .unwrap_or(0);
+                .sum();
+            
+            // Tính quorum threshold cần thiết dựa trên số certificates ở round đã commit gần nhất
+            // Hoặc committee size nếu chưa có commit nào
+            // Điều này đảm bảo tính nhất quán: quorum threshold dựa trên số certificates đã được commit, không phải partial
+            let last_committed_round = self.consensus_round.load(Ordering::Relaxed) as Round;
+            let current_epoch_start_round = (self.epoch.saturating_sub(1)) * RECONFIGURE_INTERVAL;
+            let current_epoch_end_round = current_epoch_start_round + RECONFIGURE_INTERVAL - 1;
+            let last_committed_round_in_current_epoch = last_committed_round > 0 
+                && last_committed_round >= current_epoch_start_round 
+                && last_committed_round <= current_epoch_end_round;
+            
+            let prev_quorum_basis_count = if last_committed_round > 0 && last_committed_round_in_current_epoch {
+                // Dùng số certificates ở round đã commit gần nhất (THUỘC EPOCH HIỆN TẠI)
+                self.authors_seen_per_round
+                    .get(&last_committed_round)
+                    .map(|s| s.len())
+                    .unwrap_or(committee_guard.authorities.len())
+            } else {
+                // Chưa có commit hoặc commit không thuộc epoch hiện tại → dùng committee size
+                committee_guard.authorities.len()
+            };
+            
+            // Tính quorum threshold dựa trên số certificates BAN ĐẦU
+            let prev_quorum_required = committee_guard.quorum_threshold_dynamic(prev_quorum_basis_count);
+            
             drop(committee_guard);
             
-            // Đã đạt quorum đầy đủ nếu tổng stake >= quorum threshold
-            prev_round_stake >= prev_quorum
+            // Đã đạt quorum đầy đủ nếu tổng stake của parents trong header >= quorum threshold BAN ĐẦU
+            // CRITICAL: Kiểm tra dựa trên parents THỰC TẾ trong header và quorum threshold BAN ĐẦU
+            // Nếu header chỉ có 1 parent nhưng quorum threshold ban đầu là 4, thì prev_round chưa đạt quorum đầy đủ
+            parents_stake >= prev_quorum_required
         };
         
         // *** BULLSHARK LOGIC: Quyết định required_stake ***
