@@ -174,22 +174,42 @@ impl ConsensusState {
         if new_overall_last_committed > self.last_committed_round {
             let old_overall_last_committed = self.last_committed_round;
             self.last_committed_round = new_overall_last_committed;
-            info!(
-                "[StateUpdate][E{}] Global last_committed_round advanced from {} to {}",
-                self.epoch, old_overall_last_committed, new_overall_last_committed
-            );
 
-            // Log memory usage
+            // Giảm log verbosity - chỉ log khi có thay đổi đáng kể
+            if new_overall_last_committed % 10 == 0
+                || new_overall_last_committed - old_overall_last_committed > 5
+            {
+                info!(
+                    "[StateUpdate][E{}] Global last_committed_round advanced from {} to {}",
+                    self.epoch, old_overall_last_committed, new_overall_last_committed
+                );
+            } else {
+                debug!(
+                    "[StateUpdate][E{}] Global last_committed_round advanced from {} to {}",
+                    self.epoch, old_overall_last_committed, new_overall_last_committed
+                );
+            }
+
+            // Giảm log memory usage - chỉ log khi có thay đổi đáng kể
             let dag_size = self.dag.len();
             let committed_size = self.committed_certificates.len();
-            info!(
-                "[Consensus][E{}] Memory usage: DAG rounds: {}, Committed certs: {}",
-                self.epoch, dag_size, committed_size
-            );
+            if new_overall_last_committed % 10 == 0
+                || new_overall_last_committed - old_overall_last_committed > 5
+            {
+                info!(
+                    "[Consensus][E{}] Memory usage: DAG rounds: {}, Committed certs: {}",
+                    self.epoch, dag_size, committed_size
+                );
+            } else {
+                debug!(
+                    "[Consensus][E{}] Memory usage: DAG rounds: {}, Committed certs: {}",
+                    self.epoch, dag_size, committed_size
+                );
+            }
 
             // Tính toán round để dọn dẹp (GC)
             let minimum_round_to_keep = self.last_committed_round.saturating_sub(gc_depth);
-            debug!(
+            trace!(
                    "[GC][E{}] Performing GC: Keeping rounds >= {}. (Current last_committed_round: {}, gc_depth: {})",
                     self.epoch, minimum_round_to_keep, self.last_committed_round, gc_depth
               );
@@ -1159,11 +1179,57 @@ impl ConsensusAlgorithm for Bullshark {
             // CRITICAL: `order_dag` sẽ skip các certificates đã commit (check `committed_certificates`)
             // Điều này đảm bảo không commit lại certificates đã commit trước đó
             let mut sequence = Vec::new();
-            for x in utils::order_dag(self.gc_depth, leader_to_commit, state) {
-                // CRITICAL: `state.update` cập nhật `last_committed_round` và `committed_certificates`
-                // Điều này đảm bảo các certificates được commit tuần tự và không bị commit lại
-                state.update(&x, self.gc_depth);
-                sequence.push(x);
+            let ordered_certs = utils::order_dag(self.gc_depth, leader_to_commit, state);
+
+            // OPTIMIZATION: Batch update để giảm số lần gọi GC
+            // Thay vì gọi state.update() cho mỗi certificate (gây GC quá nhiều),
+            // ta chỉ cập nhật state một lần sau khi commit tất cả certificates trong sub-dag
+            let mut max_committed_round = state.last_committed_round;
+
+            for x in &ordered_certs {
+                // Chỉ cập nhật tracking structures, không trigger GC
+                let cert_round = x.round();
+                let cert_origin = x.origin();
+
+                // Cập nhật last_committed cho author
+                state
+                    .last_committed
+                    .entry(cert_origin)
+                    .and_modify(|current_round| *current_round = max(*current_round, cert_round))
+                    .or_insert(cert_round);
+
+                // Ghi lại digest và round của certificate đã commit
+                state.committed_certificates.insert(x.digest(), cert_round);
+
+                // Track max round để trigger GC sau
+                max_committed_round = max_committed_round.max(cert_round);
+
+                sequence.push(x.clone());
+            }
+
+            // Chỉ trigger GC một lần sau khi commit tất cả certificates trong sub-dag
+            if max_committed_round > state.last_committed_round {
+                let old_committed = state.last_committed_round;
+                state.last_committed_round = max_committed_round;
+
+                // Perform GC only once per sub-dag commit
+                let minimum_round_to_keep =
+                    state.last_committed_round.saturating_sub(self.gc_depth);
+
+                // Dọn dẹp DAG
+                state
+                    .dag
+                    .retain(|r, _| *r == 0 || *r >= minimum_round_to_keep);
+
+                // Dọn dẹp committed_certificates
+                state
+                    .committed_certificates
+                    .retain(|_digest, round| *round >= minimum_round_to_keep);
+
+                debug!(
+                    "[Bullshark][E{}] GC performed after committing sub-dag: last_committed_round {} -> {}",
+                    epoch, old_committed, state.last_committed_round
+                );
             }
 
             if !sequence.is_empty() {
