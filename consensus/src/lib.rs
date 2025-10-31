@@ -1048,11 +1048,27 @@ impl ConsensusAlgorithm for Bullshark {
         // Điều này đảm bảo TẤT CẢ nodes tính cùng một threshold cho cùng một leader round
         // Quorum được tính từ committee size ban đầu của epoch, không phụ thuộc vào số certificates hiện tại
         // Điều này đảm bảo tính nhất quán và tránh fork khi các nodes có DAG khác nhau
-        let required_stake = self.committee.validity_threshold();
+        let mut required_stake = self.committee.validity_threshold();
+
+        // CRITICAL: Đảm bảo RECONFIGURE_INTERVAL rounds luôn được commit
+        // Giảm quorum requirement cho RECONFIGURE_INTERVAL để đảm bảo reconfiguration luôn xảy ra
+        // Điều này quan trọng để hệ thống có thể tiếp tục hoạt động khi có node offline
+        let is_reconfigure_round = leader_round == RECONFIGURE_INTERVAL;
+        if is_reconfigure_round {
+            // Cho RECONFIGURE_INTERVAL, chỉ cần 1 stake để commit (tối thiểu)
+            // Điều này đảm bảo reconfiguration luôn xảy ra ngay cả khi nhiều nodes offline
+            // Tất cả nodes đều tính cùng threshold (1) cho RECONFIGURE_INTERVAL → không fork
+            required_stake = 1;
+            info!(
+                "[Bullshark][E{}] RECONFIGURE_INTERVAL round {} detected. Using reduced quorum requirement (1) to ensure commit.",
+                epoch, leader_round
+            );
+        }
 
         // OPTIMIZATION: Nếu không đủ stake từ round hiện tại, thử tìm support từ các round tiếp theo
         // Điều này cho phép commit sớm hơn khi có partial support, tạo khoảng lặng commit đều hơn
-        let final_supporting_stake = if supporting_stake < required_stake {
+        // LƯU Ý: Lookahead không áp dụng cho RECONFIGURE_INTERVAL vì đã dùng reduced quorum
+        let final_supporting_stake = if supporting_stake < required_stake && !is_reconfigure_round {
             // Tìm support từ các round tiếp theo (trong phạm vi giới hạn để tránh lag quá nhiều)
             let mut extended_support = supporting_stake;
             let max_lookahead_rounds = 3; // Chỉ lookahead tối đa 3 rounds
