@@ -33,7 +33,7 @@ class CommandMaker:
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
         # SỬA ĐỔI: Thêm tham số --uds-socket cố định
-        UDS_SOCKET_PATH = '/tmp/rust-go.sock_1'
+        UDS_SOCKET_PATH = '/tmp/block.sock_1'
         return (f'./node {v} run --keys {keys} --committee {committee} '
                 f'--store {store} --parameters {parameters} '
                 f'--uds-socket {UDS_SOCKET_PATH} primary') # <--- Đã thêm
@@ -46,7 +46,7 @@ class CommandMaker:
         assert isinstance(debug, bool)
         v = '-vvv' if debug else '-vv'
         # SỬA ĐỔI: Thêm tham số --uds-socket cố định
-        UDS_SOCKET_PATH = '/tmp/rust-go.sock_1'
+        UDS_SOCKET_PATH = '/tmp/block.sock_1'
         return (f'./node {v} run --keys {keys} --committee {committee} '
                 f'--store {store} --parameters {parameters} '
                 f'--uds-socket {UDS_SOCKET_PATH} worker --id {id}') # <--- Đã thêm
