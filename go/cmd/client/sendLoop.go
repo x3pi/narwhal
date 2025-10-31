@@ -22,7 +22,7 @@ func createRandomTransaction(randomValue uint64, size int) []byte {
 }
 
 func main() {
-	nodeAddress := "127.0.0.1:4008"       // Địa chỉ worker node
+	nodeAddress := "127.0.0.1:4011"       // Địa chỉ worker node
 	transactionSize := 128                // Kích thước giao dịch
 	sendInterval := 10 * time.Millisecond // Thời gian chờ giữa mỗi lần gửi
 

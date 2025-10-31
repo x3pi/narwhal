@@ -404,6 +404,66 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         }
     }
 
+    /// Gửi block (có thể trống) qua Unix socket
+    async fn send_block(
+        stream: &mut UnixStream,
+        round: u64,
+        transactions: Vec<comm::Transaction>,
+        node_id: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let committed_block = comm::CommittedBlock {
+            epoch: round,
+            height: round,
+            transactions,
+        };
+
+        let epoch_data = comm::CommittedEpochData {
+            blocks: vec![committed_block],
+        };
+
+        let mut proto_buf = BytesMut::new();
+        epoch_data
+            .encode(&mut proto_buf)
+            .expect("FATAL: Protobuf serialization failed!");
+
+        let mut len_buf = BytesMut::new();
+        put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
+        if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
+            log::info!(
+                "[ANALYZE] Node ID {} SENDING EMPTY BLOCK (fake) for round {}.",
+                node_id,
+                round
+            );
+        } else {
+            log::info!(
+                "[ANALYZE] Node ID {} SENDING BLOCK with {} transactions for round {}.",
+                node_id,
+                epoch_data.blocks[0].transactions.len(),
+                round
+            );
+        }
+
+        log::info!(
+            "[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.",
+            node_id,
+            len_buf.len(),
+            proto_buf.len(),
+            round
+        );
+
+        stream.write_all(&len_buf).await?;
+        stream.write_all(&proto_buf).await?;
+
+        log::info!(
+            "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
+            node_id,
+            round
+        );
+
+        Ok(())
+    }
+
     let socket_path: String = format!("/tmp/executor{}.sock", node_id);
     log::info!(
         "[ANALYZE] Node ID {} attempting to connect to {}",
@@ -433,9 +493,12 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         }
     };
     log::info!(
-        "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
+        "[ANALYZE] Node ID {} entering loop to wait for committed blocks. Only even rounds will be sent.",
         node_id
     );
+
+    // Track round chẵn hiện tại đang chờ (bắt đầu từ 0)
+    let mut expected_even_round: u64 = 0;
 
     while let Some(certificate) = rx_output.recv().await {
         let new_round = certificate.header.round;
@@ -445,7 +508,6 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
 
         match bincode::serialize(&state) {
             Ok(bytes) => {
-                // write() trả về (), không cần match
                 store.write(ConsensusState::STATE_KEY.to_vec(), bytes).await;
                 info!("[ANALYZE] Saved new last committed round: {}", new_round);
             }
@@ -457,118 +519,130 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
             }
         }
 
-        // KẾT THÚC CẬP NHẬT
-
         log::info!(
             "[ANALYZE] Node ID {} RECEIVED certificate for round {} from consensus.",
             node_id,
             certificate.header.round
         );
-        // ... (phần còn lại của analyze không đổi)
-        let mut all_transactions = Vec::new();
 
-        for (digest, worker_id) in certificate.header.payload {
-            match store.read(digest.to_vec()).await {
-                Ok(Some(serialized_batch_message)) => {
-                    match bincode::deserialize(&serialized_batch_message) {
-                        Ok(WorkerMessage::Batch(batch)) => {
-                            log::debug!(
-                                "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
-                                digest,
-                                batch.len(),
-                                worker_id
-                            );
-                            for tx_data in batch {
-                                all_transactions.push(comm::Transaction {
-                                    digest: tx_data,
-                                    worker_id: worker_id as u32,
-                                });
-                            }
-                        }
-                        Ok(_) => {
-                            log::warn!(
-                                "[ANALYZE] Digest {} did not correspond to a Batch message.",
-                                digest
-                            );
-                        }
-                        Err(e) => {
-                            log::error!(
-                                "[ANALYZE] Failed to deserialize message for digest {}: {}",
-                                digest,
-                                e
-                            );
-                        }
-                    }
-                }
-                Ok(None) => {
-                    log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
-                }
-                Err(e) => {
+        let cert_round = certificate.header.round;
+
+        // Tìm round chẵn lớn nhất <= cert_round
+        let last_even_round = if cert_round % 2 == 0 {
+            cert_round
+        } else {
+            cert_round - 1
+        };
+
+        // Kiểm tra và tạo block fake trống cho các round chẵn bị bỏ qua
+        // Chỉ xử lý nếu có round chẵn cần xử lý
+        if last_even_round >= expected_even_round {
+            // Tạo block fake trống cho các round chẵn bị bỏ qua (từ expected_even_round đến last_even_round-2)
+            let mut current_even = expected_even_round;
+            while current_even < last_even_round {
+                // Round chẵn bị bỏ qua - tạo block fake trống
+                log::warn!(
+                    "[ANALYZE] Node ID {}: Round {} (even) was skipped, creating fake empty block.",
+                    node_id,
+                    current_even
+                );
+                if let Err(e) = send_block(&mut stream, current_even, Vec::new(), node_id).await {
                     log::error!(
-                        "[ANALYZE] Failed to read batch for digest {}: {}",
-                        digest,
+                        "[ANALYZE] FATAL: Node ID {}: Failed to send fake empty block for round {}: {}",
+                        node_id,
+                        current_even,
                         e
                     );
+                    break;
+                }
+                current_even += 2; // Chỉ xử lý round chẵn, tăng 2
+            }
+            // Cập nhật expected_even_round để chuẩn bị xử lý round hiện tại
+            expected_even_round = last_even_round;
+        }
+
+        // Chỉ xử lý và gửi block ở round chẵn
+        if cert_round % 2 == 0 {
+            if cert_round < expected_even_round {
+                // Round này đã được xử lý (có thể do duplicate hoặc out-of-order)
+                log::debug!(
+                    "[ANALYZE] Node ID {}: Round {} already processed, skipping.",
+                    node_id,
+                    cert_round
+                );
+                continue;
+            }
+
+            // Thu thập tất cả transactions từ certificate
+            let mut all_transactions = Vec::new();
+
+            for (digest, worker_id) in certificate.header.payload {
+                match store.read(digest.to_vec()).await {
+                    Ok(Some(serialized_batch_message)) => {
+                        match bincode::deserialize(&serialized_batch_message) {
+                            Ok(WorkerMessage::Batch(batch)) => {
+                                log::debug!(
+                                    "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
+                                    digest,
+                                    batch.len(),
+                                    worker_id
+                                );
+                                for tx_data in batch {
+                                    all_transactions.push(comm::Transaction {
+                                        digest: tx_data,
+                                        worker_id: worker_id as u32,
+                                    });
+                                }
+                            }
+                            Ok(_) => {
+                                log::warn!(
+                                    "[ANALYZE] Digest {} did not correspond to a Batch message.",
+                                    digest
+                                );
+                            }
+                            Err(e) => {
+                                log::error!(
+                                    "[ANALYZE] Failed to deserialize message for digest {}: {}",
+                                    digest,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "[ANALYZE] Failed to read batch for digest {}: {}",
+                            digest,
+                            e
+                        );
+                    }
                 }
             }
-        }
 
-        let committed_block = comm::CommittedBlock {
-            epoch: certificate.header.round,
-            height: certificate.header.round,
-            transactions: all_transactions,
-        };
+            // Gửi block với transactions (có thể trống nếu không có transactions)
+            if let Err(e) = send_block(&mut stream, cert_round, all_transactions, node_id).await {
+                log::error!(
+                    "[ANALYZE] FATAL: Node ID {}: Failed to send block for round {}: {}",
+                    node_id,
+                    cert_round,
+                    e
+                );
+                break;
+            }
 
-        let epoch_data = comm::CommittedEpochData {
-            blocks: vec![committed_block],
-        };
-
-        log::debug!(
-            "[ANALYZE] Node ID {} serializing data for round {}",
-            node_id,
-            certificate.header.round
-        );
-        let mut proto_buf = BytesMut::new();
-        epoch_data
-            .encode(&mut proto_buf)
-            .expect("FATAL: Protobuf serialization failed!");
-
-        let mut len_buf = BytesMut::new();
-        put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
-
-        if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
-            log::info!(
-                "[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.",
+            // Cập nhật expected_even_round cho round chẵn tiếp theo
+            expected_even_round = cert_round + 2;
+        } else {
+            // Round lẻ - không gửi block, chỉ log
+            log::debug!(
+                "[ANALYZE] Node ID {}: Round {} is odd, skipping block creation.",
                 node_id,
-                certificate.header.round
+                cert_round
             );
         }
-
-        log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
-
-        if let Err(e) = stream.write_all(&len_buf).await {
-            log::error!(
-                "[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}",
-                node_id,
-                e
-            );
-            break;
-        }
-
-        if let Err(e) = stream.write_all(&proto_buf).await {
-            log::error!(
-                "[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}",
-                node_id,
-                e
-            );
-            break;
-        }
-
-        log::info!(
-            "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
-            node_id,
-            certificate.header.round
-        );
     }
 
     log::warn!(
