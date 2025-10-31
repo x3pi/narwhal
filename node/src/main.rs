@@ -792,10 +792,13 @@ async fn finalize_and_send_epoch(
     let mut committed_even_rounds: Vec<Round> = Vec::new(); // Track các round chẵn đã commit trong batch này
 
     let max_leader_round = dags.iter().map(|d| d.leader.round()).max().unwrap_or(0);
-    info!(
-        "[ANALYZE] Processing {} committed sub-dag(s) individually for epoch {} (Max Leader Round: {}).",
-        dags.len(), epoch, max_leader_round,
-    );
+    // Log chỉ khi xử lý nhiều dags hoặc debug
+    if dags.len() > 1 {
+        info!(
+            "[ANALYZE] Processing {} committed sub-dag(s) individually for epoch {} (Max Leader Round: {}).",
+            dags.len(), epoch, max_leader_round,
+        );
+    }
 
     for sub_dag in &dags {
         let consensus_commit_round = sub_dag.leader.round();
@@ -815,13 +818,17 @@ async fn finalize_and_send_epoch(
 
         let block_number_absolute = (epoch.saturating_sub(1)) * BLOCKS_PER_EPOCH + height_relative;
 
-        info!(
+        // Giảm log verbosity để tăng hiệu suất
+        debug!(
             "[ANALYZE] Creating block #{} for epoch {} (from consensus round {}).",
             block_number_absolute, epoch, consensus_commit_round
         );
 
         let mut block_transactions = Vec::new();
-        // ... (Logic xử lý transactions không đổi) ...
+
+        // Xử lý certificates và đọc batches một cách hiệu quả
+        // Collect tất cả batch digests trước để có thể batch read nếu store hỗ trợ
+        let mut batch_digests: Vec<(crypto::Digest, u32)> = Vec::new();
         for certificate in &sub_dag.certificates {
             if certificate.epoch() != epoch {
                 warn!(
@@ -834,39 +841,44 @@ async fn finalize_and_send_epoch(
                 continue;
             }
             for (digest, worker_id) in &certificate.header.payload {
-                match store.read(digest.to_vec()).await {
-                    Ok(Some(serialized_batch)) => {
-                        match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
-                            Ok(WorkerMessage::Batch(batch)) => {
-                                for tx_data in batch {
-                                    if committed_tx_digests.insert(tx_data.clone()) {
-                                        block_transactions.push(comm::Transaction {
-                                            digest: tx_data.clone(),
-                                            worker_id: *worker_id as u32,
-                                        });
-                                    } else {
-                                        debug!("[ANALYZE] Skipping duplicate transaction {} (already sent this epoch).", hex::encode(&tx_data));
-                                    }
+                batch_digests.push((digest.clone(), *worker_id));
+            }
+        }
+
+        // Đọc batches tuần tự nhưng tối ưu bằng cách giảm overhead
+        for (digest, worker_id) in batch_digests {
+            match store.read(digest.to_vec()).await {
+                Ok(Some(serialized_batch)) => {
+                    match bincode::deserialize::<WorkerMessage>(&serialized_batch) {
+                        Ok(WorkerMessage::Batch(batch)) => {
+                            for tx_data in batch {
+                                if committed_tx_digests.insert(tx_data.clone()) {
+                                    block_transactions.push(comm::Transaction {
+                                        digest: tx_data.clone(),
+                                        worker_id: worker_id as u32,
+                                    });
+                                } else {
+                                    debug!("[ANALYZE] Skipping duplicate transaction {} (already sent this epoch).", hex::encode(&tx_data));
                                 }
                             }
-                            Ok(_) => warn!(
-                                "[ANALYZE] Deserialized unexpected WorkerMessage type for batch {}",
-                                digest
-                            ),
-                            Err(e) => {
-                                warn!("[ANALYZE] Failed to deserialize batch {}: {}", digest, e)
-                            }
+                        }
+                        Ok(_) => warn!(
+                            "[ANALYZE] Deserialized unexpected WorkerMessage type for batch {}",
+                            digest
+                        ),
+                        Err(e) => {
+                            warn!("[ANALYZE] Failed to deserialize batch {}: {}", digest, e)
                         }
                     }
-                    Ok(None) => {
-                        warn!("[ANALYZE] Batch {} referenced in committed certificate {} not found in store!", digest, certificate.digest());
-                    }
-                    Err(e) => {
-                        error!("[ANALYZE] Error reading batch {} from store: {}", digest, e);
-                    }
+                }
+                Ok(None) => {
+                    warn!("[ANALYZE] Batch {} referenced in committed certificate not found in store!", digest);
+                }
+                Err(e) => {
+                    error!("[ANALYZE] Error reading batch {} from store: {}", digest, e);
                 }
             }
-        } // end cert loop
+        }
 
         blocks_to_send.push(comm::CommittedBlock {
             epoch,

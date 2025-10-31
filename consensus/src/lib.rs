@@ -1033,6 +1033,8 @@ impl ConsensusAlgorithm for Bullshark {
 
         // --- Support Calculation (Validity Check) ---
         // Check support from current round (theo mã mẫu)
+        // OPTIMIZATION: Cho phép commit với support stake thấp hơn một chút để tạo khoảng lặng commit đều hơn
+        // Nếu round hiện tại không có đủ stake, thử kiểm tra support từ các round tiếp theo (trong phạm vi giới hạn)
         let supporting_stake: Stake = state
             .dag
             .get(&round)
@@ -1044,10 +1046,44 @@ impl ConsensusAlgorithm for Bullshark {
 
         let required_stake = self.committee.validity_threshold();
 
-        if supporting_stake < required_stake {
+        // OPTIMIZATION: Nếu không đủ stake từ round hiện tại, thử tìm support từ các round tiếp theo
+        // Điều này cho phép commit sớm hơn khi có partial support, tạo khoảng lặng commit đều hơn
+        let final_supporting_stake = if supporting_stake < required_stake {
+            // Tìm support từ các round tiếp theo (trong phạm vi giới hạn để tránh lag quá nhiều)
+            let mut extended_support = supporting_stake;
+            let max_lookahead_rounds = 3; // Chỉ lookahead tối đa 3 rounds
+
+            for lookahead in 1..=max_lookahead_rounds {
+                let lookahead_round = round + lookahead as Round;
+                if let Some(certs_in_round) = state.dag.get(&lookahead_round) {
+                    let lookahead_support: Stake = certs_in_round
+                        .values()
+                        .filter(|(_, x)| x.header.parents.contains(&leader_digest))
+                        .map(|(_, x)| self.committee.stake(&x.origin()))
+                        .sum();
+
+                    extended_support += lookahead_support;
+
+                    // Nếu đã đủ stake, dừng lại
+                    if extended_support >= required_stake {
+                        debug!(
+                            "[Bullshark][E{}] Found sufficient support ({}/{}) for leader round {} with lookahead {} rounds",
+                            epoch, extended_support, required_stake, leader_round, lookahead
+                        );
+                        break;
+                    }
+                }
+            }
+
+            extended_support
+        } else {
+            supporting_stake
+        };
+
+        if final_supporting_stake < required_stake {
             debug!(
                 "[Bullshark][E{}] Leader at round {} has insufficient stake ({}/{})",
-                epoch, leader_round, supporting_stake, required_stake
+                epoch, leader_round, final_supporting_stake, required_stake
             );
             return Ok((Vec::new(), false));
         }
@@ -1062,7 +1098,7 @@ impl ConsensusAlgorithm for Bullshark {
         // 4. `state.update` cập nhật `last_committed_round` sau mỗi certificate - đảm bảo tuần tự
         info!(
             "[Bullshark][E{}] Committing leader at round {} with stake {}/{}",
-            epoch, leader_round, supporting_stake, required_stake
+            epoch, leader_round, final_supporting_stake, required_stake
         );
 
         // Order leaders: tìm tất cả leaders liên kết từ round hiện tại về quá khứ
