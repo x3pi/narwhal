@@ -8,7 +8,7 @@ use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::warn;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
@@ -172,6 +172,24 @@ impl Proposer {
 
         if deduplicated_payload.is_empty() {
             debug!("No payload to include in header for round {}", self.round);
+            // Still create an empty header if we have parents (for round advancement)
+            // This is needed for empty rounds where no batches are available
+            if !self.last_parents.is_empty() {
+                let header = Header::new(
+                    self.name,
+                    self.round,
+                    BTreeMap::new(),
+                    self.last_parents.drain(..).collect(),
+                    &mut self.signature_service,
+                )
+                .await;
+                debug!("Created empty header {:?}", header);
+                self.tx_core
+                    .send(header)
+                    .await
+                    .expect("Failed to send header");
+                return true;
+            }
             return false;
         }
 
