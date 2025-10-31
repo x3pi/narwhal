@@ -7,6 +7,7 @@ use crypto::{Digest, PublicKey, SignatureService};
 use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
+use log::warn;
 use std::collections::{HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -65,6 +66,8 @@ pub struct Proposer {
     pending_payload_size: usize,
     /// Track the latest committed round to help decide when to retry stale payloads.
     latest_committed_round: Round,
+    /// Track digests that have been committed to avoid re-proposing them.
+    committed_digests: HashSet<Digest>,
 }
 
 impl Proposer {
@@ -104,6 +107,7 @@ impl Proposer {
                 digests: VecDeque::with_capacity(2 * header_size.max(1)),
                 pending_payload_size: 0,
                 latest_committed_round: 0,
+                committed_digests: HashSet::new(),
             }
             .run()
             .await;
@@ -112,11 +116,42 @@ impl Proposer {
 
     async fn make_header(&mut self) -> bool {
         let payload: Vec<(Digest, WorkerId)> = self.collect_payload_for_header();
+
+        // Final check: ensure no duplicates in payload before creating header
+        let mut seen = HashSet::new();
+        let mut deduplicated_payload = Vec::new();
+        let mut duplicates_found = 0;
+
+        for (digest, worker_id) in payload {
+            if seen.contains(&digest) {
+                duplicates_found += 1;
+                debug!(
+                    "Removing duplicate digest {} from header payload for round {}",
+                    digest, self.round
+                );
+                continue;
+            }
+            seen.insert(digest.clone());
+            deduplicated_payload.push((digest, worker_id));
+        }
+
+        if duplicates_found > 0 {
+            warn!(
+                "Found {} duplicate digests in header payload for round {}, removed them",
+                duplicates_found, self.round
+            );
+        }
+
+        if deduplicated_payload.is_empty() {
+            debug!("No payload to include in header for round {}", self.round);
+            return false;
+        }
+
         // Make a new header.
         let header = Header::new(
             self.name,
             self.round,
-            payload.into_iter().collect(),
+            deduplicated_payload.into_iter().collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,
         )
@@ -140,14 +175,31 @@ impl Proposer {
     fn collect_payload_for_header(&mut self) -> Vec<(Digest, WorkerId)> {
         let mut collected = Vec::new();
         let mut accumulated_size = 0usize;
+        let mut seen_digests = HashSet::new(); // Track digests in this header to avoid duplicates
 
         for entry in self.digests.iter_mut() {
             if accumulated_size >= self.header_size {
                 break;
             }
 
+            // Skip if already committed
+            if self.committed_digests.contains(&entry.digest) {
+                entry.state = BatchState::Committed;
+                continue;
+            }
+
+            // Skip if already added to this header (duplicate check)
+            if seen_digests.contains(&entry.digest) {
+                debug!(
+                    "Skipping duplicate digest {} in header payload for round {}",
+                    entry.digest, self.round
+                );
+                continue;
+            }
+
             if matches!(entry.state, BatchState::Pending) {
                 accumulated_size += entry.size;
+                seen_digests.insert(entry.digest.clone());
                 collected.push((entry.digest.clone(), entry.worker_id));
                 entry.state = BatchState::InFlight {
                     round: self.round,
@@ -165,6 +217,11 @@ impl Proposer {
 
         if committed.digests.is_empty() {
             return;
+        }
+
+        // Add all committed digests to the tracking set
+        for digest in &committed.digests {
+            self.committed_digests.insert(digest.clone());
         }
 
         let committed_set: HashSet<_> = committed.digests.into_iter().collect();
@@ -188,6 +245,12 @@ impl Proposer {
 
         for entry in self.digests.iter_mut() {
             if let BatchState::InFlight { round, sent_at } = entry.state {
+                // Skip if already committed
+                if self.committed_digests.contains(&entry.digest) {
+                    entry.state = BatchState::Committed;
+                    continue;
+                }
+
                 if now.duration_since(sent_at) >= self.retry_delay
                     || self.latest_committed_round > round
                 {
@@ -255,6 +318,12 @@ impl Proposer {
                     self.last_parents = parents;
                 }
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
+                    // Skip if already committed
+                    if self.committed_digests.contains(&digest) {
+                        debug!("Skipping batch {} - already committed", digest);
+                        continue;
+                    }
+
                     // Store the batch in the primary's store for the `analyze` function to find.
                     let size = digest.size();
 
