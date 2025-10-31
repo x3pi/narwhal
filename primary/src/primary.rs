@@ -33,6 +33,12 @@ pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 pub const CHANNEL_CAPACITY: usize = 1_000;
 pub type Round = u64;
 
+#[derive(Debug, Clone)]
+pub struct CommittedBatches {
+    pub round: Round,
+    pub digests: Vec<Digest>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub enum PrimaryMessage {
     Header(Header),
@@ -76,6 +82,7 @@ impl Primary {
         let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_committed_batches, rx_committed_batches) = channel(CHANNEL_CAPACITY);
         let payload_cache = Arc::new(DashMap::new());
 
         parameters.log();
@@ -158,7 +165,13 @@ impl Primary {
             tx_parents,
         );
 
-        GarbageCollector::spawn(&name, &committee, consensus_round.clone(), rx_consensus);
+        GarbageCollector::spawn(
+            &name,
+            &committee,
+            consensus_round.clone(),
+            rx_consensus,
+            tx_committed_batches.clone(),
+        );
 
         PayloadReceiver::spawn(store.clone(), payload_cache.clone(), rx_others_digests);
 
@@ -187,8 +200,10 @@ impl Primary {
             store.clone(),
             parameters.header_size,
             parameters.max_header_delay,
+            parameters.sync_retry_delay,
             rx_parents,
             rx_our_digests,
+            rx_committed_batches,
             tx_headers,
         );
 

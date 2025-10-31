@@ -4,10 +4,9 @@ use crate::primary::Round;
 use config::{Committee, WorkerId};
 use crypto::{ConsensusPublicKey, Digest, Hash, PublicKey, Signature, SignatureService};
 use serde::{Deserialize, Serialize};
-use sha3::{Digest as Sha3Digest};
+use sha3::Digest as Sha3Digest;
 use sha3::Sha3_512 as Sha512;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
-use std::convert::TryInto;
 use std::fmt;
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -98,7 +97,10 @@ impl Hash for Header {
         for x in &self.parents {
             hasher.update(x.as_ref());
         }
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        let hash = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&hash[..32]);
+        Digest(bytes)
     }
 }
 
@@ -170,7 +172,10 @@ impl Hash for Vote {
         hasher.update(self.id.as_ref());
         hasher.update(self.round.to_le_bytes());
         hasher.update(self.origin.as_ref());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        let hash = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&hash[..32]);
+        Digest(bytes)
     }
 }
 
@@ -262,7 +267,10 @@ impl Hash for Certificate {
         hasher.update(self.header.id.as_ref());
         hasher.update(self.round().to_le_bytes());
         hasher.update(self.origin().as_ref());
-        Digest(hasher.finalize().as_slice()[..32].try_into().unwrap())
+        let hash = hasher.finalize();
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&hash[..32]);
+        Digest(bytes)
     }
 }
 

@@ -6,7 +6,6 @@ use crate::common::{listener, serialized_batch};
 use bytes::Bytes;
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
-use std::convert::TryInto;
 use std::fs;
 use tokio::sync::mpsc::channel;
 
@@ -24,11 +23,10 @@ async fn hash_and_store() {
     let id = 0;
 
     // Tính toán digest và tạo message kỳ vọng.
-    let digest = Digest(
-        Sha512::digest(&batch_data).as_slice()[..32]
-            .try_into()
-            .unwrap(),
-    );
+    let hash = Sha512::digest(&batch_data);
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&hash[..32]);
+    let digest = Digest(bytes);
     let expected_message = WorkerPrimaryMessage::OurBatch(digest.clone(), id, batch_data.clone());
     let expected_serialized = bincode::serialize(&expected_message)
         .expect("Failed to serialize our own worker-primary message");

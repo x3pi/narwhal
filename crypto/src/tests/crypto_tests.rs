@@ -9,7 +9,10 @@ use sha3::{Digest as Sha3DigestTrait, Sha3_512};
 
 impl Hash for &[u8] {
     fn digest(&self) -> Digest {
-        Digest(Sha3_512::digest(self).as_slice()[..32].try_into().unwrap())
+        let hash = Sha3_512::digest(self);
+        let mut bytes = [0u8; 32];
+        bytes.copy_from_slice(&hash[..32]);
+        Digest(bytes)
     }
 }
 
@@ -35,9 +38,10 @@ pub fn keys() -> Vec<(PublicKey, SecretKey)> {
 /// Fixture for generating consensus keypairs (BLS12-381).
 pub fn consensus_keys() -> Vec<(ConsensusPublicKey, ConsensusSecretKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
-    (0..4).map(|_| generate_consensus_keypair(&mut rng)).collect()
+    (0..4)
+        .map(|_| generate_consensus_keypair(&mut rng))
+        .collect()
 }
-
 
 // ##################################################################
 // ### Network Identity Key Tests (secp256k1)                     ###
@@ -149,4 +153,3 @@ async fn signature_service() {
     // Verify the signature we received.
     assert!(signature.verify(&digest, &public_key).is_ok());
 }
-

@@ -294,21 +294,28 @@ impl Core {
 
         // Quick check: Đọc consensus state để tránh gửi certificate đã commit
         let consensus_state_key = b"consensus_state".to_vec();
-      if let Ok(Some(bytes)) = self.store.read(consensus_state_key.clone()).await {
-          #[derive(serde::Deserialize)]
-          struct ConsensusState {
-              last_committed_round: Round,
-          }
-          if let Ok(state) = bincode::deserialize::<ConsensusState>(&bytes) {
-              if certificate.round() <= state.last_committed_round {
-                  debug!("Certificate {} already committed (round {} <= {}), skipping consensus", 
-                         certificate.digest(), certificate.round(), state.last_committed_round);
-                  return Ok(());
-              }
-          }
-      }
+        if let Ok(Some(bytes)) = self.store.read(consensus_state_key.clone()).await {
+            #[derive(serde::Deserialize)]
+            struct ConsensusState {
+                last_committed_round: Round,
+            }
+            if let Ok(state) = bincode::deserialize::<ConsensusState>(&bytes) {
+                if certificate.round() <= state.last_committed_round {
+                    debug!(
+                        "Certificate {} already committed (round {} <= {}), skipping consensus",
+                        certificate.digest(),
+                        certificate.round(),
+                        state.last_committed_round
+                    );
+                    return Ok(());
+                }
+            }
+        }
 
-        log::info!("Sending certificate {:?} to consensus", certificate.digest());
+        log::info!(
+            "Sending certificate {:?} to consensus",
+            certificate.digest()
+        );
 
         // Send it to the consensus layer.
         let id = certificate.header.id.clone();

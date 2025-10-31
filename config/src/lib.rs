@@ -1,9 +1,10 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crypto::{
-    generate_consensus_keypair, generate_production_keypair, ConsensusPublicKey, ConsensusSecretKey,
-    PublicKey, SecretKey,
+    generate_consensus_keypair, generate_production_keypair, ConsensusPublicKey,
+    ConsensusSecretKey, PublicKey, SecretKey,
 };
 use log::info;
+use rand::SeedableRng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -12,7 +13,6 @@ use std::io::BufWriter;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use thiserror::Error;
-use rand::SeedableRng;
 
 #[derive(Error, Debug)]
 pub enum ConfigError {
@@ -250,4 +250,3 @@ impl Default for KeyPair {
         Self::new()
     }
 }
-

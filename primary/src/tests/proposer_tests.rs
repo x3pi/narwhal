@@ -12,7 +12,8 @@ async fn propose_empty() {
     let signature_service = SignatureService::new(consensus_secret);
 
     let (_tx_parents, rx_parents) = channel(1);
-    let (_tx_our_digests, rx_our_digests) = channel(1);
+    let (_tx_our_digests, rx_our_digests) = channel::<(Digest, WorkerId, Vec<u8>)>(1);
+    let (_tx_committed, rx_committed) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
 
     // Create a new test store.
@@ -28,8 +29,10 @@ async fn propose_empty() {
         store, // Thêm store
         /* header_size */ 1_000,
         /* max_header_delay */ 20,
+        /* sync_retry_delay */ 10,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
+        /* rx_committed */ rx_committed,
         /* tx_core */ tx_headers,
     );
 
@@ -47,7 +50,8 @@ async fn propose_payload() {
     let signature_service = SignatureService::new(consensus_secret);
 
     let (_tx_parents, rx_parents) = channel(1);
-    let (tx_our_digests, rx_our_digests) = channel(1);
+    let (tx_our_digests, rx_our_digests) = channel::<(Digest, WorkerId, Vec<u8>)>(1);
+    let (_tx_committed, rx_committed) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
 
     // Create a new test store.
@@ -63,8 +67,10 @@ async fn propose_payload() {
         store, // Thêm store
         /* header_size */ 32,
         /* max_header_delay */ 1_000_000, // Ensure it is not triggered.
+        /* sync_retry_delay */ 10,
         /* rx_core */ rx_parents,
         /* rx_workers */ rx_our_digests,
+        /* rx_committed */ rx_committed,
         /* tx_core */ tx_headers,
     );
 

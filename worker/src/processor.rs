@@ -4,11 +4,10 @@
 use bytes::Bytes;
 use config::WorkerId;
 use crypto::Digest;
-use sha3::{Digest as Sha3Digest};
-use sha3::Sha3_512 as Sha512;
 use network::SimpleSender;
 use primary::WorkerPrimaryMessage;
-use std::convert::TryInto;
+use sha3::Digest as Sha3Digest;
+use sha3::Sha3_512 as Sha512;
 use std::net::SocketAddr;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
@@ -40,7 +39,10 @@ impl Processor {
         tokio::spawn(async move {
             while let Some(batch) = rx_batch.recv().await {
                 // Hash the batch.
-                let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
+                let hash = Sha512::digest(&batch);
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&hash[..32]);
+                let digest = Digest(bytes);
 
                 // Store the batch.
                 store.write(digest.to_vec(), batch.clone()).await;
@@ -52,7 +54,10 @@ impl Processor {
                 };
                 let serialized_message = bincode::serialize(&message)
                     .expect("Failed to serialize our own worker-primary message");
-                log::info!("Processor: Sending batch to primary at {:?}", primary_address);
+                log::info!(
+                    "Processor: Sending batch to primary at {:?}",
+                    primary_address
+                );
                 // SỬA ĐỔI: Gửi trực tiếp đến primary qua mạng.
                 network
                     .send(primary_address, Bytes::from(serialized_message))

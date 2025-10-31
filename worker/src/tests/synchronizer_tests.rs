@@ -9,7 +9,7 @@ async fn synchronize() {
     let (tx_message, rx_message) = channel(1);
 
     let mut keys = keys();
-    let (name, _,_) = keys.pop().unwrap();
+    let (name, _, _) = keys.pop().unwrap();
     let id = 0;
     let committee = committee_with_base_port(9_000);
 
@@ -31,7 +31,7 @@ async fn synchronize() {
     );
 
     // Spawn a listener to receive our batch requests.
-    let (target, _,_) = keys.pop().unwrap();
+    let (target, _, _) = keys.pop().unwrap();
     let address = committee.worker(&target, &id).unwrap().worker_to_worker;
     let missing = vec![batch_digest()];
     let message = WorkerMessage::BatchRequest(missing.clone(), name);

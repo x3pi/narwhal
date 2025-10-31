@@ -4,7 +4,7 @@ use crate::worker::WorkerMessage;
 use bytes::Bytes;
 use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
 use crypto::{
-    generate_consensus_keypair, generate_keypair, Digest, PublicKey, SecretKey, ConsensusPublicKey
+    generate_consensus_keypair, generate_keypair, ConsensusPublicKey, Digest, PublicKey, SecretKey,
 };
 use log::warn;
 use network::quic::QuicTransport;
@@ -12,7 +12,6 @@ use network::transport::Transport;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
 use sha3::{Digest as Sha3DigestTrait, Sha3_512};
-use std::convert::TryInto as _;
 use std::net::SocketAddr;
 use tokio::task::JoinHandle;
 
@@ -107,11 +106,10 @@ pub fn serialized_batch() -> Vec<u8> {
 
 // Fixture for the digest of a serialized batch.
 pub fn batch_digest() -> Digest {
-    Digest(
-        Sha3_512::digest(&serialized_batch()).as_slice()[..32]
-            .try_into()
-            .unwrap(),
-    )
+    let hash = Sha3_512::digest(&serialized_batch());
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(&hash[..32]);
+    Digest(bytes)
 }
 
 // A fixture for a test network listener.
@@ -155,4 +153,3 @@ pub fn listener(address: SocketAddr, expected: Option<Bytes>) -> JoinHandle<()> 
         }
     })
 }
-

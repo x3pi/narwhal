@@ -118,11 +118,10 @@ impl BatchMaker {
         #[cfg(feature = "benchmark")]
         {
             // NOTE: This is one extra hash that is only needed to print the following log entries.
-            let digest = Digest(
-                Sha512::digest(&serialized).as_slice()[..32]
-                    .try_into()
-                    .unwrap(),
-            );
+            let hash = Sha512::digest(&serialized);
+            let mut bytes = [0u8; 32];
+            bytes.copy_from_slice(&hash[..32]);
+            let digest = Digest(bytes);
 
             for id in tx_ids {
                 // NOTE: This log entry is used to compute performance.

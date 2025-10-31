@@ -1,14 +1,15 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::Certificate;
-use crate::primary::PrimaryWorkerMessage;
+use crate::primary::{CommittedBatches, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::Committee;
 use crypto::PublicKey;
+use log::{info, warn};
 use network::SimpleSender;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use tokio::sync::mpsc::Receiver;
+use tokio::sync::mpsc::{Receiver, Sender};
 
 /// Receives the highest round reached by consensus and update it for all tasks.
 pub struct GarbageCollector {
@@ -20,6 +21,8 @@ pub struct GarbageCollector {
     addresses: Vec<SocketAddr>,
     /// A network sender to notify our workers of cleanup events.
     network: SimpleSender,
+    /// Notify the proposer about committed batches so it can release in-flight digests.
+    tx_committed: Sender<CommittedBatches>,
 }
 
 impl GarbageCollector {
@@ -28,6 +31,7 @@ impl GarbageCollector {
         committee: &Committee,
         consensus_round: Arc<AtomicU64>,
         rx_consensus: Receiver<Certificate>,
+        tx_committed: Sender<CommittedBatches>,
     ) {
         let addresses = committee
             .our_workers(name)
@@ -42,6 +46,7 @@ impl GarbageCollector {
                 rx_consensus,
                 addresses,
                 network: SimpleSender::new(),
+                tx_committed,
             }
             .run()
             .await;
@@ -51,14 +56,33 @@ impl GarbageCollector {
     async fn run(&mut self) {
         let mut last_committed_round = 0;
         while let Some(certificate) = self.rx_consensus.recv().await {
-            // TODO [issue #9]: Re-include batch digests that have not been sequenced into our next block.
-
             let round = certificate.round();
             if round > last_committed_round {
                 last_committed_round = round;
 
                 // Trigger cleanup on the primary.
                 self.consensus_round.store(round, Ordering::Relaxed);
+
+                let digests: Vec<_> = certificate.header.payload.keys().cloned().collect();
+                if let Err(e) = self
+                    .tx_committed
+                    .send(CommittedBatches {
+                        round,
+                        digests: digests.clone(),
+                    })
+                    .await
+                {
+                    warn!(
+                        "GarbageCollector: failed to notify proposer about committed round {}: {}",
+                        round, e
+                    );
+                } else {
+                    info!(
+                        "GarbageCollector: informed proposer about committed round {} ({} batches)",
+                        round,
+                        digests.len()
+                    );
+                }
 
                 // Trigger cleanup on the workers..
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))

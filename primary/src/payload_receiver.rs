@@ -18,7 +18,13 @@ impl PayloadReceiver {
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
     ) {
         tokio::spawn(async move {
-            Self { store, cache, rx_workers }.run().await;
+            Self {
+                store,
+                cache,
+                rx_workers,
+            }
+            .run()
+            .await;
         });
     }
 

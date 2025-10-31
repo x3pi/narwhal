@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use anyhow::{Context, Result, anyhow}; // Thêm `anyhow` vào use statement
+use anyhow::{anyhow, Context, Result}; // Thêm `anyhow` vào use statement
 use bytes::BufMut as _;
 use bytes::BytesMut;
 use clap::{crate_name, crate_version, App, AppSettings};
@@ -90,7 +90,10 @@ impl Client {
         }
 
         // SỬA LỖI: Sử dụng macro `anyhow!` để bọc lỗi lại một cách tường minh.
-        let mut connection = self.transport.connect(self.target).await
+        let mut connection = self
+            .transport
+            .connect(self.target)
+            .await
             .map_err(|e| anyhow!(e))
             .context(format!("failed to connect to {}", self.target))?;
 
@@ -120,7 +123,7 @@ impl Client {
 
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
-                
+
                 if let Err(e) = connection.send(bytes).await {
                     warn!("Failed to send transaction: {}", e);
                     break 'main;
