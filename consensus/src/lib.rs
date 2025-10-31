@@ -1044,6 +1044,10 @@ impl ConsensusAlgorithm for Bullshark {
             .map(|(_, x)| self.committee.stake(&x.origin()))
             .sum();
 
+        // CRITICAL FORK PREVENTION: Sử dụng quorum CỐ ĐỊNH từ committee của epoch hiện tại
+        // Điều này đảm bảo TẤT CẢ nodes tính cùng một threshold cho cùng một leader round
+        // Quorum được tính từ committee size ban đầu của epoch, không phụ thuộc vào số certificates hiện tại
+        // Điều này đảm bảo tính nhất quán và tránh fork khi các nodes có DAG khác nhau
         let required_stake = self.committee.validity_threshold();
 
         // OPTIMIZATION: Nếu không đủ stake từ round hiện tại, thử tìm support từ các round tiếp theo

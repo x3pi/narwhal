@@ -294,10 +294,10 @@ impl Committee {
 
     /// Tính quorum động dựa trên số node đang hoạt động (có certificate trong round trước đó)
     /// Đảm bảo tất cả node tính cùng một cách để tránh fork
-    /// 
+    ///
     /// Args:
     ///   - active_cert_count: Số certificate đã có trong round trước đó (round N-1)
-    /// 
+    ///
     /// Returns:
     ///   - Quorum threshold động: 2 * active_cert_count / 3 + 1
     ///   - Nếu active_cert_count = 0 hoặc không hợp lệ, fallback về quorum ban đầu
@@ -306,28 +306,50 @@ impl Committee {
             // Fallback về quorum ban đầu nếu không có certificate nào
             return self.quorum_threshold();
         }
-        
+
         // Đảm bảo không vượt quá tổng số node ban đầu
         let max_active = self.authorities.len();
         let active_count = active_cert_count.min(max_active);
-        
+
         // Tính quorum động: 2 * active_count / 3 + 1
         // Đảm bảo luôn >= 1 và <= số node ban đầu
         let dynamic_threshold = 2 * active_count / 3 + 1;
-        
+
         // Đảm bảo không nhỏ hơn quorum tối thiểu (nếu có ít nhất 2 node)
         let result = if active_count >= 2 {
             dynamic_threshold.max(2)
         } else {
             dynamic_threshold
         };
-        
+
         result as Stake
     }
 
     pub fn validity_threshold(&self) -> Stake {
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         (total_votes + 2) / 3
+    }
+
+    /// Tính validity threshold động dựa trên số node đang hoạt động
+    /// Điều này cho phép commit với threshold thấp hơn khi có ít nodes active
+    /// giúp commit đều hơn và giảm gián đoạn
+    pub fn validity_threshold_dynamic(&self, active_count: usize) -> Stake {
+        if active_count == 0 {
+            return self.validity_threshold();
+        }
+
+        let max_active = self.authorities.len();
+        let active = active_count.min(max_active);
+
+        // Tính validity threshold động: (active + 2) / 3
+        // Với 5 nodes: (5+2)/3 = 2
+        // Với 4 nodes: (4+2)/3 = 2
+        // Với 3 nodes: (3+2)/3 = 1
+        // Với 2 nodes: (2+2)/3 = 1
+        let dynamic_threshold = (active + 2) / 3;
+
+        // Đảm bảo tối thiểu là 1 (cho phép commit với ít nhất 1 node)
+        dynamic_threshold.max(1) as Stake
     }
 
     pub fn primary(&self, to: &PublicKey) -> Result<PrimaryAddresses, ConfigError> {
