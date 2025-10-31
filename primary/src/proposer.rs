@@ -8,7 +8,7 @@ use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::warn;
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
@@ -67,7 +67,14 @@ pub struct Proposer {
     /// Track the latest committed round to help decide when to retry stale payloads.
     latest_committed_round: Round,
     /// Track digests that have been committed to avoid re-proposing them.
-    committed_digests: HashSet<Digest>,
+    /// Maps digest to the round it was committed in (for cleanup purposes).
+    committed_digests: HashMap<Digest, Round>,
+    /// Maximum rounds to wait before considering an InFlight batch as potentially committed.
+    /// If a batch has been InFlight for more than this many rounds, we won't retry it.
+    max_retry_rounds: Round,
+    /// Maximum number of committed digests to keep in memory before cleanup.
+    /// Older digests (from rounds before latest_committed_round - max_retry_rounds * 2) will be removed.
+    max_committed_digests: usize,
 }
 
 impl Proposer {
@@ -107,7 +114,9 @@ impl Proposer {
                 digests: VecDeque::with_capacity(2 * header_size.max(1)),
                 pending_payload_size: 0,
                 latest_committed_round: 0,
-                committed_digests: HashSet::new(),
+                committed_digests: HashMap::new(),
+                max_retry_rounds: 20, // Don't retry batches that have been InFlight for more than 20 rounds
+                max_committed_digests: 10000, // Cleanup old digests when this limit is reached
             }
             .run()
             .await;
@@ -117,12 +126,24 @@ impl Proposer {
     async fn make_header(&mut self) -> bool {
         let payload: Vec<(Digest, WorkerId)> = self.collect_payload_for_header();
 
-        // Final check: ensure no duplicates in payload before creating header
+        // Final check: ensure no duplicates and no committed batches in payload before creating header
         let mut seen = HashSet::new();
         let mut deduplicated_payload = Vec::new();
         let mut duplicates_found = 0;
+        let mut committed_found = 0;
 
         for (digest, worker_id) in payload {
+            // CRITICAL: Final check - skip if already committed
+            if self.committed_digests.contains_key(&digest) {
+                committed_found += 1;
+                warn!(
+                    "Removing already-committed digest {} from header payload for round {}",
+                    digest, self.round
+                );
+                continue;
+            }
+
+            // Skip duplicates
             if seen.contains(&digest) {
                 duplicates_found += 1;
                 debug!(
@@ -139,6 +160,13 @@ impl Proposer {
             warn!(
                 "Found {} duplicate digests in header payload for round {}, removed them",
                 duplicates_found, self.round
+            );
+        }
+
+        if committed_found > 0 {
+            warn!(
+                "Found {} already-committed digests in header payload for round {}, removed them",
+                committed_found, self.round
             );
         }
 
@@ -173,6 +201,24 @@ impl Proposer {
     }
 
     fn collect_payload_for_header(&mut self) -> Vec<(Digest, WorkerId)> {
+        // First, cleanup any committed batches from the queue
+        // We need to calculate size to subtract first
+        let mut size_to_subtract = 0usize;
+        let committed_digests_ref = &self.committed_digests;
+
+        for entry in self.digests.iter() {
+            if committed_digests_ref.contains_key(&entry.digest) {
+                if matches!(entry.state, BatchState::Pending) {
+                    size_to_subtract += entry.size;
+                }
+            }
+        }
+
+        // Now remove committed batches
+        self.digests
+            .retain(|entry| !committed_digests_ref.contains_key(&entry.digest));
+        self.pending_payload_size = self.pending_payload_size.saturating_sub(size_to_subtract);
+
         let mut collected = Vec::new();
         let mut accumulated_size = 0usize;
         let mut seen_digests = HashSet::new(); // Track digests in this header to avoid duplicates
@@ -182,8 +228,13 @@ impl Proposer {
                 break;
             }
 
-            // Skip if already committed
-            if self.committed_digests.contains(&entry.digest) {
+            // CRITICAL: Double-check committed status before collecting
+            // This prevents race conditions where batch was committed between cleanup and collection
+            if self.committed_digests.contains_key(&entry.digest) {
+                warn!(
+                    "Detected committed batch {} during payload collection for round {} - skipping",
+                    entry.digest, self.round
+                );
                 entry.state = BatchState::Committed;
                 continue;
             }
@@ -206,6 +257,17 @@ impl Proposer {
                     sent_at: Instant::now(),
                 };
                 self.pending_payload_size = self.pending_payload_size.saturating_sub(entry.size);
+            } else if let BatchState::InFlight {
+                round: old_round, ..
+            } = entry.state
+            {
+                // CRITICAL: Don't re-propose batches that are already InFlight
+                // This prevents the same batch from being included in multiple headers
+                warn!(
+                    "Batch {} is already InFlight from round {}, skipping in round {}",
+                    entry.digest, old_round, self.round
+                );
+                continue;
             }
         }
 
@@ -219,44 +281,140 @@ impl Proposer {
             return;
         }
 
-        // Add all committed digests to the tracking set
+        // Add all committed digests to the tracking set FIRST
+        // This ensures we can check committed_digests even for InFlight batches
         for digest in &committed.digests {
-            self.committed_digests.insert(digest.clone());
+            self.committed_digests
+                .insert(digest.clone(), committed.round);
         }
 
+        // Cleanup old digests if we've exceeded the limit
+        self.cleanup_old_committed_digests();
+
         let committed_set: HashSet<_> = committed.digests.into_iter().collect();
+        let mut marked_count = 0;
+        let mut inflight_count = 0;
+
         for entry in self.digests.iter_mut() {
             if committed_set.contains(&entry.digest) {
+                // Mark as committed regardless of current state
+                // This prevents InFlight batches from being retried later
                 if matches!(entry.state, BatchState::Pending) {
                     self.pending_payload_size =
                         self.pending_payload_size.saturating_sub(entry.size);
+                } else if matches!(entry.state, BatchState::InFlight { .. }) {
+                    inflight_count += 1;
                 }
                 entry.state = BatchState::Committed;
+                marked_count += 1;
             }
+        }
+
+        if marked_count > 0 {
+            debug!(
+                "Marked {} batches as committed (round {}), {} were InFlight",
+                marked_count, committed.round, inflight_count
+            );
         }
 
         self.digests
             .retain(|entry| !matches!(entry.state, BatchState::Committed));
     }
 
+    /// Cleanup old committed digests to prevent unbounded memory growth.
+    /// Removes digests from rounds that are older than (latest_committed_round - max_retry_rounds * 2).
+    /// This ensures we keep enough history to check for committed batches during retry logic.
+    fn cleanup_old_committed_digests(&mut self) {
+        // Only cleanup if we've exceeded the limit
+        if self.committed_digests.len() <= self.max_committed_digests {
+            return;
+        }
+
+        // Calculate watermark: keep digests from rounds that are within max_retry_rounds * 2 of latest_committed_round
+        // This ensures we can still check for committed batches during retry logic
+        let watermark = self
+            .latest_committed_round
+            .saturating_sub(self.max_retry_rounds * 2);
+
+        let before_count = self.committed_digests.len();
+        self.committed_digests
+            .retain(|_, commit_round| *commit_round >= watermark);
+        let after_count = self.committed_digests.len();
+        let removed = before_count - after_count;
+
+        if removed > 0 {
+            debug!(
+                "Cleaned up {} old committed digests (watermark: round {}, kept: {})",
+                removed, watermark, after_count
+            );
+        }
+    }
+
     fn retry_stale_batches(&mut self) {
         let now = Instant::now();
         let mut requeued = 0usize;
+        let mut skipped_committed = 0usize;
+        let mut skipped_too_old = 0usize;
+        let mut requeued_old = 0usize;
 
         for entry in self.digests.iter_mut() {
             if let BatchState::InFlight { round, sent_at } = entry.state {
-                // Skip if already committed
-                if self.committed_digests.contains(&entry.digest) {
+                // Skip if already committed - this is critical to prevent duplicates
+                if self.committed_digests.contains_key(&entry.digest) {
                     entry.state = BatchState::Committed;
+                    skipped_committed += 1;
                     continue;
                 }
 
-                if now.duration_since(sent_at) >= self.retry_delay
-                    || self.latest_committed_round > round
-                {
-                    entry.state = BatchState::Pending;
-                    self.pending_payload_size += entry.size;
-                    requeued += 1;
+                // Check if batch is too old (InFlight for more than max_retry_rounds)
+                let is_too_old = self.round > round.saturating_add(self.max_retry_rounds);
+
+                if is_too_old {
+                    // For very old batches, only retry if latest_committed_round hasn't advanced much
+                    // This means the batch likely hasn't been committed yet
+                    // If latest_committed_round has advanced significantly, the batch might be committed
+                    // but we haven't received notification yet, so we skip retry
+                    let rounds_since_sent = self.round.saturating_sub(round);
+                    let rounds_committed_since_sent =
+                        self.latest_committed_round.saturating_sub(round);
+
+                    // If we've committed many rounds since batch was sent, likely it's already committed
+                    // If we've committed few rounds, batch might still be pending
+                    if rounds_committed_since_sent < rounds_since_sent / 2 {
+                        // Not many rounds committed since batch was sent - likely still pending
+                        debug!(
+                            "Retrying old batch {} (sent at round {}, current round {}, committed rounds since: {})",
+                            entry.digest, round, self.round, rounds_committed_since_sent
+                        );
+                        entry.state = BatchState::Pending;
+                        self.pending_payload_size += entry.size;
+                        requeued_old += 1;
+                    } else {
+                        // Many rounds committed since batch was sent - likely already committed
+                        debug!(
+                            "Skipping retry for batch {} - too old and likely committed (sent at round {}, current round {}, committed rounds since: {})",
+                            entry.digest, round, self.round, rounds_committed_since_sent
+                        );
+                        skipped_too_old += 1;
+                        // Keep it in InFlight state - will be marked as Committed when commit notification is received
+                        continue;
+                    }
+                } else {
+                    // Batch is not too old - normal retry logic
+                    // Only retry if batch hasn't been committed and meets retry conditions
+                    if now.duration_since(sent_at) >= self.retry_delay
+                        || self.latest_committed_round > round
+                    {
+                        // Double-check: verify batch is still not committed before re-queueing
+                        if !self.committed_digests.contains_key(&entry.digest) {
+                            entry.state = BatchState::Pending;
+                            self.pending_payload_size += entry.size;
+                            requeued += 1;
+                        } else {
+                            entry.state = BatchState::Committed;
+                            skipped_committed += 1;
+                        }
+                    }
                 }
             }
         }
@@ -265,6 +423,27 @@ impl Proposer {
             debug!(
                 "Requeued {} batches for re-inclusion (latest_committed_round = {})",
                 requeued, self.latest_committed_round
+            );
+        }
+
+        if requeued_old > 0 {
+            debug!(
+                "Requeued {} old batches that are likely still pending (latest_committed_round = {})",
+                requeued_old, self.latest_committed_round
+            );
+        }
+
+        if skipped_committed > 0 {
+            debug!(
+                "Skipped {} already-committed batches during retry check",
+                skipped_committed
+            );
+        }
+
+        if skipped_too_old > 0 {
+            debug!(
+                "Skipped {} batches that are too old and likely already committed (max_retry_rounds = {}). These batches remain in InFlight state and will be marked as Committed when commit notification is received.",
+                skipped_too_old, self.max_retry_rounds
             );
         }
 
@@ -319,7 +498,7 @@ impl Proposer {
                 }
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
                     // Skip if already committed
-                    if self.committed_digests.contains(&digest) {
+                    if self.committed_digests.contains_key(&digest) {
                         debug!("Skipping batch {} - already committed", digest);
                         continue;
                     }

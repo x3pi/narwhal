@@ -57,39 +57,43 @@ impl GarbageCollector {
         let mut last_committed_round = 0;
         while let Some(certificate) = self.rx_consensus.recv().await {
             let round = certificate.round();
+
+            // Update consensus round if this is a new round
             if round > last_committed_round {
                 last_committed_round = round;
-
-                // Trigger cleanup on the primary.
                 self.consensus_round.store(round, Ordering::Relaxed);
 
-                let digests: Vec<_> = certificate.header.payload.keys().cloned().collect();
-                if let Err(e) = self
-                    .tx_committed
-                    .send(CommittedBatches {
-                        round,
-                        digests: digests.clone(),
-                    })
-                    .await
-                {
-                    warn!(
-                        "GarbageCollector: failed to notify proposer about committed round {}: {}",
-                        round, e
-                    );
-                } else {
-                    info!(
-                        "GarbageCollector: informed proposer about committed round {} ({} batches)",
-                        round,
-                        digests.len()
-                    );
-                }
-
-                // Trigger cleanup on the workers..
+                // Trigger cleanup on the workers only once per round
                 let bytes = bincode::serialize(&PrimaryWorkerMessage::Cleanup(round))
                     .expect("Failed to serialize our own message");
                 self.network
                     .broadcast(self.addresses.clone(), Bytes::from(bytes))
                     .await;
+            }
+
+            // IMPORTANT: Send batch digests from ALL certificates committed in this round
+            // This ensures proposer knows about batches committed in certificates from other primaries
+            // as well as its own certificate
+            let digests: Vec<_> = certificate.header.payload.keys().cloned().collect();
+            if let Err(e) = self
+                .tx_committed
+                .send(CommittedBatches {
+                    round,
+                    digests: digests.clone(),
+                })
+                .await
+            {
+                warn!(
+                    "GarbageCollector: failed to notify proposer about committed round {}: {}",
+                    round, e
+                );
+            } else {
+                info!(
+                    "GarbageCollector: informed proposer about committed round {} ({} batches) from certificate {}",
+                    round,
+                    digests.len(),
+                    certificate.header.id
+                );
             }
         }
     }
