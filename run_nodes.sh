@@ -12,22 +12,21 @@ NODES=$(jq '.authorities | length' < benchmark/.committee.json)
 # --- Đường dẫn ---
 BENCHMARK_DIR="benchmark"
 NODE_BINARY="./target/release/node"
-EXECUTOR_BINARY="./go/bin/exetps"
 
 LOG_DIR="$BENCHMARK_DIR/logs"
 COMMITTEE_FILE="$BENCHMARK_DIR/.committee.json"
 PARAMETERS_FILE="$BENCHMARK_DIR/.parameters.json"
 
 # --- Dọn dẹp triệt để trước khi chạy ---
-echo "--- 🧹 Stage 0: Cleanup ---"
-tmux kill-server || true
-pkill -f "$NODE_BINARY" || true
-pkill -f "$EXECUTOR_BINARY" || true
-sleep 1
-# SỬA LỖI: Xóa cả các file socket cũ trong /tmp
-rm -rf "$LOG_DIR" "$BENCHMARK_DIR"/db-* /tmp/executor*.sock
-mkdir -p "$LOG_DIR"
-echo "✅ Cleanup done!"
+# echo "--- 🧹 Stage 0: Cleanup ---"
+# tmux kill-server || true
+# pkill -f "$NODE_BINARY" || true
+# pkill -f "$EXECUTOR_BINARY" || true
+# sleep 1
+# # SỬA LỖI: Xóa cả các file socket cũ trong /tmp
+# rm -rf "$LOG_DIR" "$BENCHMARK_DIR"/db-* /tmp/executor*.sock
+# mkdir -p "$LOG_DIR"
+# echo "✅ Cleanup done!"
 
 
 echo "🚀 Launching Nodes, Workers, and Executors in tmux..."
@@ -37,14 +36,8 @@ AUTHORITY_NAMES=($(jq -r '.authorities | keys[]' < "$COMMITTEE_FILE"))
 
 # --- Khởi chạy các node trong các session tmux ---
 for i in $(seq 0 $((NODES-1))); do
-    key_file="$BENCHMARK_DIR/.node-$i.json"
+    key_file="$BENCHMARK_DIR/node-$i.json"
     AUTHORITY_NAME=${AUTHORITY_NAMES[$i]}
-
-    # --- SỬA LỖI: Khởi chạy Executor TRƯỚC ---
-    executor_log_file="$LOG_DIR/executor-$i.log"
-    executor_cmd="$EXECUTOR_BINARY --id $i"
-    tmux new -d -s "executor-$i" "$executor_cmd > '$executor_log_file' 2>&1"
-
     # --- SỬA LỖI: Thêm một khoảng nghỉ ngắn để executor tạo socket ---
     sleep 0.2
 

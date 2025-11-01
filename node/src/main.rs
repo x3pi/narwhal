@@ -1,11 +1,11 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
-use config::{Committee, KeyPair, Parameters, WorkerId};
+use config::{Committee, KeyPair, NodeConfig, Parameters, ValidatorInfo, WorkerId};
 use consensus::Consensus;
-use consensus::{Bullshark, ConsensusProtocol};
+use consensus::{Bullshark, ConsensusProtocol, ConsensusState};
 use crypto::Digest;
 use crypto::Hash as _;
 use env_logger::Env;
@@ -20,16 +20,232 @@ use worker::{Worker, WorkerMessage};
 use bytes::{BufMut, BytesMut};
 use prost::Message;
 use std::collections::{HashMap, HashSet};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
+use tokio::time::sleep;
+use tokio::time::Duration;
 
 // Thêm module để import các struct được tạo bởi prost
 pub mod comm {
     include!(concat!(env!("OUT_DIR"), "/comm.rs"));
 }
 
+pub mod validator {
+    include!(concat!(env!("OUT_DIR"), "/validator.rs"));
+}
+
 /// The default channel capacity.
 pub const CHANNEL_CAPACITY: usize = 10_000;
+const CONSENSUS_STATE_KEY: &[u8] = b"consensus_state";
+
+async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Result<ValidatorInfo> {
+    log::info!(
+        "[NODE] Fetching validator list for block {} via UDS {}",
+        block_number,
+        socket_path
+    );
+
+    const UDS_CONNECT_TIMEOUT_MS: u64 = 5_000;
+    const UDS_RW_TIMEOUT_MS: u64 = 10_000;
+
+    let mut stream = tokio::time::timeout(
+        Duration::from_millis(UDS_CONNECT_TIMEOUT_MS),
+        UnixStream::connect(socket_path),
+    )
+    .await
+    .context(format!(
+        "UDS connection timeout ({}ms)",
+        UDS_CONNECT_TIMEOUT_MS
+    ))?
+    .map_err(|e| anyhow::anyhow!("Failed to connect to UDS path '{}': {}", socket_path, e))?;
+
+    let request = validator::Request {
+        payload: Some(validator::request::Payload::BlockRequest(
+            validator::BlockRequest { block_number },
+        )),
+    };
+    let request_bytes = request.encode_to_vec();
+    let len_bytes = (request_bytes.len() as u32).to_be_bytes();
+
+    tokio::time::timeout(
+        Duration::from_millis(UDS_RW_TIMEOUT_MS),
+        stream.write_all(&len_bytes),
+    )
+    .await
+    .context(format!("UDS write timeout ({}ms)", UDS_RW_TIMEOUT_MS))?
+    .map_err(|e| anyhow::anyhow!("Failed to write request length to UDS: {}", e))?;
+
+    tokio::time::timeout(
+        Duration::from_millis(UDS_RW_TIMEOUT_MS),
+        stream.write_all(&request_bytes),
+    )
+    .await
+    .context(format!("UDS write timeout ({}ms)", UDS_RW_TIMEOUT_MS))?
+    .map_err(|e| anyhow::anyhow!("Failed to write request payload to UDS: {}", e))?;
+
+    let mut len_buf = [0u8; 4];
+    tokio::time::timeout(
+        Duration::from_millis(UDS_RW_TIMEOUT_MS),
+        stream.read_exact(&mut len_buf),
+    )
+    .await
+    .context(format!(
+        "UDS read timeout ({}ms) - server may not be responding",
+        UDS_RW_TIMEOUT_MS
+    ))?
+    .map_err(|e| anyhow::anyhow!("Failed to read response length from UDS: {}", e))?;
+
+    let response_len = u32::from_be_bytes(len_buf) as usize;
+    let mut response_buf = vec![0u8; response_len];
+    tokio::time::timeout(
+        Duration::from_millis(UDS_RW_TIMEOUT_MS),
+        stream.read_exact(&mut response_buf),
+    )
+    .await
+    .context(format!(
+        "UDS read timeout ({}ms) - server may not be responding",
+        UDS_RW_TIMEOUT_MS
+    ))?
+    .map_err(|e| anyhow::anyhow!("Failed to read response payload from UDS: {}", e))?;
+
+    let wrapped_response = validator::Response::decode(&response_buf[..])
+        .context("Failed to decode validator Response protobuf")?;
+
+    let list = match wrapped_response.payload {
+        Some(validator::response::Payload::ValidatorList(list)) => list,
+        Some(other) => {
+            return Err(anyhow::anyhow!(
+                "Received unexpected response payload: {:?}",
+                other
+            ))
+        }
+        None => {
+            return Err(anyhow::anyhow!(
+                "Received empty response payload from validator service"
+            ))
+        }
+    };
+
+    let mut wrapper_list = ValidatorInfo::default();
+    for proto_val in list.validators {
+        wrapper_list.validators.push(config::Validator {
+            address: proto_val.address,
+            primary_address: proto_val.primary_address,
+            worker_address: proto_val.worker_address,
+            p2p_address: proto_val.p2p_address,
+            total_staked_amount: proto_val.total_staked_amount,
+            pubkey_bls: proto_val.pubkey_bls,
+            pubkey_secp: proto_val.pubkey_secp,
+        });
+    }
+
+    Ok(wrapper_list)
+}
+
+async fn read_last_committed_round(store: &mut Store) -> Option<u64> {
+    match store.read(CONSENSUS_STATE_KEY.to_vec()).await {
+        Ok(Some(bytes)) => match bincode::deserialize::<ConsensusState>(&bytes) {
+            Ok(state) => Some(state.last_committed_round),
+            Err(e) => {
+                log::error!(
+                    "Failed to deserialize consensus state: {}. Falling back to round 0.",
+                    e
+                );
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(e) => {
+            log::error!(
+                "Failed to read consensus state from store: {}. Falling back to round 0.",
+                e
+            );
+            None
+        }
+    }
+}
+
+async fn fetch_committee_from_uds(
+    socket_path: &str,
+    block_number: u64,
+    node_config: &NodeConfig,
+    epoch: u64,
+) -> Result<Committee> {
+    const RETRY_DELAY_MS: u64 = 5_000;
+
+    loop {
+        match fetch_validators_via_uds(socket_path, block_number).await {
+            Ok(validator_info) => {
+                let self_address = node_config.name.to_eth_address();
+                match Committee::from_validator_info(validator_info, &self_address, epoch) {
+                    Ok(committee) => {
+                        log::info!(
+                            "[NODE] Loaded committee for epoch {} from UDS (block {}).",
+                            epoch,
+                            block_number
+                        );
+                        return Ok(committee);
+                    }
+                    Err(e) => {
+                        log::error!(
+                            "[NODE] Failed to parse committee data from UDS: {}. Retrying in {} ms...",
+                            e,
+                            RETRY_DELAY_MS
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                log::error!(
+                    "[NODE] Failed to fetch validators for block {}: {}. Retrying in {} ms...",
+                    block_number,
+                    e,
+                    RETRY_DELAY_MS
+                );
+            }
+        }
+
+        sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+    }
+}
+
+async fn load_initial_committee(
+    committee_file: Option<&str>,
+    store: &mut Store,
+    node_config: &NodeConfig,
+) -> Result<Committee> {
+    let always_false = false; // Tạm thời để logic UDS chạy
+    if always_false && committee_file.is_some() {
+        let filename = committee_file.unwrap();
+        log::info!("[New Branch] Loading committee from file: {}", filename);
+        let mut committee =
+            Committee::import(filename).context("Failed to load committee from file")?;
+        if committee.epoch == 0 {
+            committee.epoch = 1;
+            log::info!("Committee file has epoch 0, setting to 1.");
+        }
+        Ok(committee)
+    } else {
+        let socket_path = node_config.uds_get_validators_path.trim();
+        if socket_path.is_empty() {
+            return Err(anyhow!(
+                "NodeConfig.uds_get_validators_path is empty; cannot fetch committee"
+            ));
+        }
+
+        let last_committed_round = read_last_committed_round(store).await.unwrap_or(0);
+        let block_number = last_committed_round / 2;
+        let epoch_to_load = block_number.saturating_add(1);
+
+        log::info!(
+            "[NODE] No committee file provided. Fetching via UDS for epoch {} (block {}).",
+            epoch_to_load,
+            block_number
+        );
+
+        fetch_committee_from_uds(socket_path, block_number, node_config, epoch_to_load).await
+    }
+}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -46,7 +262,9 @@ async fn main() -> Result<()> {
             SubCommand::with_name("run")
                 .about("Run a node")
                 .args_from_usage("--keys=<FILE> 'The file containing the node keys'")
-                .args_from_usage("--committee=<FILE> 'The file containing committee information'")
+                .args_from_usage(
+                    "--committee=[FILE] 'Optional path to the committee definition file'",
+                )
                 .args_from_usage("--parameters=[FILE] 'The file containing the node parameters'")
                 .args_from_usage("--store=<PATH> 'The path where to create the data store'")
                 .subcommand(SubCommand::with_name("primary").about("Run a single primary"))
@@ -73,7 +291,7 @@ async fn main() -> Result<()> {
     logger.init();
 
     match matches.subcommand() {
-        ("generate_keys", Some(sub_matches)) => KeyPair::new()
+        ("generate_keys", Some(sub_matches)) => NodeConfig::new()
             .export(sub_matches.value_of("filename").unwrap())
             .context("Failed to generate key pair")?,
         ("run", Some(sub_matches)) => run(sub_matches).await?,
@@ -85,13 +303,11 @@ async fn main() -> Result<()> {
 // Runs either a worker or a primary.
 async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let key_file = matches.value_of("keys").unwrap();
-    let committee_file = matches.value_of("committee").unwrap();
     let parameters_file = matches.value_of("parameters");
     let store_path = matches.value_of("store").unwrap();
 
-    let keypair = KeyPair::import(key_file).context("Failed to load the node's keypair")?;
-    let committee =
-        Committee::import(committee_file).context("Failed to load the committee information")?;
+    let node_config =
+        NodeConfig::import(key_file).context("Failed to load the node's configuration")?;
 
     let parameters = match parameters_file {
         Some(filename) => {
@@ -101,7 +317,28 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     };
 
     let store = Store::new(store_path).context("Failed to create a store")?;
+    let mut store_for_committee = store.clone();
+    let committee_file = matches.value_of("committee");
+    let committee = load_initial_committee(committee_file, &mut store_for_committee, &node_config)
+        .await
+        .context("Failed to initialize committee")?;
+
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
+    let initial_epoch = committee.epoch;
+    let block_socket = if node_config.uds_block_path.trim().is_empty() {
+        log::info!(
+            "Node {} cấu hình uds_block_path trống: bỏ qua gửi committed block qua UDS",
+            node_config.name
+        );
+        None
+    } else {
+        log::info!(
+            "Node {} sẽ gửi committed block tới uds_block_path: {}",
+            node_config.name,
+            node_config.uds_block_path
+        );
+        Some(node_config.uds_block_path.clone())
+    };
 
     match matches.subcommand() {
         ("primary", _) => {
@@ -110,12 +347,19 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
             let node_id = primary_keys
                 .iter()
-                .position(|pk| pk == &keypair.name)
-                .context("Public key không tìm thấy trong committee file")?;
+                .position(|pk| pk == &node_config.name)
+                .context("Public key không tìm thấy trong committee")?;
 
-            log::info!("Node {} khởi chạy với ID: {}", keypair.name, node_id);
-            log::info!("Node's eth secret: {}", keypair.secret.encode_base64());
-            log::info!("Node's eth address: {:?}", keypair.name.to_eth_address());
+            log::info!("Node {} khởi chạy với ID: {}", node_config.name, node_id);
+            log::info!("Node's eth secret: {}", node_config.secret.encode_base64());
+            log::info!("Node's eth address: {}", node_config.name.to_eth_address());
+
+            let keypair = KeyPair {
+                name: node_config.name.clone(),
+                secret: node_config.secret.clone(),
+                consensus_key: node_config.consensus_key.clone(),
+                consensus_secret: node_config.consensus_secret.clone(),
+            };
 
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
@@ -144,7 +388,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 }),
             );
 
-            analyze(rx_output, node_id, store, 1).await; // Epoch mặc định là 1
+            analyze(rx_output, node_id, store, initial_epoch, block_socket).await;
         }
         ("worker", Some(sub_matches)) => {
             let id_str = sub_matches.value_of("id").unwrap();
@@ -156,7 +400,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             })?;
 
             tokio::spawn(Worker::spawn(
-                keypair.name,
+                node_config.name,
                 id,
                 committee,
                 parameters,
@@ -181,6 +425,7 @@ async fn analyze(
     node_id: usize,
     mut store: Store,
     initial_epoch: u64,
+    block_socket: Option<String>,
 ) {
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
@@ -193,34 +438,44 @@ async fn analyze(
         }
     }
 
-    let socket_path = format!("/tmp/executor{}.sock", node_id);
-    log::info!(
-        "[ANALYZE] Node ID {} attempting to connect to {}",
-        node_id,
-        socket_path
-    );
+    let mut stream_opt: Option<UnixStream> = if let Some(socket_path) = block_socket {
+        log::info!(
+            "[ANALYZE] Node ID {} attempting to connect to {}",
+            node_id,
+            socket_path
+        );
 
-    let mut stream = loop {
-        match UnixStream::connect(&socket_path).await {
-            Ok(stream) => {
-                log::info!(
-                    "[ANALYZE] Node ID {} connected successfully to {}",
-                    node_id,
-                    socket_path
-                );
-                break stream;
+        let stream = loop {
+            match UnixStream::connect(&socket_path).await {
+                Ok(stream) => {
+                    log::info!(
+                        "[ANALYZE] Node ID {} connected successfully to {}",
+                        node_id,
+                        socket_path
+                    );
+                    break stream;
+                }
+                Err(e) => {
+                    log::warn!(
+                        "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
+                        node_id,
+                        socket_path,
+                        e
+                    );
+                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                }
             }
-            Err(e) => {
-                log::warn!(
-                    "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
-                    node_id,
-                    socket_path,
-                    e
-                );
-                tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
-            }
-        }
+        };
+
+        Some(stream)
+    } else {
+        log::info!(
+            "[ANALYZE] Node ID {} has no block socket configured; committed blocks will not be sent via UDS.",
+            node_id
+        );
+        None
     };
+
     log::info!(
         "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
         node_id
@@ -291,7 +546,7 @@ async fn analyze(
     }
 
     async fn emit_blocks(
-        stream: &mut UnixStream,
+        stream: Option<&mut UnixStream>,
         node_id: usize,
         blocks: Vec<comm::CommittedBlock>,
         last_committed: &mut HashMap<u64, u64>,
@@ -305,7 +560,14 @@ async fn analyze(
             .map(|block| (block.epoch, block.height))
             .collect();
 
-        send_blocks(stream, blocks, node_id).await?;
+        match stream {
+            Some(stream) => {
+                send_blocks(stream, blocks, node_id).await?;
+            }
+            None => {
+                drop(blocks);
+            }
+        }
 
         for (epoch, height) in metadata {
             last_committed.insert(epoch, height);
@@ -345,7 +607,7 @@ async fn analyze(
 
                     let block_count = 1;
                     if let Err(e) = emit_blocks(
-                        &mut stream,
+                        stream_opt.as_mut(),
                         node_id,
                         vec![comm::CommittedBlock {
                             epoch: finished.epoch,
@@ -362,7 +624,7 @@ async fn analyze(
                             e
                         );
                         break;
-                    } else {
+                    } else if stream_opt.is_some() {
                         log::info!(
                             "[ANALYZE] SUCCESS: Node ID {} sent {} block(s) successfully.",
                             node_id,
@@ -407,7 +669,7 @@ async fn analyze(
                 }
 
                 if let Err(e) = emit_blocks(
-                    &mut stream,
+                    stream_opt.as_mut(),
                     node_id,
                     missing_blocks,
                     &mut last_committed_height_per_epoch,
@@ -420,7 +682,7 @@ async fn analyze(
                         e
                     );
                     break;
-                } else {
+                } else if stream_opt.is_some() {
                     let block_count = height.saturating_sub(last_height + 1);
                     if block_count > 0 {
                         log::info!(
@@ -462,7 +724,7 @@ async fn analyze(
 
                     let block_count = 1;
                     if let Err(e) = emit_blocks(
-                        &mut stream,
+                        stream_opt.as_mut(),
                         node_id,
                         vec![comm::CommittedBlock {
                             epoch: finished.epoch,
@@ -479,7 +741,7 @@ async fn analyze(
                             e
                         );
                         break;
-                    } else {
+                    } else if stream_opt.is_some() {
                         log::info!(
                             "[ANALYZE] SUCCESS: Node ID {} sent {} block(s) successfully.",
                             node_id,
@@ -590,7 +852,7 @@ async fn analyze(
 
         let block_count = 1;
         if let Err(e) = emit_blocks(
-            &mut stream,
+            stream_opt.as_mut(),
             node_id,
             vec![comm::CommittedBlock {
                 epoch: current.epoch,
@@ -606,7 +868,7 @@ async fn analyze(
                 node_id,
                 e
             );
-        } else {
+        } else if stream_opt.is_some() {
             log::info!(
                 "[ANALYZE] SUCCESS: Node ID {} sent {} block(s) successfully.",
                 node_id,

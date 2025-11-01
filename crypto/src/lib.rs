@@ -228,6 +228,15 @@ impl fmt::Display for ConsensusPublicKey {
     }
 }
 
+impl ConsensusPublicKey {
+    pub fn decode_base64(s: &str) -> Result<Self, FastCryptoError> {
+        let bytes = Base64::decode(s)?;
+        let pk =
+            BLS12381PublicKey::from_bytes(&bytes).map_err(|_| FastCryptoError::InvalidInput)?;
+        Ok(Self(pk))
+    }
+}
+
 pub struct ConsensusSecretKey(BLS12381PrivateKey);
 
 // Implement Clone manually by reconstructing the key from its bytes.

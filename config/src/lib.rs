@@ -1,9 +1,10 @@
-// Copyright(C) Facebook, Inc. and its affiliates.
+use base64::{engine::general_purpose::STANDARD as BASE64_ENGINE, Engine as _};
 use crypto::{
     generate_consensus_keypair, generate_production_keypair, ConsensusPublicKey,
     ConsensusSecretKey, PublicKey, SecretKey,
 };
-use log::info;
+use hex::FromHex;
+use log::{info, warn};
 use rand::SeedableRng;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
@@ -27,6 +28,25 @@ pub enum ConfigError {
 
     #[error("Failed to write config file '{file}': {message}")]
     ExportError { file: String, message: String },
+
+    #[error("Failed to parse validator data: {0}")]
+    ParseError(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Validator {
+    pub address: String,
+    pub primary_address: String,
+    pub worker_address: String,
+    pub p2p_address: String,
+    pub total_staked_amount: String,
+    pub pubkey_bls: String,
+    pub pubkey_secp: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ValidatorInfo {
+    pub validators: Vec<Validator>,
 }
 
 pub trait Import: DeserializeOwned {
@@ -62,7 +82,7 @@ pub trait Export: Serialize {
 pub type Stake = u32;
 pub type WorkerId = u32;
 
-#[derive(Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Parameters {
     pub header_size: usize,
     pub max_header_delay: u64,
@@ -88,6 +108,7 @@ impl Default for Parameters {
 }
 
 impl Import for Parameters {}
+impl Export for Parameters {}
 
 impl Parameters {
     pub fn log(&self) {
@@ -101,35 +122,157 @@ impl Parameters {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct PrimaryAddresses {
     pub primary_to_primary: SocketAddr,
     pub worker_to_primary: SocketAddr,
 }
 
-#[derive(Clone, Deserialize, Eq, Hash, PartialEq)]
+#[derive(Clone, Deserialize, Eq, Hash, PartialEq, Serialize, Debug)]
 pub struct WorkerAddresses {
     pub transactions: SocketAddr,
     pub worker_to_worker: SocketAddr,
     pub primary_to_worker: SocketAddr,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Authority {
     pub stake: Stake,
     pub consensus_key: ConsensusPublicKey,
     pub primary: PrimaryAddresses,
     pub workers: HashMap<WorkerId, WorkerAddresses>,
+    pub p2p_address: String,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize, Debug)]
 pub struct Committee {
     pub authorities: BTreeMap<PublicKey, Authority>,
+    pub epoch: u64,
 }
 
 impl Import for Committee {}
+impl Export for Committee {}
 
 impl Committee {
+    fn hex_to_base64_string(hex_input: &str) -> Result<String, ConfigError> {
+        let bytes = Vec::from_hex(hex_input).map_err(|e| {
+            ConfigError::ParseError(format!(
+                "Failed to decode hex string '{}': {}",
+                hex_input, e
+            ))
+        })?;
+        Ok(BASE64_ENGINE.encode(bytes))
+    }
+
+    pub fn from_validator_info(
+        mut validator_info: ValidatorInfo,
+        self_address: &str,
+        epoch: u64,
+    ) -> Result<Self, ConfigError> {
+        const BASE_PRIMARY_TO_WORKER_PORT: u16 = 10_000;
+        const BASE_WORKER_TO_PRIMARY_PORT: u16 = 11_000;
+        const BASE_TRANSACTIONS_PORT: u16 = 12_000;
+
+        validator_info
+            .validators
+            .sort_by(|a, b| a.address.cmp(&b.address));
+
+        let mut authorities = BTreeMap::new();
+        for (i, val) in validator_info.validators.iter().enumerate() {
+            let base64_address = Self::hex_to_base64_string(&val.pubkey_secp)?;
+            let public_key = PublicKey::decode_base64(&base64_address).map_err(|e| {
+                ConfigError::ParseError(format!(
+                    "Failed to parse public key '{}': {}",
+                    val.address, e
+                ))
+            })?;
+
+            let base64_bls_key = Self::hex_to_base64_string(&val.pubkey_bls)?;
+            let consensus_key =
+                ConsensusPublicKey::decode_base64(&base64_bls_key).map_err(|e| {
+                    ConfigError::ParseError(format!(
+                        "Failed to parse consensus key '{}': {}",
+                        val.pubkey_bls, e
+                    ))
+                })?;
+
+            let stake: Stake = val.total_staked_amount.parse().unwrap_or(1);
+            let primary_to_primary: SocketAddr = val.primary_address.parse().map_err(|e| {
+                ConfigError::ParseError(format!(
+                    "Invalid primary_address '{}': {}",
+                    val.primary_address, e
+                ))
+            })?;
+
+            if primary_to_primary.ip().to_string() == "0.0.0.0" || primary_to_primary.port() == 0 {
+                warn!(
+                    "[Config] ⚠️ INVALID PRIMARY ADDRESS for validator {} (address: {}, pubkey_secp: {}): {}",
+                    val.address,
+                    val.address,
+                    &val.pubkey_secp[..val.pubkey_secp.len().min(20)],
+                    primary_to_primary
+                );
+            } else {
+                info!(
+                    "[Config] Loaded validator {} with primary_address: {}",
+                    val.address, primary_to_primary
+                );
+            }
+
+            let (worker_to_primary, primary_to_worker, transactions) =
+                if val.address.to_lowercase() == self_address.to_lowercase() {
+                    info!(
+                        "Assigning sequential internal ports for self (address: {}).",
+                        self_address
+                    );
+                    (
+                        format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
+                            .parse()
+                            .unwrap(),
+                        format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
+                            .parse()
+                            .unwrap(),
+                        format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
+                            .parse()
+                            .unwrap(),
+                    )
+                } else {
+                    let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
+                    (placeholder_addr, placeholder_addr, placeholder_addr)
+                };
+
+            let workers = [(
+                0,
+                WorkerAddresses {
+                    primary_to_worker,
+                    transactions,
+                    worker_to_worker: val.worker_address.parse().map_err(|e| {
+                        ConfigError::ParseError(format!(
+                            "Invalid worker_address '{}': {}",
+                            val.worker_address, e
+                        ))
+                    })?,
+                },
+            )]
+            .iter()
+            .cloned()
+            .collect();
+
+            let authority = Authority {
+                stake,
+                consensus_key,
+                primary: PrimaryAddresses {
+                    primary_to_primary,
+                    worker_to_primary,
+                },
+                workers,
+                p2p_address: val.p2p_address.clone(),
+            };
+            authorities.insert(public_key, authority);
+        }
+        Ok(Committee { authorities, epoch })
+    }
+
     pub fn size(&self) -> usize {
         self.authorities.len()
     }
@@ -155,9 +298,35 @@ impl Committee {
         2 * total_votes / 3 + 1
     }
 
+    pub fn quorum_threshold_dynamic(&self, active_cert_count: usize) -> Stake {
+        if active_cert_count == 0 {
+            return self.quorum_threshold();
+        }
+
+        let max_active = self.authorities.len();
+        let active_count = active_cert_count.min(max_active);
+        let dynamic_threshold = 2 * active_count / 3 + 1;
+        if active_count >= 2 {
+            dynamic_threshold.max(2) as Stake
+        } else {
+            dynamic_threshold as Stake
+        }
+    }
+
     pub fn validity_threshold(&self) -> Stake {
         let total_votes: Stake = self.authorities.values().map(|x| x.stake).sum();
         (total_votes + 2) / 3
+    }
+
+    pub fn validity_threshold_dynamic(&self, active_count: usize) -> Stake {
+        if active_count == 0 {
+            return self.validity_threshold();
+        }
+
+        let max_active = self.authorities.len();
+        let active = active_count.min(max_active);
+        let dynamic_threshold = (active + 2) / 3;
+        dynamic_threshold.max(1) as Stake
     }
 
     pub fn primary(&self, to: &PublicKey) -> Result<PrimaryAddresses, ConfigError> {
@@ -185,11 +354,12 @@ impl Committee {
             .iter()
             .find(|(worker_id, _)| worker_id == &id)
             .map(|(_, worker)| worker.clone())
-            .ok_or_else(|| ConfigError::NotInCommittee(*to))
+            .ok_or_else(|| ConfigError::UnknownWorker(*id))
     }
 
     pub fn our_workers(&self, myself: &PublicKey) -> Result<Vec<WorkerAddresses>, ConfigError> {
-        self.authorities
+        Ok(self
+            .authorities
             .iter()
             .find(|(name, _)| name == &myself)
             .map(|(_, authority)| authority)
@@ -197,8 +367,7 @@ impl Committee {
             .workers
             .values()
             .cloned()
-            .map(Ok)
-            .collect()
+            .collect())
     }
 
     pub fn others_workers(
@@ -246,6 +415,41 @@ impl KeyPair {
 }
 
 impl Default for KeyPair {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub struct NodeConfig {
+    pub name: PublicKey,
+    pub secret: SecretKey,
+    pub consensus_key: ConsensusPublicKey,
+    pub consensus_secret: ConsensusSecretKey,
+    pub uds_get_validators_path: String,
+    pub uds_block_path: String,
+}
+
+impl Import for NodeConfig {}
+impl Export for NodeConfig {}
+
+impl NodeConfig {
+    pub fn new() -> Self {
+        let (name, secret) = generate_production_keypair();
+        let mut rng = rand::rngs::StdRng::from_entropy();
+        let (consensus_key, consensus_secret) = generate_consensus_keypair(&mut rng);
+        Self {
+            name,
+            secret,
+            consensus_key,
+            consensus_secret,
+            uds_get_validators_path: "/tmp/get_validator.sock_1".to_string(),
+            uds_block_path: "".to_string(),
+        }
+    }
+}
+
+impl Default for NodeConfig {
     fn default() -> Self {
         Self::new()
     }

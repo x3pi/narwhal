@@ -69,9 +69,14 @@ class Committee:
         assert isinstance(base_port, int) and base_port > 1024
 
         port = base_port
-        self.json = {'authorities': OrderedDict()}
+        self.json = OrderedDict()
+        self.json['authorities'] = OrderedDict()
         for name, hosts in addresses.items():
             host = hosts.pop(0)
+
+            p2p_address = f'{host}:{port}'
+            port += 1
+
             primary_addr = {
                 'primary_to_primary': f'{host}:{port}',
                 'worker_to_primary': f'{host}:{port + 1}'
@@ -91,9 +96,12 @@ class Committee:
             self.json['authorities'][name] = {
                 'stake': 1,
                 'consensus_key': consensus_key,
+                'p2p_address': p2p_address,
                 'primary': primary_addr,
                 'workers': workers_addr
             }
+
+        self.json['epoch'] = 1
 
     def primary_addresses(self, faults=0):
         ''' Returns an ordered list of primaries' addresses. '''
@@ -128,6 +136,10 @@ class Committee:
             addresses = self.json['authorities'][name]['primary']
             ips.add(self.ip(addresses['primary_to_primary']))
             ips.add(self.ip(addresses['worker_to_primary']))
+
+            p2p_address = self.json['authorities'][name].get('p2p_address')
+            if p2p_address:
+                ips.add(self.ip(p2p_address))
 
             for worker in self.json['authorities'][name]['workers'].values():
                 ips.add(self.ip(worker['primary_to_worker']))
