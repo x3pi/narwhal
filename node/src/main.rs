@@ -6,6 +6,8 @@ use config::Import as _;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use consensus::Consensus;
 use consensus::{Bullshark, ConsensusProtocol};
+use crypto::Digest;
+use crypto::Hash as _;
 use env_logger::Env;
 use primary::{Certificate, Primary};
 use store::Store;
@@ -17,6 +19,7 @@ use worker::{Worker, WorkerMessage};
 // Thêm các use statements cần thiết
 use bytes::{BufMut, BytesMut};
 use prost::Message;
+use std::collections::{HashMap, HashSet};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UnixStream;
 
@@ -141,7 +144,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 }),
             );
 
-            analyze(rx_output, node_id, store).await;
+            analyze(rx_output, node_id, store, 1).await; // Epoch mặc định là 1
         }
         ("worker", Some(sub_matches)) => {
             let id_str = sub_matches.value_of("id").unwrap();
@@ -172,7 +175,13 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 }
 
 /// Receives an ordered list of certificates and apply any application-specific logic.
-async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store: Store) {
+/// Sửa logic: Gửi block theo commit (bất kỳ round nào), tạo fake block rỗng cho round chẵn không commit.
+async fn analyze(
+    mut rx_output: Receiver<Certificate>,
+    node_id: usize,
+    mut store: Store,
+    initial_epoch: u64,
+) {
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
             if value < 0x80 {
@@ -217,117 +226,393 @@ async fn analyze(mut rx_output: Receiver<Certificate>, node_id: usize, mut store
         node_id
     );
 
-    while let Some(certificate) = rx_output.recv().await {
+    // Track height lớn nhất đã gửi cho mỗi epoch (height = ceil(round / 2))
+    let mut last_committed_height_per_epoch: HashMap<u64, u64> = HashMap::new();
+
+    #[derive(Debug)]
+    struct BlockBuilder {
+        epoch: u64,
+        height: u64,
+        certificate_count: usize,
+        transactions: Vec<comm::Transaction>,
+        batch_hashes: HashSet<Digest>,
+    }
+
+    impl BlockBuilder {
+        fn new(epoch: u64, height: u64) -> Self {
+            Self {
+                epoch,
+                height,
+                certificate_count: 0,
+                transactions: Vec::new(),
+                batch_hashes: HashSet::new(),
+            }
+        }
+    }
+
+    async fn send_blocks(
+        stream: &mut UnixStream,
+        blocks: Vec<comm::CommittedBlock>,
+        node_id: usize,
+    ) -> Result<(), String> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let epoch_data = comm::CommittedEpochData { blocks };
+
+        let mut proto_buf = BytesMut::new();
+        epoch_data
+            .encode(&mut proto_buf)
+            .map_err(|e| format!("Failed to encode Protobuf: {}", e))?;
+
+        let mut len_buf = BytesMut::new();
+        put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
+
         log::info!(
-            "[ANALYZE] Node ID {} RECEIVED certificate for round {} from consensus.",
+            "[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for {} blocks.",
             node_id,
-            certificate.header.round
+            len_buf.len(),
+            proto_buf.len(),
+            epoch_data.blocks.len()
         );
 
-        let mut all_transactions = Vec::new();
+        stream
+            .write_all(&len_buf)
+            .await
+            .map_err(|e| format!("Failed to write length to socket: {}", e))?;
 
-        for (digest, worker_id) in certificate.header.payload {
-            match store.read(digest.to_vec()).await {
+        stream
+            .write_all(&proto_buf)
+            .await
+            .map_err(|e| format!("Failed to write payload to socket: {}", e))?;
+
+        Ok(())
+    }
+
+    async fn emit_blocks(
+        stream: &mut UnixStream,
+        node_id: usize,
+        blocks: Vec<comm::CommittedBlock>,
+        last_committed: &mut HashMap<u64, u64>,
+    ) -> Result<(), String> {
+        if blocks.is_empty() {
+            return Ok(());
+        }
+
+        let metadata: Vec<(u64, u64)> = blocks
+            .iter()
+            .map(|block| (block.epoch, block.height))
+            .collect();
+
+        send_blocks(stream, blocks, node_id).await?;
+
+        for (epoch, height) in metadata {
+            last_committed.insert(epoch, height);
+        }
+
+        Ok(())
+    }
+
+    let mut current_block: Option<BlockBuilder> = None;
+
+    while let Some(certificate) = rx_output.recv().await {
+        let commit_round = certificate.header.round;
+        let epoch = initial_epoch;
+
+        log::info!(
+            "[ANALYZE] Node ID {} RECEIVED certificate for round {} (epoch {}) from consensus.",
+            node_id,
+            commit_round,
+            epoch
+        );
+
+        let height = (commit_round + 1) / 2;
+
+        // Nếu đang xây dựng block và gặp round cao hơn thì flush block cũ
+        if let Some(current_height) = current_block.as_ref().map(|b| b.height) {
+            if height > current_height {
+                if let Some(finished) = current_block.take() {
+                    let leader_round = finished.height * 2;
+                    log::info!(
+                        "[ANALYZE] Node ID {} Finalizing block for height {} (leader round {}) containing {} unique transactions ({} certificates).",
+                        node_id,
+                        finished.height,
+                        leader_round,
+                        finished.transactions.len(),
+                        finished.certificate_count
+                    );
+
+                    let block_count = 1;
+                    if let Err(e) = emit_blocks(
+                        &mut stream,
+                        node_id,
+                        vec![comm::CommittedBlock {
+                            epoch: finished.epoch,
+                            height: finished.height,
+                            transactions: finished.transactions,
+                        }],
+                        &mut last_committed_height_per_epoch,
+                    )
+                    .await
+                    {
+                        log::error!(
+                            "[ANALYZE] FATAL: Node ID {} Failed to send blocks: {}",
+                            node_id,
+                            e
+                        );
+                        break;
+                    } else {
+                        log::info!(
+                            "[ANALYZE] SUCCESS: Node ID {} sent {} block(s) successfully.",
+                            node_id,
+                            block_count
+                        );
+                    }
+                }
+            }
+        }
+
+        let last_height = last_committed_height_per_epoch
+            .get(&epoch)
+            .copied()
+            .unwrap_or(0);
+
+        if height <= last_height {
+            log::warn!(
+                "[ANALYZE] Node ID {} received certificate round {} (height {}) but last committed height is {}. Skipping to avoid duplicates.",
+                node_id,
+                commit_round,
+                height,
+                last_height
+            );
+            continue;
+        }
+
+        if current_block.is_none() {
+            if height > last_height + 1 {
+                let mut missing_blocks = Vec::new();
+                for missing_height in (last_height + 1)..height {
+                    log::info!(
+                        "[ANALYZE] Node ID {} Creating fake empty block for missing height {} (last committed {}).",
+                        node_id,
+                        missing_height,
+                        last_height
+                    );
+                    missing_blocks.push(comm::CommittedBlock {
+                        epoch,
+                        height: missing_height,
+                        transactions: Vec::new(),
+                    });
+                }
+
+                if let Err(e) = emit_blocks(
+                    &mut stream,
+                    node_id,
+                    missing_blocks,
+                    &mut last_committed_height_per_epoch,
+                )
+                .await
+                {
+                    log::error!(
+                        "[ANALYZE] FATAL: Node ID {} Failed to send missing blocks: {}",
+                        node_id,
+                        e
+                    );
+                    break;
+                } else {
+                    let block_count = height.saturating_sub(last_height + 1);
+                    if block_count > 0 {
+                        log::info!(
+                            "[ANALYZE] SUCCESS: Node ID {} sent {} synthetic block(s) for gaps.",
+                            node_id,
+                            block_count
+                        );
+                    }
+                }
+            }
+
+            current_block = Some(BlockBuilder::new(epoch, height));
+        }
+
+        if current_block.is_none() {
+            current_block = Some(BlockBuilder::new(epoch, height));
+        }
+
+        if let Some(builder_ref) = current_block.as_ref() {
+            if builder_ref.height > height {
+                log::warn!(
+                    "[ANALYZE] Node ID {} encountered out-of-order certificate (round {}, height {}) already building height {}. Skipping.",
+                    node_id,
+                    commit_round,
+                    height,
+                    builder_ref.height
+                );
+                continue;
+            } else if builder_ref.height < height {
+                if let Some(finished) = current_block.take() {
+                    let leader_round = finished.height * 2;
+                    log::warn!(
+                        "[ANALYZE] Node ID {} forcing flush of unfinished block height {} (leader round {}) due to new height {}.",
+                        node_id,
+                        finished.height,
+                        leader_round,
+                        height
+                    );
+
+                    let block_count = 1;
+                    if let Err(e) = emit_blocks(
+                        &mut stream,
+                        node_id,
+                        vec![comm::CommittedBlock {
+                            epoch: finished.epoch,
+                            height: finished.height,
+                            transactions: finished.transactions,
+                        }],
+                        &mut last_committed_height_per_epoch,
+                    )
+                    .await
+                    {
+                        log::error!(
+                            "[ANALYZE] FATAL: Node ID {} Failed to send blocks: {}",
+                            node_id,
+                            e
+                        );
+                        break;
+                    } else {
+                        log::info!(
+                            "[ANALYZE] SUCCESS: Node ID {} sent {} block(s) successfully.",
+                            node_id,
+                            block_count
+                        );
+                    }
+                }
+
+                current_block = Some(BlockBuilder::new(epoch, height));
+            }
+        }
+
+        let builder = current_block.as_mut().expect("Block builder must exist");
+
+        builder.certificate_count += 1;
+
+        let cert_digest = certificate.digest();
+        let payload_len = certificate.header.payload.len();
+        log::debug!(
+            "[ANALYZE] Node ID {} adding certificate {} (round {}) with {} batch digests to block height {}",
+            node_id,
+            cert_digest,
+            commit_round,
+            payload_len,
+            builder.height
+        );
+
+        for (batch_digest, worker_id) in certificate.header.payload.iter() {
+            if !builder.batch_hashes.insert(batch_digest.clone()) {
+                log::debug!(
+                    "[ANALYZE] Skipping duplicate batch {} within block height {}",
+                    batch_digest,
+                    builder.height
+                );
+                continue;
+            }
+
+            match store.read(batch_digest.to_vec()).await {
                 Ok(Some(serialized_batch_message)) => {
-                    match bincode::deserialize(&serialized_batch_message) {
+                    log::debug!(
+                        "[ANALYZE] Found batch {} from worker {} in store ({} bytes, height {}).",
+                        batch_digest,
+                        worker_id,
+                        serialized_batch_message.len(),
+                        builder.height
+                    );
+                    match bincode::deserialize::<WorkerMessage>(&serialized_batch_message) {
                         Ok(WorkerMessage::Batch(batch)) => {
-                            log::debug!(
-                                "[ANALYZE] Unpacked batch {} with {} transactions for worker {}.",
-                                digest,
-                                batch.len(),
-                                worker_id
-                            );
+                            if batch.is_empty() {
+                                log::warn!(
+                                    "[ANALYZE] Batch {} from worker {} decoded with 0 transactions (height {}).",
+                                    batch_digest,
+                                    worker_id,
+                                    builder.height
+                                );
+                            }
                             for tx_data in batch {
-                                all_transactions.push(comm::Transaction {
+                                builder.transactions.push(comm::Transaction {
                                     digest: tx_data,
-                                    worker_id: worker_id as u32,
+                                    worker_id: *worker_id as u32,
                                 });
                             }
                         }
                         Ok(_) => {
                             log::warn!(
-                                "[ANALYZE] Digest {} did not correspond to a Batch message.",
-                                digest
+                                "[ANALYZE] Digest {} did not correspond to a Batch message (height {}).",
+                                batch_digest,
+                                builder.height
                             );
                         }
                         Err(e) => {
                             log::error!(
-                                "[ANALYZE] Failed to deserialize message for digest {}: {}",
-                                digest,
+                                "[ANALYZE] Failed to deserialize batch {}: {}",
+                                batch_digest,
                                 e
                             );
                         }
                     }
                 }
                 Ok(None) => {
-                    log::warn!("[ANALYZE] Batch for digest {} not found in store.", digest);
+                    log::warn!(
+                        "[ANALYZE] Batch {} referenced in committed DAG not found in store (height {}).",
+                        batch_digest,
+                        builder.height
+                    );
                 }
                 Err(e) => {
                     log::error!(
-                        "[ANALYZE] Failed to read batch for digest {}: {}",
-                        digest,
+                        "[ANALYZE] Error reading batch {} from store: {}",
+                        batch_digest,
                         e
                     );
                 }
             }
         }
+    }
 
-        let committed_block = comm::CommittedBlock {
-            epoch: certificate.header.round,
-            height: certificate.header.round,
-            transactions: all_transactions,
-        };
-
-        let epoch_data = comm::CommittedEpochData {
-            blocks: vec![committed_block],
-        };
-
-        log::debug!(
-            "[ANALYZE] Node ID {} serializing data for round {}",
-            node_id,
-            certificate.header.round
-        );
-        let mut proto_buf = BytesMut::new();
-        epoch_data
-            .encode(&mut proto_buf)
-            .expect("FATAL: Protobuf serialization failed!");
-
-        let mut len_buf = BytesMut::new();
-        put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
-
-        if epoch_data.blocks.iter().all(|b| b.transactions.is_empty()) {
-            log::info!(
-                "[ANALYZE] Node ID {} SENDING EMPTY BLOCK for round {}.",
-                node_id,
-                certificate.header.round
-            );
-        }
-
-        log::info!("[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for round {}.", node_id, len_buf.len(), proto_buf.len(), certificate.header.round);
-
-        if let Err(e) = stream.write_all(&len_buf).await {
-            log::error!(
-                "[ANALYZE] FATAL: Node ID {}: Failed to write length to socket: {}",
-                node_id,
-                e
-            );
-            break;
-        }
-
-        if let Err(e) = stream.write_all(&proto_buf).await {
-            log::error!(
-                "[ANALYZE] FATAL: Node ID {}: Failed to write payload to socket: {}",
-                node_id,
-                e
-            );
-            break;
-        }
-
+    if let Some(current) = current_block.take() {
+        let leader_round = current.height * 2;
         log::info!(
-            "[ANALYZE] SUCCESS: Node ID {} sent block for round {} successfully.",
+            "[ANALYZE] Node ID {} Finalizing block for height {} (leader round {}) containing {} unique transactions ({} certificates) before shutdown.",
             node_id,
-            certificate.header.round
+            current.height,
+            leader_round,
+            current.transactions.len(),
+            current.certificate_count
         );
+
+        let block_count = 1;
+        if let Err(e) = emit_blocks(
+            &mut stream,
+            node_id,
+            vec![comm::CommittedBlock {
+                epoch: current.epoch,
+                height: current.height,
+                transactions: current.transactions,
+            }],
+            &mut last_committed_height_per_epoch,
+        )
+        .await
+        {
+            log::error!(
+                "[ANALYZE] FATAL: Node ID {} Failed to send final block: {}",
+                node_id,
+                e
+            );
+        } else {
+            log::info!(
+                "[ANALYZE] SUCCESS: Node ID {} sent {} block(s) successfully.",
+                node_id,
+                block_count
+            );
+        }
     }
 
     log::warn!(

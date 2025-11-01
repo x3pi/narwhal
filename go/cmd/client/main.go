@@ -24,7 +24,7 @@ func createRandomTransaction(randomValue uint64, size int) []byte {
 }
 
 func main() {
-	nodeAddress := "127.0.0.1:4111" // Thay đổi cổng này tới worker bạn muốn
+	nodeAddress := "127.0.0.1:4018" // Thay đổi cổng này tới worker bạn muốn
 	transactionSize := 128
 
 	// 1. Khởi tạo client.
@@ -41,7 +41,7 @@ func main() {
 
 	// --- Gửi giao dịch 1 (sample transaction) ---
 	log.Println("Đang gửi giao dịch #1...")
-	txData1 := createSampleTransaction(101, transactionSize)
+	txData1 := createSampleTransaction(553, transactionSize)
 	if err := client.SendTransaction(txData1); err != nil {
 		log.Fatalf("Gửi giao dịch #1 thất bại: %v", err)
 	}
@@ -49,7 +49,7 @@ func main() {
 
 	// --- Gửi giao dịch 2 (random transaction) ---
 	log.Println("Đang gửi giao dịch #2...")
-	txData2 := createRandomTransaction(202, transactionSize)
+	txData2 := createRandomTransaction(662, transactionSize)
 	if err := client.SendTransaction(txData2); err != nil {
 		log.Fatalf("Gửi giao dịch #2 thất bại: %v", err)
 	}

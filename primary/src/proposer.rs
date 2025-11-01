@@ -171,7 +171,12 @@ impl Proposer {
         }
 
         if deduplicated_payload.is_empty() {
-            debug!("No payload to include in header for round {}", self.round);
+            debug!(
+                "No payload to include in header for round {} (pending_payload_size = {}, queue_len = {})",
+                self.round,
+                self.pending_payload_size,
+                self.digests.len()
+            );
             // Still create an empty header if we have parents (for round advancement)
             // This is needed for empty rounds where no batches are available
             if !self.last_parents.is_empty() {
@@ -194,6 +199,14 @@ impl Proposer {
         }
 
         // Make a new header.
+        debug!(
+            "Creating header for round {} with {} payload digests (pending_payload_size before send = {}, queue_len = {})",
+            self.round,
+            deduplicated_payload.len(),
+            self.pending_payload_size,
+            self.digests.len()
+        );
+
         let header = Header::new(
             self.name,
             self.round,
@@ -270,6 +283,15 @@ impl Proposer {
                 accumulated_size += entry.size;
                 seen_digests.insert(entry.digest.clone());
                 collected.push((entry.digest.clone(), entry.worker_id));
+                debug!(
+                    "[COLLECT] Round {} queued batch {} from worker {} (size {} bytes). Accumulated payload = {} / target {}",
+                    self.round,
+                    entry.digest,
+                    entry.worker_id,
+                    entry.size,
+                    accumulated_size,
+                    self.header_size
+                );
                 entry.state = BatchState::InFlight {
                     round: self.round,
                     sent_at: Instant::now(),
@@ -288,6 +310,14 @@ impl Proposer {
                 continue;
             }
         }
+
+        debug!(
+            "[COLLECT] Finished round {} collection: {} digests totaling {} bytes (pending_payload_size now {}).",
+            self.round,
+            collected.len(),
+            accumulated_size,
+            self.pending_payload_size
+        );
 
         collected
     }
@@ -523,12 +553,30 @@ impl Proposer {
 
                     // Store the batch in the primary's store for the `analyze` function to find.
                     let size = digest.size();
+                    let raw_len = batch.len();
 
                     if self.digests.iter().any(|entry| entry.digest == digest) {
+                        debug!(
+                            "Ignoring duplicate batch {} from worker {} (already queued; pending_payload_size = {}).",
+                            digest,
+                            worker_id,
+                            self.pending_payload_size
+                        );
                         continue;
                     }
 
+                    debug!(
+                        "Received batch {} from worker {} (digest size {} bytes, raw payload {} bytes) at round {}.",
+                        digest,
+                        worker_id,
+                        size,
+                        raw_len,
+                        self.round
+                    );
+
                     self.store.write(digest.clone().to_vec(), batch).await;
+
+                    let digest_for_log = digest.clone();
 
                     self.digests.push_back(BatchEntry {
                         digest,
@@ -537,6 +585,12 @@ impl Proposer {
                         state: BatchState::Pending,
                     });
                     self.pending_payload_size += size;
+                    debug!(
+                        "Batch {} enqueued; pending_payload_size = {}, queue_len = {}",
+                        digest_for_log,
+                        self.pending_payload_size,
+                        self.digests.len()
+                    );
                 }
                 Some(committed) = self.rx_committed.recv() => {
                     self.mark_committed(committed);
