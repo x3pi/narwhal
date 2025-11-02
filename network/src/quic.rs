@@ -24,14 +24,34 @@ impl Connection for QuicConnection {
     }
 
     async fn recv(&mut self) -> TransportResult<Option<Bytes>> {
-        match self.connection.accept_uni().await {
-            Ok(mut recv_stream) => {
-                let buffer = recv_stream.read_to_end(128 * 1024 * 1024).await?;
-                Ok(Some(Bytes::from(buffer)))
+        // Ưu tiên nhận bidirectional stream (để có thể gửi ACK về)
+        // Nếu không có, fallback về unidirectional stream
+        tokio::select! {
+            result = self.connection.accept_bi() => {
+                match result {
+                    Ok((mut send_stream, mut recv_stream)) => {
+                        let buffer = recv_stream.read_to_end(128 * 1024 * 1024).await?;
+                        // Lưu send_stream để có thể gửi ACK (sẽ được xử lý bởi Writer)
+                        // Tạm thời đóng send_stream vì Writer sẽ tạo stream mới khi cần
+                        let _ = send_stream.finish().await;
+                        Ok(Some(Bytes::from(buffer)))
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(_)) => Ok(None),
+                    Err(quinn::ConnectionError::LocallyClosed) => Ok(None),
+                    Err(e) => Err(Box::new(e)),
+                }
             }
-            Err(quinn::ConnectionError::ApplicationClosed(_)) => Ok(None),
-            Err(quinn::ConnectionError::LocallyClosed) => Ok(None),
-            Err(e) => Err(Box::new(e)),
+            result = self.connection.accept_uni() => {
+                match result {
+                    Ok(mut recv_stream) => {
+                        let buffer = recv_stream.read_to_end(128 * 1024 * 1024).await?;
+                        Ok(Some(Bytes::from(buffer)))
+                    }
+                    Err(quinn::ConnectionError::ApplicationClosed(_)) => Ok(None),
+                    Err(quinn::ConnectionError::LocallyClosed) => Ok(None),
+                    Err(e) => Err(Box::new(e)),
+                }
+            }
         }
     }
 }

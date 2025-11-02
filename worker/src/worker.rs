@@ -264,7 +264,7 @@ struct TxReceiverHandler {
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
-    async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+    async fn dispatch(&self, writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         #[cfg(feature = "benchmark")]
         {
             // Tạo hash SHA-512 của toàn bộ nội dung transaction làm định danh
@@ -304,10 +304,22 @@ impl MessageHandler for TxReceiverHandler {
             );
         }
 
-        self.tx_batch_maker
-            .send(message.to_vec())
-            .await
-            .expect("Failed to send transaction");
+        // Gửi transaction vào batch maker
+        let send_result = self.tx_batch_maker.send(message.to_vec()).await;
+
+        // Gửi ACK về client để báo nhận được transaction thành công
+        // Lưu ý: Client cần sử dụng bidirectional stream để nhận được ACK này
+        if send_result.is_ok() {
+            if let Err(e) = writer.send(Bytes::from("ACK")).await {
+                log::warn!("Failed to send ACK to client: {}", e);
+            } else {
+                log::debug!("Sent ACK to client for received transaction");
+            }
+        } else {
+            // Nếu không thể gửi vào batch maker, không gửi ACK
+            log::error!("Failed to send transaction to batch maker, not sending ACK");
+        }
+
         Ok(())
     }
 }
