@@ -76,6 +76,37 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
+                    // Log when transaction is added to batch
+                    #[cfg(feature = "benchmark")]
+                    {
+                        // Tạo hash SHA-512 của toàn bộ nội dung transaction làm định danh
+                        let hash = Sha512::digest(&transaction);
+                        let mut digest_bytes = [0u8; 32];
+                        digest_bytes.copy_from_slice(&hash[..32]);
+                        let tx_digest = Digest(digest_bytes);
+
+                        // Also extract original tx ID if it's a sample transaction
+                        let original_tx_id = if transaction.len() > 8 && transaction[0] == 0u8 {
+                            let tx_id_bytes: [u8; 8] = transaction[1..9].try_into().unwrap_or([0; 8]);
+                            Some(u64::from_be_bytes(tx_id_bytes))
+                        } else {
+                            None
+                        };
+
+                        if let Some(orig_id) = original_tx_id {
+                            log::info!("[TX_ADDED_TO_BATCH] Transaction {} (tx_hash: {}) added to current batch (batch_size: {} bytes, tx_count: {})",
+                                orig_id,
+                                tx_digest,
+                                self.current_batch_size + transaction.len(),
+                                self.current_batch.len() + 1);
+                        } else {
+                            log::info!("[TX_ADDED_TO_BATCH] Transaction (tx_hash: {}) added to current batch (batch_size: {} bytes, tx_count: {})",
+                                tx_digest,
+                                self.current_batch_size + transaction.len(),
+                                self.current_batch.len() + 1);
+                        }
+                    }
+
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
@@ -100,14 +131,34 @@ impl BatchMaker {
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
 
-        // Look for sample txs (they all start with 0) and gather their txs id (the next 8 bytes).
         #[cfg(feature = "benchmark")]
-        let tx_ids: Vec<_> = self
+        let batch_len = self.current_batch.len();
+
+        // Extract both original tx IDs and transaction hashes (SHA-512, 32 bytes) for all transactions
+        #[cfg(feature = "benchmark")]
+        let (tx_ids, tx_hashes): (Vec<_>, Vec<_>) = self
             .current_batch
             .iter()
-            .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
-            .filter_map(|tx| tx[1..9].try_into().ok())
-            .collect();
+            .map(|tx| {
+                // Extract original tx ID if it's a sample transaction
+                let orig_id = if tx[0] == 0u8 && tx.len() > 8 {
+                    tx[1..9]
+                        .try_into()
+                        .ok()
+                        .map(|bytes: [u8; 8]| u64::from_be_bytes(bytes))
+                } else {
+                    None
+                };
+
+                // Tạo hash SHA-512 của toàn bộ nội dung transaction làm định danh
+                let hash = Sha512::digest(tx);
+                let mut digest_bytes = [0u8; 32];
+                digest_bytes.copy_from_slice(&hash[..32]);
+                let tx_digest = Digest(digest_bytes);
+
+                (orig_id, tx_digest)
+            })
+            .unzip();
 
         // Serialize the batch.
         self.current_batch_size = 0;
@@ -123,14 +174,34 @@ impl BatchMaker {
             bytes.copy_from_slice(&hash[..32]);
             let digest = Digest(bytes);
 
-            for id in tx_ids {
-                // NOTE: This log entry is used to compute performance.
-                info!(
-                    "Batch {:?} contains sample tx {}",
-                    digest,
-                    u64::from_be_bytes(id)
-                );
+            // Log sample transactions with original IDs
+            for orig_id_opt in &tx_ids {
+                if let Some(orig_id) = orig_id_opt {
+                    // NOTE: This log entry is used to compute performance.
+                    info!("Batch {:?} contains sample tx {}", digest, orig_id);
+                }
             }
+
+            // Log all transactions in batch with both original IDs (if available) and transaction hashes
+            let tx_info: Vec<String> = tx_ids
+                .iter()
+                .zip(tx_hashes.iter())
+                .map(|(orig_id_opt, tx_hash)| {
+                    if let Some(orig_id) = orig_id_opt {
+                        format!("{}[hash:{}]", orig_id, tx_hash)
+                    } else {
+                        format!("[hash:{}]", tx_hash)
+                    }
+                })
+                .collect();
+
+            info!(
+                "[BATCH_CREATED] Batch {:?} created with {} transactions (tx_info: {:?}, total_size: {} B)",
+                digest,
+                batch_len,
+                tx_info,
+                size
+            );
 
             // NOTE: This log entry is used to compute performance.
             info!("Batch {:?} contains {} B", digest, size);

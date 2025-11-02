@@ -2,7 +2,7 @@
 // Copyright (c) 2022, Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-use config::{Committee, Stake};
+use config::{Committee, Stake, RECONFIGURE_INTERVAL};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{debug, error, info, log_enabled, warn};
@@ -17,11 +17,6 @@ use store::Store;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
-
-// Interval for reconfiguration (round-based)
-pub const RECONFIGURE_INTERVAL: Round = 1000;
-// Stop accepting new batches starting from this round (5 rounds before reconfiguration)
-pub const RECONFIGURE_BATCH_STOP_ROUND: Round = 995;
 
 // ====================
 // ERROR DEFINITIONS

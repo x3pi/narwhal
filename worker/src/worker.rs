@@ -20,6 +20,10 @@ use network::{
 };
 use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "benchmark")]
+use sha3::{Digest as Sha3Digest, Sha3_512 as Sha512};
+#[cfg(feature = "benchmark")]
+use std::convert::TryInto as _;
 use std::error::Error;
 use store::Store;
 use tokio::sync::mpsc::{channel, Sender};
@@ -261,6 +265,45 @@ struct TxReceiverHandler {
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+        #[cfg(feature = "benchmark")]
+        {
+            // Tạo hash SHA-512 của toàn bộ nội dung transaction làm định danh
+            let hash = Sha512::digest(&message);
+            let mut digest_bytes = [0u8; 32];
+            digest_bytes.copy_from_slice(&hash[..32]);
+            let tx_digest = Digest(digest_bytes);
+
+            // Also extract original tx ID if it's a sample transaction (starts with 0)
+            let original_tx_id = if message.len() > 8 && message[0] == 0u8 {
+                let tx_id_bytes: [u8; 8] = message[1..9].try_into().unwrap_or([0; 8]);
+                Some(u64::from_be_bytes(tx_id_bytes))
+            } else {
+                None
+            };
+
+            if let Some(orig_id) = original_tx_id {
+                log::info!(
+                    "[TX_RECEIVED] Transaction {} (tx_hash: {}) received (size: {} bytes)",
+                    orig_id,
+                    tx_digest,
+                    message.len()
+                );
+            } else {
+                log::info!(
+                    "[TX_RECEIVED] Transaction (tx_hash: {}) received (size: {} bytes)",
+                    tx_digest,
+                    message.len()
+                );
+            }
+        }
+        #[cfg(not(feature = "benchmark"))]
+        {
+            log::debug!(
+                "[TX_RECEIVED] Transaction received (size: {} bytes)",
+                message.len()
+            );
+        }
+
         self.tx_batch_maker
             .send(message.to_vec())
             .await

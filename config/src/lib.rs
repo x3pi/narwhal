@@ -82,6 +82,13 @@ pub trait Export: Serialize {
 pub type Stake = u32;
 pub type WorkerId = u32;
 
+// Reconfiguration constants - centralized configuration
+pub type Round = u64;
+/// Interval for reconfiguration (round-based)
+pub const RECONFIGURE_INTERVAL: Round = 100000;
+/// Stop accepting new batches starting from this round (5 rounds before reconfiguration)
+pub const RECONFIGURE_BATCH_STOP_ROUND: Round = 99995;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Parameters {
     pub header_size: usize,

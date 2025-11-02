@@ -94,6 +94,13 @@ impl GarbageCollector {
                     digests.len(),
                     certificate.header.id
                 );
+                // Log each committed batch digest
+                for digest in &digests {
+                    info!(
+                        "[BATCH_COMMITTED] Batch {:?} committed at round {} in certificate {}",
+                        digest, round, certificate.header.id
+                    );
+                }
             }
         }
     }

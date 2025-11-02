@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
 use crate::primary::{CommittedBatches, Round};
-use config::{Committee, WorkerId};
+use config::{Committee, WorkerId, RECONFIGURE_BATCH_STOP_ROUND};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::debug;
@@ -12,9 +12,6 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
-
-// Stop accepting new batches starting from this round (5 rounds before reconfiguration)
-const RECONFIGURE_BATCH_STOP_ROUND: Round = 995;
 
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
