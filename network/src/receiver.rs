@@ -2,7 +2,7 @@
 use crate::transport::{Connection, Listener};
 use async_trait::async_trait;
 use bytes::Bytes;
-use log::{debug, info, warn};
+use log::{debug, warn};
 use std::error::Error;
 use std::net::SocketAddr;
 
@@ -41,7 +41,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                     continue;
                 }
             };
-            info!("Incoming connection established with {}", peer);
+            debug!("Incoming connection established with {}", peer);
             Self::spawn_runner(connection, peer, self.handler.clone()).await;
         }
     }
@@ -72,7 +72,7 @@ impl<Handler: MessageHandler> Receiver<Handler> {
                     }
                 }
             }
-            warn!("Connection closed by peer {}", peer);
+            debug!("Connection closed by peer {}", peer);
         });
     }
 }

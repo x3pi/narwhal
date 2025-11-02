@@ -312,18 +312,17 @@ impl Core {
             }
         }
 
-        log::info!(
-            "Sending certificate {:?} to consensus",
-            certificate.digest()
-        );
-
         // Send it to the consensus layer.
-        let id = certificate.header.id.clone();
-        if let Err(e) = self.tx_consensus.send(certificate).await {
-            warn!(
-                "Failed to deliver certificate {} to the consensus: {}",
-                id, e
-            );
+        let digest = certificate.digest();
+        match self.tx_consensus.send(certificate).await {
+            Ok(_) => {
+                debug!("Sending certificate {:?} to consensus", digest);
+            }
+            Err(_e) => {
+                // Only log once at debug level to avoid spam - consensus is likely shutting down
+                debug!("Consensus channel closed, stopping further certificate delivery");
+                return Ok(());
+            }
         }
         Ok(())
     }

@@ -4,7 +4,7 @@ use crate::primary::{CommittedBatches, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::Committee;
 use crypto::PublicKey;
-use log::{info, warn};
+use log::{debug, info};
 use network::SimpleSender;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -83,7 +83,7 @@ impl GarbageCollector {
                 })
                 .await
             {
-                warn!(
+                debug!(
                     "GarbageCollector: failed to notify proposer about committed round {}: {}",
                     round, e
                 );

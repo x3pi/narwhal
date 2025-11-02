@@ -2,7 +2,7 @@
 use crate::error::NetworkError;
 use crate::transport::Transport;
 use bytes::Bytes;
-use log::{info, warn};
+use log::{debug, warn};
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -124,7 +124,7 @@ impl Connection {
         loop {
             match self.transport.connect(self.address).await {
                 Ok(connection) => {
-                    info!("Outgoing connection established with {}", self.address);
+                    debug!("Outgoing connection established with {}", self.address);
                     delay = self.retry_delay;
                     retry = 0;
 

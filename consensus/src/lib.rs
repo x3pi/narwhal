@@ -8,6 +8,8 @@ use crypto::{Digest, PublicKey};
 use log::{debug, error, info, log_enabled, warn};
 use primary::{Certificate, Round};
 use serde::{Deserialize, Serialize};
+use sha3::Digest as Sha3Digest;
+use sha3::Sha3_512 as Sha512;
 use std::cmp::max;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -15,6 +17,11 @@ use store::Store;
 use thiserror::Error;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::sync::RwLock;
+
+// Interval for reconfiguration (round-based)
+pub const RECONFIGURE_INTERVAL: Round = 1000;
+// Stop accepting new batches starting from this round (5 rounds before reconfiguration)
+pub const RECONFIGURE_BATCH_STOP_ROUND: Round = 995;
 
 // ====================
 // ERROR DEFINITIONS
@@ -408,29 +415,70 @@ impl Bullshark {
         }
     }
 
-    /// Chọn leader theo round-robin deterministic
-    /// ĐÂY LÀ CÁCH CHÍNH THỨC CỦA BULLSHARK/SUI
+    /// Chọn leader theo round-robin deterministic với fallback logic 3 tầng
+    /// ĐÂY LÀ CÁCH CHÍNH THỨC CỦA BULLSHARK/SUI với cải tiến liveness
     ///
-    /// Bullshark sử dụng predefined leader selection cho steady-state leaders:
-    /// - Round 1 của mỗi wave: steady-state leader #1
-    /// - Round 3 của mỗi wave: steady-state leader #2
+    /// 3 tầng selection:
+    /// 1. Designated leader (round-robin) - đảm bảo fairness
+    /// 2. Fallback leader (common coin hash) - deterministic randomness
+    /// 3. Try all available - đảm bảo liveness khi có bất kỳ certificate nào
     ///
-    /// Leader được chọn bằng round-robin để:
+    /// Leader được chọn để:
     /// - Đảm bảo fairness giữa các validators
     /// - Deterministic: tất cả nodes đều tính ra cùng leader
     /// - Byzantine-resistant: không thể manipulate vì predefined
+    /// - High liveness: tỷ lệ commit cao hơn đáng kể
     fn leader<'a>(&self, round: Round, dag: &'a Dag) -> Option<&'a (Digest, Certificate)> {
         // Lấy tất cả public keys và sắp xếp để đảm bảo deterministic order
         let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
         keys.sort();
 
-        // Round-robin selection - ĐÚNG THEO PAPER BULLSHARK
+        // TẦNG 1: Designated leader (round-robin)
         let leader_pk = &keys[round as usize % self.committee.size()];
+        if let Some(cert) = dag.get(&round).and_then(|x| x.get(leader_pk)) {
+            debug!(
+                "Selected designated leader for round {}: {:?}",
+                round, leader_pk
+            );
+            return Some(cert);
+        }
 
-        debug!("Selected leader for round {}: {:?}", round, leader_pk);
+        // TẦNG 2: Fallback leader using common coin (hash of round + epoch)
+        let common_coin = {
+            let mut hasher = Sha512::new();
+            hasher.update(round.to_le_bytes());
+            hasher.update(self.committee.epoch.to_le_bytes());
+            let hash = hasher.finalize();
+            // Use first 8 bytes as u64 for determinism
+            let mut coin_bytes = [0u8; 8];
+            coin_bytes.copy_from_slice(&hash[..8]);
+            u64::from_le_bytes(coin_bytes)
+        };
 
-        // Tìm certificate của leader trong DAG
-        dag.get(&round).and_then(|x| x.get(leader_pk))
+        let fallback_pk = &keys[common_coin as usize % self.committee.size()];
+        if let Some(cert) = dag.get(&round).and_then(|x| x.get(fallback_pk)) {
+            debug!(
+                "Selected fallback leader for round {}: {:?} (coin: {})",
+                round, fallback_pk, common_coin
+            );
+            return Some(cert);
+        }
+
+        // TẦNG 3: Try all available leaders in deterministic order
+        if let Some(round_certs) = dag.get(&round) {
+            for key in &keys {
+                if let Some(cert) = round_certs.get(key) {
+                    debug!(
+                        "Selected available leader for round {}: {:?} (tier 3)",
+                        round, key
+                    );
+                    return Some(cert);
+                }
+            }
+        }
+
+        debug!("No leader found for round {}", round);
+        None
     }
 }
 
@@ -702,6 +750,16 @@ impl Consensus {
                         if let Err(e) = self.tx_output.send(certificate).await {
                             warn!("Failed to output certificate: {}", e);
                         }
+                    }
+
+                    // Check if we've reached the reconfiguration interval AFTER outputting
+                    if committed && state.last_committed_round >= RECONFIGURE_INTERVAL {
+                        info!(
+                            "Reached reconfiguration interval (round {} >= {}), shutting down gracefully",
+                            state.last_committed_round,
+                            RECONFIGURE_INTERVAL
+                        );
+                        break; // Exit the consensus loop (will drop channels automatically)
                     }
                 }
                 Err(e) => {

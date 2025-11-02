@@ -3,7 +3,7 @@ use crate::error::NetworkError;
 use crate::quic::QuicTransport;
 use crate::transport::Transport;
 use bytes::Bytes;
-use log::{info, warn};
+use log::{debug, warn};
 use rand::prelude::SliceRandom as _;
 use rand::rngs::SmallRng;
 use rand::SeedableRng as _;
@@ -101,7 +101,7 @@ impl ConnectionManager {
         loop {
             match self.transport.connect(self.address).await {
                 Ok(mut connection) => {
-                    info!("Outgoing connection established with {}", self.address);
+                    debug!("Outgoing connection established with {}", self.address);
                     retry_delay = Duration::from_millis(200);
 
                     while let Some(data) = self.receiver.recv().await {

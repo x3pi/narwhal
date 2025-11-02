@@ -13,6 +13,9 @@ use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
+// Stop accepting new batches starting from this round (5 rounds before reconfiguration)
+const RECONFIGURE_BATCH_STOP_ROUND: Round = 995;
+
 #[cfg(test)]
 #[path = "tests/proposer_tests.rs"]
 pub mod proposer_tests;
@@ -249,6 +252,17 @@ impl Proposer {
         self.digests
             .retain(|entry| !committed_digests_ref.contains_key(&entry.digest));
         self.pending_payload_size = self.pending_payload_size.saturating_sub(size_to_subtract);
+
+        // IMPORTANT: If we're at or past the batch stop round, return empty payload
+        // This allows consensus to continue but without processing transactions
+        if self.round >= RECONFIGURE_BATCH_STOP_ROUND {
+            debug!(
+                "[COLLECT] Round {} >= BATCH_STOP_ROUND {}. Returning empty payload to allow consensus to continue without processing new transactions.",
+                self.round,
+                RECONFIGURE_BATCH_STOP_ROUND
+            );
+            return Vec::new();
+        }
 
         let mut collected = Vec::new();
         let mut accumulated_size = 0usize;
