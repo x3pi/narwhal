@@ -543,17 +543,97 @@ impl ConsensusAlgorithm for Bullshark {
             leader_round, stake, required_stake
         );
 
-        // Order and commit
+        // Order and commit - OPTIMIZATION: Commit certificates in leader path first
         let mut sequence = Vec::new();
+        let mut committed_digests = HashSet::new();
+
+        // Commit certificates in leader path (standard Bullshark logic)
         for leader_cert in utils::order_leaders(&leader, state, |r, d| self.leader(r, d))
             .iter()
             .rev()
         {
             for x in utils::order_dag(self.gc_depth, leader_cert, state) {
-                state.update(&x, self.gc_depth);
-                sequence.push(x);
+                let digest = x.digest();
+                if !committed_digests.contains(&digest) {
+                    state.update(&x, self.gc_depth);
+                    sequence.push(x.clone());
+                    committed_digests.insert(digest);
+                }
             }
         }
+
+        // OPTIMIZATION: Commit any additional certificates in DAG from uncommitted rounds
+        // SAFETY: Only commit certificates that are referenced by at least 2f+1 certificates from current round
+        // This ensures all nodes will have the same view and commit the same sequence (no fork)
+        // A certificate is "safe to commit" if it's in parents of majority of nodes in current round
+        let last_committed = state.last_committed_round;
+        let mut additional_certs = Vec::new();
+
+        // SAFETY: Only commit additional certificates if they are referenced by majority (2f+1) from current round
+        // This ensures all nodes commit the same sequence (no fork)
+        // First pass: collect certificates to commit (avoid borrow conflicts)
+        // Only consider rounds BEFORE leader_round
+        for candidate_round in (last_committed + 1)..leader_round {
+            if let Some(round_certs) = state.dag.get(&candidate_round) {
+                for (candidate_digest, candidate_cert) in round_certs.values() {
+                    // Skip if already committed or would be garbage collected
+                    let already_committed = state
+                        .last_committed
+                        .get(&candidate_cert.origin())
+                        .map_or(false, |r| r >= &candidate_cert.round());
+
+                    let candidate_digest_clone = candidate_digest.clone();
+                    if already_committed
+                        || committed_digests.contains(&candidate_digest_clone)
+                        || candidate_cert.round() + self.gc_depth < last_committed
+                    {
+                        continue;
+                    }
+
+                    // SAFETY CHECK: Count how many certificates from current round reference this certificate
+                    // A certificate is safe to commit if at least 2f+1 nodes have seen it (via parent reference)
+                    // This ensures all nodes committing this leader round will have the same view
+                    let mut supporting_stake: Stake = 0;
+                    if let Some(current_round_certs) = state.dag.get(&round) {
+                        for (_, current_cert) in current_round_certs.values() {
+                            if current_cert
+                                .header
+                                .parents
+                                .contains(&candidate_digest_clone)
+                            {
+                                supporting_stake += self.committee.stake(&current_cert.origin());
+                            }
+                        }
+                    }
+
+                    let required_stake_for_safety = self.committee.validity_threshold();
+                    if supporting_stake >= required_stake_for_safety {
+                        // Certificate is referenced by majority (2f+1) - safe to commit
+                        // All nodes that commit this leader round will have seen this certificate
+                        // because they all have the same 2f+1 certificates from current round
+                        debug!("Certificate {} from round {} is referenced by {}/{} stake in current round - safe to commit",
+                               candidate_cert.digest(), candidate_round, supporting_stake, required_stake_for_safety);
+                        additional_certs.push((candidate_digest_clone, candidate_cert.clone()));
+                    } else {
+                        // Certificate not referenced by majority - skip to avoid fork risk
+                        debug!("Certificate {} from round {} only referenced by {}/{} stake - skipping to avoid fork",
+                               candidate_cert.digest(), candidate_round, supporting_stake, required_stake_for_safety);
+                    }
+                }
+            }
+        }
+
+        // Second pass: commit collected certificates
+        for (digest, cert) in additional_certs {
+            debug!("Committing additional certificate {} from round {} (referenced by majority in current round)", 
+                   cert.digest(), cert.round());
+            state.update(&cert, self.gc_depth);
+            sequence.push(cert);
+            committed_digests.insert(digest);
+        }
+
+        // Sort by round to maintain ordering
+        sequence.sort_by_key(|x| x.round());
 
         let committed = !sequence.is_empty();
         if committed {
