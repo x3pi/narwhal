@@ -99,7 +99,7 @@ impl Default for Parameters {
             header_size: 1_000,
             max_header_delay: 100,
             gc_depth: 50,
-            sync_retry_delay: 5_000,
+            sync_retry_delay: 1_000,
             sync_retry_nodes: 3,
             batch_size: 500_000,
             max_batch_delay: 100,

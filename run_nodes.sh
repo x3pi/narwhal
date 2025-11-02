@@ -14,7 +14,7 @@ BENCHMARK_DIR="benchmark"
 NODE_BINARY="./target/release/node"
 
 LOG_DIR="$BENCHMARK_DIR/logs"
-COMMITTEE_FILE="$BENCHMARK_DIR/.committee.json"
+COMMITTEE_FILE="$BENCHMARK_DIR/committlee.json"
 PARAMETERS_FILE="$BENCHMARK_DIR/.parameters.json"
 
 # --- Dọn dẹp triệt để trước khi chạy ---
@@ -45,7 +45,7 @@ for i in $(seq 0 $((NODES-1))); do
     primary_db_path="$BENCHMARK_DIR/db-primary-$i"
     primary_log_file="$LOG_DIR/primary-$i.log"
     primary_cmd="$NODE_BINARY run --keys '$key_file' --committee '$COMMITTEE_FILE' --parameters '$PARAMETERS_FILE' --store '$primary_db_path' primary"
-    tmux new -d -s "primary-$i" "RUST_LOG=debug $primary_cmd > '$primary_log_file' 2>&1"
+    tmux new -d -s "primary-$i" "RUST_LOG=info $primary_cmd > '$primary_log_file' 2>&1"
     
     # --- Khởi chạy tất cả Workers cho node này ---
     WORKERS_PER_NODE=$(jq ".authorities.\"$AUTHORITY_NAME\".workers | length" < "$COMMITTEE_FILE")
@@ -53,7 +53,7 @@ for i in $(seq 0 $((NODES-1))); do
         worker_db_path="$BENCHMARK_DIR/db-worker-$i-$j"
         worker_log_file="$LOG_DIR/worker-$i-$j.log"
         worker_cmd="$NODE_BINARY run --keys '$key_file' --committee '$COMMITTEE_FILE' --parameters '$PARAMETERS_FILE' --store '$worker_db_path' worker --id $j"
-        tmux new -d -s "worker-$i-$j" "RUST_LOG=debug $worker_cmd > '$worker_log_file' 2>&1"
+        tmux new -d -s "worker-$i-$j" "RUST_LOG=info $worker_cmd > '$worker_log_file' 2>&1"
     done
 done
 

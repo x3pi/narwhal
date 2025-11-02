@@ -24,7 +24,7 @@ func createRandomTransaction(randomValue uint64, size int) []byte {
 }
 
 func main() {
-	nodeAddress := "127.0.0.1:4018" // Thay đổi cổng này tới worker bạn muốn
+	nodeAddress := "127.0.0.1:12000" // Thay đổi cổng này tới worker bạn muốn
 	transactionSize := 128
 
 	// 1. Khởi tạo client.

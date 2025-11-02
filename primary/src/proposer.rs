@@ -115,7 +115,7 @@ impl Proposer {
                 pending_payload_size: 0,
                 latest_committed_round: 0,
                 committed_digests: HashMap::new(),
-                max_retry_rounds: 20, // Don't retry batches that have been InFlight for more than 20 rounds
+                max_retry_rounds: 1000, // Don't retry batches that have been InFlight for more than 1000 rounds
                 max_committed_digests: 10000, // Cleanup old digests when this limit is reached
             }
             .run()
@@ -253,6 +253,7 @@ impl Proposer {
         let mut collected = Vec::new();
         let mut accumulated_size = 0usize;
         let mut seen_digests = HashSet::new(); // Track digests in this header to avoid duplicates
+        let mut inflight_skipped = 0usize;
 
         for entry in self.digests.iter_mut() {
             if accumulated_size >= self.header_size {
@@ -279,6 +280,12 @@ impl Proposer {
                 continue;
             }
 
+            // OPTIMIZATION: Skip InFlight batches immediately without logging each one
+            if matches!(entry.state, BatchState::InFlight { .. }) {
+                inflight_skipped += 1;
+                continue;
+            }
+
             if matches!(entry.state, BatchState::Pending) {
                 accumulated_size += entry.size;
                 seen_digests.insert(entry.digest.clone());
@@ -297,18 +304,14 @@ impl Proposer {
                     sent_at: Instant::now(),
                 };
                 self.pending_payload_size = self.pending_payload_size.saturating_sub(entry.size);
-            } else if let BatchState::InFlight {
-                round: old_round, ..
-            } = entry.state
-            {
-                // CRITICAL: Don't re-propose batches that are already InFlight
-                // This prevents the same batch from being included in multiple headers
-                warn!(
-                    "Batch {} is already InFlight from round {}, skipping in round {}",
-                    entry.digest, old_round, self.round
-                );
-                continue;
             }
+        }
+
+        if inflight_skipped > 0 {
+            debug!(
+                "[COLLECT] Skipped {} InFlight batches during collection for round {}",
+                inflight_skipped, self.round
+            );
         }
 
         debug!(
@@ -404,6 +407,7 @@ impl Proposer {
         let mut skipped_committed = 0usize;
         let mut skipped_too_old = 0usize;
         let mut requeued_old = 0usize;
+        let mut removed_too_old = 0usize;
 
         for entry in self.digests.iter_mut() {
             if let BatchState::InFlight { round, sent_at } = entry.state {
@@ -416,6 +420,19 @@ impl Proposer {
 
                 // Check if batch is too old (InFlight for more than max_retry_rounds)
                 let is_too_old = self.round > round.saturating_add(self.max_retry_rounds);
+                // Check if batch is extremely old (InFlight for more than max_retry_rounds * 2)
+                let is_extremely_old = self.round > round.saturating_add(self.max_retry_rounds * 2);
+
+                if is_extremely_old {
+                    // Remove extremely old batches - they will never be committed
+                    warn!(
+                        "Removing extremely old batch {} (sent at round {}, current round {}, extremely old threshold: {})",
+                        entry.digest, round, self.round, self.max_retry_rounds * 2
+                    );
+                    entry.state = BatchState::Committed;
+                    removed_too_old += 1;
+                    continue;
+                }
 
                 if is_too_old {
                     // For very old batches, only retry if latest_committed_round hasn't advanced much
@@ -492,6 +509,13 @@ impl Proposer {
             debug!(
                 "Skipped {} batches that are too old and likely already committed (max_retry_rounds = {}). These batches remain in InFlight state and will be marked as Committed when commit notification is received.",
                 skipped_too_old, self.max_retry_rounds
+            );
+        }
+
+        if removed_too_old > 0 {
+            warn!(
+                "Removed {} extremely old batches (max_retry_rounds * 2 = {}) that will never be committed",
+                removed_too_old, self.max_retry_rounds * 2
             );
         }
 

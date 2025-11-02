@@ -214,7 +214,7 @@ async fn load_initial_committee(
     store: &mut Store,
     node_config: &NodeConfig,
 ) -> Result<Committee> {
-    let always_false = false; // Tạm thời để logic UDS chạy
+    let always_false = true; // Tạm thời để logic UDS chạy
     if always_false && committee_file.is_some() {
         let filename = committee_file.unwrap();
         log::info!("[New Branch] Loading committee from file: {}", filename);
@@ -322,6 +322,8 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
     let committee = load_initial_committee(committee_file, &mut store_for_committee, &node_config)
         .await
         .context("Failed to initialize committee")?;
+
+    log::info!("Committee: {:?}", committee);
 
     let (tx_output, rx_output) = channel(CHANNEL_CAPACITY);
     let initial_epoch = committee.epoch;
