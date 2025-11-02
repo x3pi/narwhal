@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header, Vote};
 use bytes::Bytes;
-use config::{Authority, Committee, PrimaryAddresses, WorkerAddresses};
+use config::{Authority, Committee, PrimaryAddresses, RoundWithEpoch, WorkerAddresses};
 use crypto::Hash as _;
 use crypto::{
     generate_consensus_keypair, generate_keypair, ConsensusPublicKey, ConsensusSecretKey,
@@ -106,10 +106,11 @@ pub fn committee_with_base_port(base_port: u16) -> Committee {
 // Fixture: Cập nhật để ký bằng ConsensusSecretKey.
 pub fn header() -> Header {
     let (author, _, _, secret) = keys().pop().unwrap();
+    let comm = committee();
     let header = Header {
         author,
-        round: 1,
-        parents: Certificate::genesis(&committee())
+        round_with_epoch: RoundWithEpoch::from_round_and_committee(1, &comm),
+        parents: Certificate::genesis(&comm)
             .iter()
             .map(|x| x.digest())
             .collect(),
@@ -124,14 +125,16 @@ pub fn header() -> Header {
 }
 
 // Fixture: Cập nhật để ký bằng ConsensusSecretKey.
+#[allow(dead_code)]
 pub fn headers() -> Vec<Header> {
+    let comm = committee();
     keys()
         .into_iter()
         .map(|(author, _, _, secret)| {
             let header = Header {
                 author,
-                round: 1,
-                parents: Certificate::genesis(&committee())
+                round_with_epoch: RoundWithEpoch::from_round_and_committee(1, &comm),
+                parents: Certificate::genesis(&comm)
                     .iter()
                     .map(|x| x.digest())
                     .collect(),
@@ -151,17 +154,17 @@ pub fn headers() -> Vec<Header> {
 pub fn votes(header: &Header) -> Vec<Vote> {
     keys()
         .into_iter()
-        .map(|(author, _, _, secret)| {
+        .map(|(author, _, _, consensus_secret)| {
             let vote = Vote {
                 id: header.id.clone(),
-                round: header.round,
+                round_with_epoch: header.round_with_epoch,
                 origin: header.author,
                 author,
                 signature: Signature::default(),
             };
             let digest = vote.digest();
             Vote {
-                signature: Signature::new(&digest, &secret),
+                signature: Signature::new(&digest, &consensus_secret),
                 ..vote
             }
         })
@@ -170,12 +173,25 @@ pub fn votes(header: &Header) -> Vec<Vote> {
 
 // Fixture
 pub fn certificate(header: &Header) -> Certificate {
+    // Create certificate first to get its digest
+    let cert = Certificate {
+        header: header.clone(),
+        votes: Vec::new(),
+    };
+    let cert_digest = cert.digest();
+
+    // Create votes with signatures on certificate digest, not vote digest
+    let votes_with_sigs: Vec<_> = keys()
+        .into_iter()
+        .map(|(author, _, _, consensus_secret)| {
+            let signature = Signature::new(&cert_digest, &consensus_secret);
+            (author, signature)
+        })
+        .collect();
+
     Certificate {
         header: header.clone(),
-        votes: votes(header)
-            .into_iter()
-            .map(|x| (x.author, x.signature))
-            .collect(),
+        votes: votes_with_sigs,
     }
 }
 

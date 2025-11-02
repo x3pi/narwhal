@@ -131,7 +131,7 @@ impl HeaderWaiter {
                         WaiterMessage::SyncBatches(missing, header) => {
                             debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();
-                            let round = header.round;
+                            let round = header.round();
                             let author = header.author;
 
                             // Ensure we sync only once per header.
@@ -174,7 +174,7 @@ impl HeaderWaiter {
                         WaiterMessage::SyncParents(missing, header) => {
                             debug!("Synching the parents of {}", header);
                             let header_id = header.id.clone();
-                            let round = header.round;
+                            let round = header.round();
                             let author = header.author;
 
                             // Ensure we sync only once per header.

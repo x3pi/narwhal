@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
 use crate::primary::{CommittedBatches, Round};
-use config::{Committee, WorkerId, RECONFIGURE_BATCH_STOP_ROUND};
+use config::{Committee, RoundWithEpoch, WorkerId, RECONFIGURE_BATCH_STOP_ROUND};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 #[cfg(feature = "benchmark")]
@@ -35,6 +35,8 @@ enum BatchState {
 pub struct Proposer {
     /// The public key of this primary.
     name: PublicKey,
+    /// Committee information (for epoch)
+    committee: Committee,
     /// Service to sign headers.
     signature_service: SignatureService,
     /// The persistent storage.
@@ -99,10 +101,12 @@ impl Proposer {
             .map(|x| x.digest())
             .collect();
 
+        let committee_clone = committee.clone();
         let shutdown_handle_clone = shutdown_handle.clone();
         tokio::spawn(async move {
             Self {
                 name,
+                committee: committee_clone,
                 signature_service,
                 store,
                 header_size,
@@ -194,9 +198,11 @@ impl Proposer {
             // Still create an empty header if we have parents (for round advancement)
             // This is needed for empty rounds where no batches are available
             if !self.last_parents.is_empty() {
+                let round_with_epoch =
+                    RoundWithEpoch::from_round_and_committee(self.round, &self.committee);
                 let header = Header::new(
                     self.name,
-                    self.round,
+                    round_with_epoch,
                     BTreeMap::new(),
                     self.last_parents.drain(..).collect(),
                     &mut self.signature_service,
@@ -221,9 +227,11 @@ impl Proposer {
             self.digests.len()
         );
 
+        let round_with_epoch =
+            RoundWithEpoch::from_round_and_committee(self.round, &self.committee);
         let header = Header::new(
             self.name,
-            self.round,
+            round_with_epoch,
             deduplicated_payload.into_iter().collect(),
             self.last_parents.drain(..).collect(),
             &mut self.signature_service,

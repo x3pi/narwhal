@@ -33,14 +33,18 @@ impl VotesAggregator {
         // Ensure it is the first time this authority votes.
         ensure!(self.used.insert(author), DagError::AuthorityReuse(author));
 
+        // Vote signature đã được tạo với certificate digest khi vote được tạo
         self.votes.push((author, vote.signature));
         self.weight += committee.stake(&author);
+
         if self.weight >= committee.quorum_threshold() {
             self.weight = 0; // Ensures quorum is only reached once.
-            return Ok(Some(Certificate {
+
+            let certificate = Certificate {
                 header: header.clone(),
                 votes: self.votes.clone(),
-            }));
+            };
+            return Ok(Some(certificate));
         }
         Ok(None)
     }

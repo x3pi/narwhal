@@ -625,7 +625,7 @@ async fn analyze(
             );
             // KHÔNG break ngay - tiếp tục xử lý cho đến khi đạt target_height
         }
-        let commit_round = certificate.header.round;
+        let commit_round = certificate.header.round();
         let epoch = initial_epoch;
 
         log::info!(

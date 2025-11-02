@@ -1,8 +1,11 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{
-    certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
+    certificate, committee, committee_with_base_port, header, keys, listener, votes,
 };
+use crate::messages::Header;
+use config::RoundWithEpoch;
+use crypto::Signature;
 use dashmap::DashMap; // Thêm import cho DashMap
 use futures::future::try_join_all;
 use std::fs;
@@ -315,21 +318,29 @@ async fn process_certificates() {
     let _ = fs::remove_dir_all(path);
     let mut store = Store::new(path).unwrap();
 
+    // Store genesis certificates so that deliver_certificate can find parents
+    let comm = committee();
+    let genesis_certificates = Certificate::genesis(&comm);
+    for genesis_cert in &genesis_certificates {
+        let bytes = bincode::serialize(genesis_cert).unwrap();
+        store.write(genesis_cert.digest().to_vec(), bytes).await;
+    }
+
     // Make a synchronizer for the core.
     let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
-        &committee(),
+        &comm,
         store.clone(),
         payload_cache, // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
 
-    // Spawn the core.
+    // Spawn the core with the same committee instance
     Core::spawn(
         name,
-        committee(),
+        comm.clone(),
         store.clone(),
         synchronizer,
         signature_service,
@@ -345,11 +356,69 @@ async fn process_certificates() {
     );
 
     // Send enough certificates to the core.
-    let certificates: Vec<_> = headers()
+    // Use headers from the same committee - must use consensus keys for signing
+    let cert_headers: Vec<_> = {
+        let comm_for_headers = comm.clone();
+        keys()
+            .into_iter()
+            .take(3)
+            .map(|(author, _, consensus_pk, consensus_secret)| {
+                // Verify author matches consensus key in committee
+                assert_eq!(
+                    comm_for_headers.consensus_key(&author).unwrap(),
+                    consensus_pk
+                );
+
+                let header = Header {
+                    author,
+                    round_with_epoch: RoundWithEpoch::from_round_and_committee(
+                        1,
+                        &comm_for_headers,
+                    ),
+                    parents: Certificate::genesis(&comm_for_headers)
+                        .iter()
+                        .map(|x| x.digest())
+                        .collect(),
+                    ..Header::default()
+                };
+                let id = header.digest();
+                Header {
+                    id: id.clone(),
+                    signature: Signature::new(&id, &consensus_secret), // Use consensus secret key
+                    ..header
+                }
+            })
+            .collect()
+    };
+    let certificates: Vec<_> = cert_headers
         .iter()
-        .take(3)
         .map(|header| certificate(header))
         .collect();
+
+    // Verify all headers first
+    for header in &cert_headers {
+        match header.verify(&comm) {
+            Ok(()) => {}
+            Err(e) => panic!(
+                "Header verification failed: {:?}. Header: {:?}",
+                e,
+                header.digest()
+            ),
+        }
+    }
+
+    // Verify all certificates before sending
+    for cert in &certificates {
+        match cert.verify(&comm) {
+            Ok(()) => {}
+            Err(e) => panic!(
+                "Certificate verification failed: {:?}. Certificate: {:?}, Header verify: {:?}",
+                e,
+                cert.digest(),
+                cert.header.verify(&comm)
+            ),
+        }
+    }
 
     for x in certificates.clone() {
         tx_primary_messages
@@ -358,14 +427,33 @@ async fn process_certificates() {
             .unwrap();
     }
 
+    // Give the core some time to process certificates
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
     // Ensure the core sends the parents of the certificates to the proposer.
-    let received = rx_parents.recv().await.unwrap();
+    // Note: certificates aggregator needs quorum (3 out of 4 authorities with stake 1 each)
+    // With 3 certificates from 3 different authorities, we should have stake 3 >= quorum threshold 3
+    let received = tokio::time::timeout(
+        tokio::time::Duration::from_secs(10),
+        rx_parents.recv()
+    ).await.unwrap_or_else(|_| {
+        panic!("Timeout waiting for parents from proposer. Certificates may not have reached quorum.");
+    }).unwrap();
     let parents = certificates.iter().map(|x| x.digest()).collect();
     assert_eq!(received, (parents, 1));
 
     // Ensure the core sends the certificates to the consensus.
     for x in certificates.clone() {
-        let received = rx_consensus.recv().await.unwrap();
+        let received =
+            tokio::time::timeout(tokio::time::Duration::from_secs(10), rx_consensus.recv())
+                .await
+                .unwrap_or_else(|_| {
+                    panic!(
+                        "Timeout waiting for certificate {:?} from consensus",
+                        x.digest()
+                    );
+                })
+                .unwrap();
         assert_eq!(received, x);
     }
 

@@ -135,7 +135,7 @@ impl Core {
             .expect("Failed to serialize our own header");
         let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
         self.cancel_handlers
-            .entry(header.round)
+            .entry(header.round())
             .or_insert_with(Vec::new)
             .extend(handlers);
 
@@ -148,7 +148,7 @@ impl Core {
         debug!("Processing {:?}", header);
         // Indicate that we are processing this header.
         self.processing
-            .entry(header.round)
+            .entry(header.round())
             .or_insert_with(HashSet::new)
             .insert(header.id.clone());
 
@@ -165,7 +165,7 @@ impl Core {
         let mut stake = 0;
         for x in parents {
             ensure!(
-                x.round() + 1 == header.round,
+                x.round() + 1 == header.round(),
                 DagError::MalformedHeader(header.id.clone())
             );
             stake += self.committee.stake(&x.origin());
@@ -189,11 +189,11 @@ impl Core {
         // Check if we can vote for this header.
         if self
             .last_voted
-            .entry(header.round)
+            .entry(header.round())
             .or_insert_with(HashSet::new)
             .insert(header.author)
         {
-            // Make a vote and send it to the header's creator.
+            // Make a vote. Vote::new() sẽ tạo signature với certificate digest
             let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
             debug!("Created {:?}", vote);
             if vote.origin == self.name {
@@ -210,7 +210,7 @@ impl Core {
                     .expect("Failed to serialize our own vote");
                 let handler = self.network.send(address, Bytes::from(bytes)).await;
                 self.cancel_handlers
-                    .entry(header.round)
+                    .entry(header.round())
                     .or_insert_with(Vec::new)
                     .push(handler);
             }
@@ -225,7 +225,7 @@ impl Core {
         // QUAN TRỌNG: KHÔNG tạo certificate mới từ votes nếu đã shutdown
         // Đảm bảo không có certificates mới được tạo sau RECONFIGURE_INTERVAL
         if self.shutdown_handle.is_shutdown() {
-            debug!("Core: Shutdown signal received, refusing to create certificate from vote for round {}", vote.round);
+            debug!("Core: Shutdown signal received, refusing to create certificate from vote for round {}", vote.round());
             return Ok(());
         }
 
@@ -269,7 +269,7 @@ impl Core {
         // processing of the certificate even if we don't have them in store right now.
         if !self
             .processing
-            .get(&certificate.header.round)
+            .get(&certificate.header.round())
             .map_or_else(|| false, |x| x.contains(&certificate.header.id))
         {
             // This function may still throw an error if the storage fails.
@@ -355,8 +355,8 @@ impl Core {
 
     fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
         ensure!(
-            self.gc_round <= header.round,
-            DagError::TooOld(header.id.clone(), header.round)
+            self.gc_round <= header.round(),
+            DagError::TooOld(header.id.clone(), header.round())
         );
 
         // Verify the header's signature.
@@ -369,15 +369,15 @@ impl Core {
 
     fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
         ensure!(
-            self.current_header.round <= vote.round,
-            DagError::TooOld(vote.digest(), vote.round)
+            self.current_header.round() <= vote.round(),
+            DagError::TooOld(vote.digest(), vote.round())
         );
 
         // Ensure we receive a vote on the expected header.
         ensure!(
             vote.id == self.current_header.id
                 && vote.origin == self.current_header.author
-                && vote.round == self.current_header.round,
+                && vote.round() == self.current_header.round(),
             DagError::UnexpectedVote(vote.id.clone())
         );
 

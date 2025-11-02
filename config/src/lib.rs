@@ -160,6 +160,32 @@ pub struct Committee {
     pub epoch: u64,
 }
 
+/// Round luôn đi kèm với epoch để đảm bảo tính nhất quán
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct RoundWithEpoch {
+    pub round: Round,
+    pub epoch: u64,
+}
+
+impl RoundWithEpoch {
+    pub fn new(round: Round, epoch: u64) -> Self {
+        Self { round, epoch }
+    }
+
+    pub fn from_round_and_committee(round: Round, committee: &Committee) -> Self {
+        Self {
+            round,
+            epoch: committee.epoch,
+        }
+    }
+}
+
+impl Default for RoundWithEpoch {
+    fn default() -> Self {
+        Self { round: 0, epoch: 0 }
+    }
+}
+
 impl Import for Committee {}
 impl Export for Committee {}
 

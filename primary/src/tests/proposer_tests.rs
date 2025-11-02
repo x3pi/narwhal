@@ -39,7 +39,7 @@ async fn propose_empty() {
 
     // Ensure the proposer makes a correct empty header.
     let header = rx_headers.recv().await.unwrap();
-    assert_eq!(header.round, 1);
+    assert_eq!(header.round(), 1);
     assert!(header.payload.is_empty());
     assert!(header.verify(&committee()).is_ok());
 }
@@ -88,7 +88,7 @@ async fn propose_payload() {
 
     // Ensure the proposer makes a correct header from the provided payload.
     let header = rx_headers.recv().await.unwrap();
-    assert_eq!(header.round, 1);
+    assert_eq!(header.round(), 1);
     assert_eq!(header.payload.get(&digest), Some(&worker_id));
     assert!(header.verify(&committee()).is_ok());
 }

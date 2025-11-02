@@ -1,8 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::error::{DagError, DagResult};
 use crate::primary::Round;
-use config::{Committee, WorkerId};
+use config::{Committee, RoundWithEpoch, WorkerId};
 use crypto::{ConsensusPublicKey, Digest, Hash, PublicKey, Signature, SignatureService};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use sha3::Digest as Sha3Digest;
 use sha3::Sha3_512 as Sha512;
@@ -12,7 +13,7 @@ use std::fmt;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Header {
     pub author: PublicKey,
-    pub round: Round,
+    pub round_with_epoch: RoundWithEpoch,
     pub payload: BTreeMap<Digest, WorkerId>,
     pub parents: BTreeSet<Digest>,
     pub id: Digest,
@@ -23,7 +24,7 @@ impl Default for Header {
     fn default() -> Self {
         Self {
             author: PublicKey::default(),
-            round: 0,
+            round_with_epoch: RoundWithEpoch::default(),
             payload: BTreeMap::new(),
             parents: BTreeSet::new(),
             id: Digest::default(),
@@ -33,16 +34,26 @@ impl Default for Header {
 }
 
 impl Header {
+    /// Lấy round (backward compatibility)
+    pub fn round(&self) -> Round {
+        self.round_with_epoch.round
+    }
+
+    /// Lấy epoch
+    pub fn epoch(&self) -> u64 {
+        self.round_with_epoch.epoch
+    }
+
     pub async fn new(
         author: PublicKey,
-        round: Round,
+        round_with_epoch: RoundWithEpoch,
         payload: BTreeMap<Digest, WorkerId>,
         parents: BTreeSet<Digest>,
         signature_service: &mut SignatureService,
     ) -> Self {
         let header = Self {
             author,
-            round,
+            round_with_epoch,
             payload,
             parents,
             id: Digest::default(),
@@ -59,7 +70,27 @@ impl Header {
 
     pub fn verify(&self, committee: &Committee) -> DagResult<()> {
         // Ensure the header id is well formed.
-        ensure!(self.digest() == self.id, DagError::InvalidHeaderId);
+        let computed_digest = self.digest();
+        ensure!(computed_digest == self.id, {
+            warn!(
+                "Header id mismatch: computed={:?}, stored={:?}, epoch={}, round={}, author={:?}",
+                computed_digest,
+                self.id,
+                self.round_with_epoch.epoch,
+                self.round(),
+                self.author
+            );
+            DagError::InvalidHeaderId
+        });
+
+        // Ensure the epoch in header matches the committee epoch.
+        ensure!(self.round_with_epoch.epoch == committee.epoch, {
+            warn!(
+                    "Header epoch mismatch: header epoch={}, committee epoch={}, round={}, author={:?}, id={:?}",
+                    self.round_with_epoch.epoch, committee.epoch, self.round(), self.author, self.id
+                );
+            DagError::MalformedHeader(self.id.clone())
+        });
 
         // Ensure the authority has voting rights.
         let voting_rights = committee.stake(&self.author);
@@ -81,7 +112,18 @@ impl Header {
             .ok_or_else(|| DagError::UnknownAuthority(self.author.clone()))?;
         self.signature
             .verify(&self.id, &consensus_pk)
-            .map_err(DagError::from)
+            .map_err(|e| {
+                warn!(
+                    "Header signature verification failed: header epoch={}, committee epoch={}, round={}, author={:?}, id={:?}, error={:?}",
+                    self.round_with_epoch.epoch,
+                    committee.epoch,
+                    self.round(),
+                    self.author,
+                    self.id,
+                    e
+                );
+                DagError::InvalidSignature(e)
+            })
     }
 }
 
@@ -89,7 +131,8 @@ impl Hash for Header {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
         hasher.update(self.author.as_ref());
-        hasher.update(self.round.to_le_bytes());
+        hasher.update(self.round_with_epoch.round.to_le_bytes());
+        hasher.update(self.round_with_epoch.epoch.to_le_bytes());
         for (x, y) in &self.payload {
             hasher.update(x.as_ref());
             hasher.update(y.to_le_bytes());
@@ -108,9 +151,10 @@ impl fmt::Debug for Header {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: B{}({}, {})",
+            "{}: B{}(epoch:{}, {}, {})",
             self.id,
-            self.round,
+            self.round(),
+            self.epoch(),
             self.author,
             self.payload.keys().map(|x| x.size()).sum::<usize>(),
         )
@@ -119,20 +163,30 @@ impl fmt::Debug for Header {
 
 impl fmt::Display for Header {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
-        write!(f, "B{}({})", self.round, self.author)
+        write!(f, "B{}({})", self.round(), self.author)
     }
 }
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Vote {
     pub id: Digest,
-    pub round: Round,
+    pub round_with_epoch: RoundWithEpoch,
     pub origin: PublicKey,
     pub author: PublicKey,
     pub signature: Signature,
 }
 
 impl Vote {
+    /// Lấy round (backward compatibility)
+    pub fn round(&self) -> Round {
+        self.round_with_epoch.round
+    }
+
+    /// Lấy epoch
+    pub fn epoch(&self) -> u64 {
+        self.round_with_epoch.epoch
+    }
+
     pub async fn new(
         header: &Header,
         author: &PublicKey,
@@ -140,12 +194,23 @@ impl Vote {
     ) -> Self {
         let vote = Self {
             id: header.id.clone(),
-            round: header.round,
+            round_with_epoch: header.round_with_epoch,
             origin: header.author.clone(),
             author: author.clone(),
             signature: Signature::default(),
         };
-        let signature = signature_service.request_signature(vote.digest()).await;
+
+        // Tính certificate digest để ký với nó (không phải vote digest)
+        // Certificate digest chỉ phụ thuộc vào header.id, round, epoch, và origin
+        // nên có thể tính trước khi certificate được tạo
+        let temp_cert = Certificate {
+            header: header.clone(),
+            votes: Vec::new(), // Votes không ảnh hưởng đến digest
+        };
+        let cert_digest = temp_cert.digest();
+
+        // Tạo signature với certificate digest (vote signatures trong certificate được verify với certificate digest)
+        let signature = signature_service.request_signature(cert_digest).await;
         Self { signature, ..vote }
     }
 
@@ -170,7 +235,8 @@ impl Hash for Vote {
     fn digest(&self) -> Digest {
         let mut hasher = Sha512::new();
         hasher.update(self.id.as_ref());
-        hasher.update(self.round.to_le_bytes());
+        hasher.update(self.round_with_epoch.round.to_le_bytes());
+        hasher.update(self.round_with_epoch.epoch.to_le_bytes());
         hasher.update(self.origin.as_ref());
         let hash = hasher.finalize();
         let mut bytes = [0u8; 32];
@@ -183,9 +249,10 @@ impl fmt::Debug for Vote {
     fn fmt(&self, f: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         write!(
             f,
-            "{}: V{}({}, {})",
+            "{}: V{}(epoch:{}, {}, {})",
             self.digest(),
-            self.round,
+            self.round(),
+            self.epoch(),
             self.author,
             self.id
         )
@@ -203,12 +270,17 @@ impl Certificate {
         committee
             .authorities
             .keys()
-            .map(|name| Self {
-                header: Header {
+            .map(|name| {
+                let header = Header {
                     author: name.clone(),
+                    round_with_epoch: RoundWithEpoch::from_round_and_committee(0, committee),
                     ..Header::default()
-                },
-                ..Self::default()
+                };
+                let id = header.digest();
+                Self {
+                    header: Header { id, ..header },
+                    ..Self::default()
+                }
             })
             .collect()
     }
@@ -253,7 +325,15 @@ impl Certificate {
     }
 
     pub fn round(&self) -> Round {
-        self.header.round
+        self.header.round_with_epoch.round
+    }
+
+    pub fn epoch(&self) -> u64 {
+        self.header.round_with_epoch.epoch
+    }
+
+    pub fn round_with_epoch(&self) -> RoundWithEpoch {
+        self.header.round_with_epoch
     }
 
     pub fn origin(&self) -> PublicKey {
@@ -266,6 +346,7 @@ impl Hash for Certificate {
         let mut hasher = Sha512::new();
         hasher.update(self.header.id.as_ref());
         hasher.update(self.round().to_le_bytes());
+        hasher.update(self.epoch().to_le_bytes()); // THÊM EPOCH vào certificate digest
         hasher.update(self.origin().as_ref());
         let hash = hasher.finalize();
         let mut bytes = [0u8; 32];
