@@ -3,7 +3,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::{crate_name, crate_version, App, AppSettings, ArgMatches, SubCommand};
 use config::Export as _;
 use config::Import as _;
-use config::{Committee, KeyPair, NodeConfig, Parameters, ValidatorInfo, WorkerId};
+use config::{
+    Committee, KeyPair, NodeConfig, Parameters, ValidatorInfo, WorkerId, RECONFIGURE_INTERVAL,
+};
 use consensus::Consensus;
 use consensus::{Bullshark, ConsensusProtocol, ConsensusState};
 use crypto::Digest;
@@ -235,15 +237,16 @@ async fn load_initial_committee(
 
         let last_committed_round = read_last_committed_round(store).await.unwrap_or(0);
         let block_number = last_committed_round / 2;
-        let epoch_to_load = block_number.saturating_add(1);
+        let epoch_to_load =
+            (block_number / (RECONFIGURE_INTERVAL / 2)) * (RECONFIGURE_INTERVAL / 2);
 
         log::info!(
             "[NODE] No committee file provided. Fetching via UDS for epoch {} (block {}).",
             epoch_to_load,
-            block_number
+            epoch_to_load
         );
 
-        fetch_committee_from_uds(socket_path, block_number, node_config, epoch_to_load).await
+        fetch_committee_from_uds(socket_path, epoch_to_load, node_config, epoch_to_load).await
     }
 }
 
