@@ -55,10 +55,12 @@ pub fn committee() -> Committee {
                         consensus_key,
                         primary,
                         workers,
+                        p2p_address: format!("127.0.0.1:{}", 600 + i),
                     },
                 )
             })
             .collect(),
+        epoch: 0,
     }
 }
 
