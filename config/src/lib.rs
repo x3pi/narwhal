@@ -15,6 +15,9 @@ use std::io::Write as _;
 use std::net::SocketAddr;
 use thiserror::Error;
 
+pub mod shutdown;
+pub use shutdown::ShutdownHandle;
+
 #[derive(Error, Debug)]
 pub enum ConfigError {
     #[error("Node {0} is not in the committee")]
@@ -85,9 +88,9 @@ pub type WorkerId = u32;
 // Reconfiguration constants - centralized configuration
 pub type Round = u64;
 /// Interval for reconfiguration (round-based)
-pub const RECONFIGURE_INTERVAL: Round = 100000;
+pub const RECONFIGURE_INTERVAL: Round = 1000;
 /// Stop accepting new batches starting from this round (5 rounds before reconfiguration)
-pub const RECONFIGURE_BATCH_STOP_ROUND: Round = 99995;
+pub const RECONFIGURE_BATCH_STOP_ROUND: Round = 995;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Parameters {

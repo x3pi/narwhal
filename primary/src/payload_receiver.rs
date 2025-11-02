@@ -29,11 +29,15 @@ impl PayloadReceiver {
     }
 
     async fn run(&mut self) {
+        // QUAN TRỌNG: Tiếp tục xử lý và ghi batches vào store cho đến khi channel đóng hoàn toàn
+        // Đảm bảo analyze() có đủ batch data trong store khi đọc
+        // Channel sẽ đóng khi Primary shutdown, nhưng phải đảm bảo tất cả batches đã nhận đều được ghi vào store
         while let Some((digest, _worker_id, batch)) = self.rx_workers.recv().await {
             // Ghi vào cache (nhanh)
             self.cache.insert(digest.clone(), batch.clone());
 
             // Ghi vào store để lưu trữ lâu dài (chậm)
+            // analyze() sẽ đọc từ store này để lấy batch data
             self.store.write(digest.to_vec(), batch).await;
         }
     }

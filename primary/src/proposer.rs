@@ -4,10 +4,9 @@ use crate::primary::{CommittedBatches, Round};
 use config::{Committee, WorkerId, RECONFIGURE_BATCH_STOP_ROUND};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
-use log::warn;
+use log::{debug, warn};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -46,6 +45,8 @@ pub struct Proposer {
     max_header_delay: u64,
     /// The delay after which in-flight batches are re-queued if still uncommitted.
     retry_delay: Duration,
+    /// Shutdown handle để kiểm tra shutdown signal
+    shutdown_handle: config::ShutdownHandle,
 
     /// Receives the parents to include in the next header (along with their round number).
     rx_core: Receiver<(Vec<Digest>, Round)>,
@@ -91,12 +92,14 @@ impl Proposer {
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
         rx_committed: Receiver<CommittedBatches>,
         tx_core: Sender<Header>,
+        shutdown_handle: config::ShutdownHandle,
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
             .map(|x| x.digest())
             .collect();
 
+        let shutdown_handle_clone = shutdown_handle.clone();
         tokio::spawn(async move {
             Self {
                 name,
@@ -105,6 +108,7 @@ impl Proposer {
                 header_size,
                 max_header_delay,
                 retry_delay: Duration::from_millis(sync_retry_delay.max(1)),
+                shutdown_handle: shutdown_handle_clone,
                 rx_core,
                 rx_workers,
                 rx_committed,
@@ -124,6 +128,16 @@ impl Proposer {
     }
 
     async fn make_header(&mut self) -> bool {
+        // QUAN TRỌNG: Kiểm tra shutdown signal trước khi tạo header mới
+        // Đảm bảo không tạo headers cho rounds sau RECONFIGURE_INTERVAL
+        if self.shutdown_handle.is_shutdown() {
+            debug!(
+                "Proposer: Shutdown signal received, refusing to create new header for round {}",
+                self.round
+            );
+            return false;
+        }
+
         let payload: Vec<(Digest, WorkerId)> = self.collect_payload_for_header();
 
         // Final check: ensure no duplicates and no committed batches in payload before creating header
@@ -545,6 +559,14 @@ impl Proposer {
         tokio::pin!(retry_timer);
 
         loop {
+            // Kiểm tra shutdown signal
+            if self.shutdown_handle.is_shutdown() {
+                #[cfg(feature = "benchmark")]
+                info!("Proposer received shutdown signal, exiting gracefully");
+                debug!("Proposer received shutdown signal, exiting gracefully");
+                break;
+            }
+
             // Check if we can propose a new header. We propose a new header when one of the following
             // conditions is met:
             // 1. We have a quorum of certificates from the previous round and enough batches' digests;

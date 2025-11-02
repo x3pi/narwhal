@@ -9,7 +9,7 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,6 +36,8 @@ pub struct Core {
     consensus_round: Arc<AtomicU64>,
     /// The depth of the garbage collector.
     gc_depth: Round,
+    /// Shutdown handle để kiểm tra shutdown signal
+    shutdown_handle: config::ShutdownHandle,
 
     /// Receiver for dag messages (headers, votes, certificates).
     rx_primaries: Receiver<PrimaryMessage>,
@@ -84,7 +86,9 @@ impl Core {
         rx_proposer: Receiver<Header>,
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
+        shutdown_handle: config::ShutdownHandle,
     ) {
+        let shutdown_handle_clone = shutdown_handle.clone();
         tokio::spawn(async move {
             Self {
                 name,
@@ -94,6 +98,7 @@ impl Core {
                 signature_service,
                 consensus_round,
                 gc_depth,
+                shutdown_handle: shutdown_handle_clone,
                 rx_primaries,
                 rx_header_waiter,
                 rx_certificate_waiter,
@@ -217,6 +222,13 @@ impl Core {
     async fn process_vote(&mut self, vote: Vote) -> DagResult<()> {
         debug!("Processing {:?}", vote);
 
+        // QUAN TRỌNG: KHÔNG tạo certificate mới từ votes nếu đã shutdown
+        // Đảm bảo không có certificates mới được tạo sau RECONFIGURE_INTERVAL
+        if self.shutdown_handle.is_shutdown() {
+            debug!("Core: Shutdown signal received, refusing to create certificate from vote for round {}", vote.round);
+            return Ok(());
+        }
+
         // Add it to the votes' aggregator and try to make a new certificate.
         if let Some(certificate) =
             self.votes_aggregator
@@ -279,17 +291,23 @@ impl Core {
         self.store.write(certificate.digest().to_vec(), bytes).await;
 
         // Check if we have enough certificates to enter a new dag round and propose a header.
-        if let Some(parents) = self
-            .certificates_aggregators
-            .entry(certificate.round())
-            .or_insert_with(|| Box::new(CertificatesAggregator::new()))
-            .append(certificate.clone(), &self.committee)?
-        {
-            // Send it to the `Proposer`.
-            self.tx_proposer
-                .send((parents, certificate.round()))
-                .await
-                .expect("Failed to send certificate");
+        // QUAN TRỌNG: KHÔNG gửi parents mới đến Proposer nếu đã shutdown
+        // Đảm bảo Proposer không tạo headers cho rounds mới sau RECONFIGURE_INTERVAL
+        if !self.shutdown_handle.is_shutdown() {
+            if let Some(parents) = self
+                .certificates_aggregators
+                .entry(certificate.round())
+                .or_insert_with(|| Box::new(CertificatesAggregator::new()))
+                .append(certificate.clone(), &self.committee)?
+            {
+                // Send it to the `Proposer`.
+                self.tx_proposer
+                    .send((parents, certificate.round()))
+                    .await
+                    .expect("Failed to send certificate");
+            }
+        } else {
+            debug!("Core: Shutdown signal received, skipping parent notification to Proposer for round {}", certificate.round());
         }
 
         // Quick check: Đọc consensus state để tránh gửi certificate đã commit
@@ -310,6 +328,14 @@ impl Core {
                     return Ok(());
                 }
             }
+        }
+
+        // QUAN TRỌNG: KHÔNG gửi certificate mới đến consensus nếu đã shutdown
+        // Đảm bảo Consensus chỉ xử lý certificates đến round RECONFIGURE_INTERVAL
+        if self.shutdown_handle.is_shutdown() {
+            debug!("Core: Shutdown signal received, refusing to send certificate {} (round {}) to consensus", 
+                   certificate.digest(), certificate.round());
+            return Ok(());
         }
 
         // Send it to the consensus layer.
@@ -372,6 +398,12 @@ impl Core {
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
         loop {
+            // Kiểm tra shutdown signal
+            if self.shutdown_handle.is_shutdown() {
+                info!("Core received shutdown signal, exiting gracefully");
+                break;
+            }
+
             let result = tokio::select! {
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {

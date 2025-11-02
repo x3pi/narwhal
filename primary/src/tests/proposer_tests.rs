@@ -34,6 +34,7 @@ async fn propose_empty() {
         /* rx_workers */ rx_our_digests,
         /* rx_committed */ rx_committed,
         /* tx_core */ tx_headers,
+        /* shutdown_handle */ config::ShutdownHandle::new(),
     );
 
     // Ensure the proposer makes a correct empty header.
@@ -72,6 +73,7 @@ async fn propose_payload() {
         /* rx_workers */ rx_our_digests,
         /* rx_committed */ rx_committed,
         /* tx_core */ tx_headers,
+        /* shutdown_handle */ config::ShutdownHandle::new(),
     );
 
     // Send enough digests for the header payload.

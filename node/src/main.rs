@@ -366,6 +366,9 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
             let (tx_new_certificates, rx_new_certificates) = channel(CHANNEL_CAPACITY);
             let (tx_feedback, rx_feedback) = channel(CHANNEL_CAPACITY);
 
+            // Tạo shutdown handle dùng chung cho tất cả các component
+            let shutdown_handle = config::ShutdownHandle::new();
+
             tokio::spawn(Primary::spawn(
                 keypair,
                 committee.clone(),
@@ -373,6 +376,7 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                 store.clone(),
                 tx_new_certificates,
                 rx_feedback,
+                shutdown_handle.clone(),
             ));
 
             let committee_clone: Committee = committee.clone();
@@ -388,9 +392,18 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
                     committee: committee_clone,
                     gc_depth: parameters.gc_depth,
                 }),
+                shutdown_handle.clone(),
             );
 
-            analyze(rx_output, node_id, store, initial_epoch, block_socket).await;
+            analyze(
+                rx_output,
+                node_id,
+                store,
+                initial_epoch,
+                block_socket,
+                shutdown_handle.clone(),
+            )
+            .await;
         }
         ("worker", Some(sub_matches)) => {
             let id_str = sub_matches.value_of("id").unwrap();
@@ -428,6 +441,7 @@ async fn analyze(
     mut store: Store,
     initial_epoch: u64,
     block_socket: Option<String>,
+    shutdown_handle: config::ShutdownHandle,
 ) {
     fn put_uvarint_to_bytes_mut(buf: &mut BytesMut, mut value: u64) {
         loop {
@@ -482,6 +496,22 @@ async fn analyze(
         "[ANALYZE] Node ID {} entering loop to wait for committed blocks.",
         node_id
     );
+
+    // QUAN TRỌNG: Tính target height cần đạt trước khi dừng
+    // Height = (round + 1) / 2, nên với RECONFIGURE_INTERVAL thì target_height = RECONFIGURE_INTERVAL / 2
+    let target_height = config::RECONFIGURE_INTERVAL / 2;
+    log::info!(
+        "[ANALYZE] Node ID {} target height to reach before shutdown: {} (from RECONFIGURE_INTERVAL {})",
+        node_id,
+        target_height,
+        config::RECONFIGURE_INTERVAL
+    );
+
+    // ĐẢM BẢO DỮ LIỆU CHO ANALYZE():
+    // 1. Certificates: Consensus sẽ output TẤT CẢ certificates đến round RECONFIGURE_INTERVAL
+    //    TRƯỚC KHI shutdown và đóng tx_output channel
+    // 2. Batch data: Worker Processor và Primary Proposer/PayloadReceiver đã ghi batches vào store
+    //    TRƯỚC KHI certificates được commit. analyze() đọc từ store này để lấy batch data.
 
     // Track height lớn nhất đã gửi cho mỗi epoch (height = ceil(round / 2))
     let mut last_committed_height_per_epoch: HashMap<u64, u64> = HashMap::new();
@@ -579,8 +609,19 @@ async fn analyze(
     }
 
     let mut current_block: Option<BlockBuilder> = None;
+    let mut shutdown_received = false;
 
     while let Some(certificate) = rx_output.recv().await {
+        // Kiểm tra shutdown signal
+        if shutdown_handle.is_shutdown() {
+            shutdown_received = true;
+            log::info!(
+                "[ANALYZE] Node ID {} received shutdown signal, but will continue until target height {} is reached",
+                node_id,
+                target_height
+            );
+            // KHÔNG break ngay - tiếp tục xử lý cho đến khi đạt target_height
+        }
         let commit_round = certificate.header.round;
         let epoch = initial_epoch;
 
@@ -632,6 +673,21 @@ async fn analyze(
                             node_id,
                             block_count
                         );
+                    }
+
+                    // QUAN TRỌNG: Kiểm tra xem đã đạt target height chưa sau khi gửi block
+                    if shutdown_received && finished.height >= target_height {
+                        let last_height = last_committed_height_per_epoch
+                            .get(&finished.epoch)
+                            .copied()
+                            .unwrap_or(0);
+                        log::info!(
+                            "[ANALYZE] Node ID {} reached target height {} (last committed: {}). Shutting down gracefully.",
+                            node_id,
+                            finished.height,
+                            last_height
+                        );
+                        break;
                     }
                 }
             }
@@ -694,6 +750,20 @@ async fn analyze(
                         );
                     }
                 }
+
+                // QUAN TRỌNG: Kiểm tra sau khi gửi missing blocks xem đã đạt target height chưa
+                let last_height_after_gaps = last_committed_height_per_epoch
+                    .get(&epoch)
+                    .copied()
+                    .unwrap_or(0);
+                if shutdown_received && last_height_after_gaps >= target_height {
+                    log::info!(
+                        "[ANALYZE] Node ID {} reached target height {} after sending missing blocks. Shutting down gracefully.",
+                        node_id,
+                        last_height_after_gaps
+                    );
+                    break;
+                }
             }
 
             current_block = Some(BlockBuilder::new(epoch, height));
@@ -749,6 +819,21 @@ async fn analyze(
                             node_id,
                             block_count
                         );
+                    }
+
+                    // QUAN TRỌNG: Kiểm tra xem đã đạt target height chưa sau khi gửi block
+                    if shutdown_received && finished.height >= target_height {
+                        let last_height = last_committed_height_per_epoch
+                            .get(&finished.epoch)
+                            .copied()
+                            .unwrap_or(0);
+                        log::info!(
+                            "[ANALYZE] Node ID {} reached target height {} (last committed: {}). Shutting down gracefully.",
+                            node_id,
+                            finished.height,
+                            last_height
+                        );
+                        break;
                     }
                 }
 
@@ -875,6 +960,45 @@ async fn analyze(
                 "[ANALYZE] SUCCESS: Node ID {} sent {} block(s) successfully.",
                 node_id,
                 block_count
+            );
+        }
+
+        // QUAN TRỌNG: Kiểm tra sau khi gửi block cuối cùng xem đã đạt target_height chưa
+        if shutdown_received {
+            if current.height >= target_height {
+                log::info!(
+                    "[ANALYZE] Node ID {} reached target height {} (sent block height {}). Shutdown complete.",
+                    node_id,
+                    target_height,
+                    current.height
+                );
+            } else {
+                log::warn!(
+                    "[ANALYZE] Node ID {} shutdown received but only reached height {} (target: {}). This may indicate missing certificates.",
+                    node_id,
+                    current.height,
+                    target_height
+                );
+            }
+        }
+    } else if shutdown_received {
+        // Nếu không có block đang xây dựng nhưng đã nhận shutdown signal
+        let last_height = last_committed_height_per_epoch
+            .get(&initial_epoch)
+            .copied()
+            .unwrap_or(0);
+        if last_height >= target_height {
+            log::info!(
+                "[ANALYZE] Node ID {} already reached target height {} before shutdown. Shutdown complete.",
+                node_id,
+                last_height
+            );
+        } else {
+            log::warn!(
+                "[ANALYZE] Node ID {} shutdown received but only reached height {} (target: {}). This may indicate missing certificates.",
+                node_id,
+                last_height,
+                target_height
             );
         }
     }

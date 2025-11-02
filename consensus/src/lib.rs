@@ -609,6 +609,7 @@ pub struct Consensus {
     protocol: Box<dyn ConsensusAlgorithm>,
     genesis: Vec<Certificate>,
     metrics: Arc<RwLock<ConsensusMetrics>>,
+    shutdown_handle: config::ShutdownHandle,
 }
 
 impl Consensus {
@@ -622,6 +623,7 @@ impl Consensus {
         tx_primary: Sender<Certificate>,
         tx_output: Sender<Certificate>,
         protocol_selection: ConsensusProtocol,
+        shutdown_handle: config::ShutdownHandle,
     ) -> Arc<RwLock<ConsensusMetrics>> {
         let protocol: Box<dyn ConsensusAlgorithm> = match protocol_selection {
             ConsensusProtocol::Tusk(tusk) => Box::new(tusk),
@@ -636,6 +638,7 @@ impl Consensus {
             protocol.name()
         );
 
+        let shutdown_handle_clone = shutdown_handle.clone();
         tokio::spawn(async move {
             Self {
                 store,
@@ -645,6 +648,7 @@ impl Consensus {
                 protocol,
                 genesis: Certificate::genesis(&committee),
                 metrics: metrics_clone,
+                shutdown_handle: shutdown_handle_clone,
             }
             .run()
             .await;
@@ -700,6 +704,12 @@ impl Consensus {
 
         // Main processing loop
         while let Some(certificate) = self.rx_primary.recv().await {
+            // Kiểm tra shutdown signal
+            if self.shutdown_handle.is_shutdown() {
+                info!("Consensus received shutdown signal, exiting gracefully");
+                break;
+            }
+
             debug!("Received certificate from round {}", certificate.round());
 
             let mut metrics = self.metrics.write().await;
@@ -725,7 +735,8 @@ impl Consensus {
                         }
                     }
 
-                    // Output committed certificates
+                    // QUAN TRỌNG: Output tất cả committed certificates TRƯỚC KHI check shutdown
+                    // Đảm bảo analyze() nhận đủ tất cả certificates đến round RECONFIGURE_INTERVAL
                     for certificate in sequence {
                         #[cfg(not(feature = "benchmark"))]
                         info!("Committed {}", certificate.header);
@@ -736,25 +747,33 @@ impl Consensus {
                             info!("Committed {} -> {:?}", certificate.header, digest);
                         }
 
-                        // Send to primary
+                        // Send to primary (cho garbage collection và feedback)
                         if let Err(e) = self.tx_primary.send(certificate.clone()).await {
                             error!("Failed to send certificate to primary: {}", e);
                         }
 
-                        // Send to output
+                        // QUAN TRỌNG: Gửi certificate đến analyze() qua tx_output
+                        // Phải đảm bảo tất cả certificates đều được gửi, kể cả certificate round RECONFIGURE_INTERVAL
                         if let Err(e) = self.tx_output.send(certificate).await {
-                            warn!("Failed to output certificate: {}", e);
+                            // Nếu channel đã đóng, analyze() có thể đã dừng nhưng vẫn có thể có messages trong buffer
+                            warn!("Failed to output certificate to analyze: {}. Analyze may have exited.", e);
                         }
                     }
 
-                    // Check if we've reached the reconfiguration interval AFTER outputting
+                    // QUAN TRỌNG: Chỉ check và set shutdown SAU KHI đã output TẤT CẢ certificates
+                    // Điều này đảm bảo analyze() nhận đủ dữ liệu trước khi channel bị drop
                     if committed && state.last_committed_round >= RECONFIGURE_INTERVAL {
                         info!(
-                            "Reached reconfiguration interval (round {} >= {}), shutting down gracefully",
+                            "Reached reconfiguration interval (round {} >= {}). All certificates output. Shutting down gracefully",
                             state.last_committed_round,
                             RECONFIGURE_INTERVAL
                         );
-                        break; // Exit the consensus loop (will drop channels automatically)
+                        // Gửi shutdown signal đến tất cả các component
+                        // Các component sẽ kiểm tra signal này và không tạo headers/certificates mới
+                        self.shutdown_handle.shutdown();
+                        // QUAN TRỌNG: Không drop tx_output ngay - để analyze() có thể đọc hết messages trong buffer
+                        // Channel sẽ tự động đóng khi Consensus task kết thúc (sau khi break)
+                        break; // Exit the consensus loop
                     }
                 }
                 Err(e) => {

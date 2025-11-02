@@ -68,6 +68,7 @@ async fn process_header() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* shutdown_handle */ config::ShutdownHandle::new(),
     );
 
     // Send a header to the core.
@@ -137,6 +138,7 @@ async fn process_header_missing_parent() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* shutdown_handle */ config::ShutdownHandle::new(),
     );
 
     // Send a header to the core.
@@ -199,6 +201,7 @@ async fn process_header_missing_payload() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* shutdown_handle */ config::ShutdownHandle::new(),
     );
 
     // Send a header to the core.
@@ -263,6 +266,7 @@ async fn process_votes() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* shutdown_handle */ config::ShutdownHandle::new(),
     );
 
     // Make the certificate we expect to receive.
@@ -337,6 +341,7 @@ async fn process_certificates() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        /* shutdown_handle */ config::ShutdownHandle::new(),
     );
 
     // Send enough certificates to the core.

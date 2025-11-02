@@ -69,6 +69,7 @@ impl Primary {
         store: Store,
         tx_consensus: Sender<Certificate>,
         rx_consensus: Receiver<Certificate>,
+        shutdown_handle: config::ShutdownHandle,
     ) {
         let (tx_others_digests, rx_others_digests) =
             channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
@@ -163,6 +164,7 @@ impl Primary {
             rx_proposer,
             tx_consensus,
             tx_parents,
+            shutdown_handle.clone(),
         );
 
         GarbageCollector::spawn(
@@ -205,6 +207,7 @@ impl Primary {
             rx_our_digests,
             rx_committed_batches,
             tx_headers,
+            shutdown_handle.clone(),
         );
 
         Helper::spawn(committee.clone(), store, rx_cert_requests);
