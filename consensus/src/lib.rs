@@ -572,8 +572,8 @@ impl ConsensusAlgorithm for Bullshark {
         // SAFETY: Only commit additional certificates if they are referenced by majority (2f+1) from current round
         // This ensures all nodes commit the same sequence (no fork)
         // First pass: collect certificates to commit (avoid borrow conflicts)
-        // Only consider rounds BEFORE leader_round
-        for candidate_round in (last_committed + 1)..leader_round {
+        // Consider ALL rounds between last_committed and leader_round (including leader_round)
+        for candidate_round in (last_committed + 1)..=leader_round {
             if let Some(round_certs) = state.dag.get(&candidate_round) {
                 for (candidate_digest, candidate_cert) in round_certs.values() {
                     // Skip if already committed or would be garbage collected
