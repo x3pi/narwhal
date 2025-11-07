@@ -447,29 +447,49 @@ async fn analyze(
             socket_path
         );
 
-        let stream = loop {
+        // Thử kết nối một số lần giới hạn, không block vô hạn
+        const MAX_CONNECT_ATTEMPTS: u32 = 3;
+        const CONNECT_RETRY_DELAY_MS: u64 = 500;
+        
+        let mut stream = None;
+        for attempt in 1..=MAX_CONNECT_ATTEMPTS {
             match UnixStream::connect(&socket_path).await {
-                Ok(stream) => {
+                Ok(s) => {
                     log::info!(
-                        "[ANALYZE] Node ID {} connected successfully to {}",
+                        "[ANALYZE] Node ID {} connected successfully to {} on attempt {}",
                         node_id,
-                        socket_path
+                        socket_path,
+                        attempt
                     );
-                    break stream;
+                    stream = Some(s);
+                    break;
                 }
                 Err(e) => {
                     log::warn!(
-                        "[ANALYZE] Node ID {}: Connection to {} failed: {}. Retrying...",
+                        "[ANALYZE] Node ID {}: Connection attempt {}/{} to {} failed: {}",
                         node_id,
+                        attempt,
+                        MAX_CONNECT_ATTEMPTS,
                         socket_path,
                         e
                     );
-                    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+                    if attempt < MAX_CONNECT_ATTEMPTS {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(CONNECT_RETRY_DELAY_MS)).await;
+                    }
                 }
             }
-        };
+        }
 
-        Some(stream)
+        if stream.is_none() {
+            log::warn!(
+                "[ANALYZE] Node ID {} failed to connect to {} after {} attempts. Will continue processing certificates without sending to UDS.",
+                node_id,
+                socket_path,
+                MAX_CONNECT_ATTEMPTS
+            );
+        }
+
+        stream
     } else {
         log::info!(
             "[ANALYZE] Node ID {} has no block socket configured; committed blocks will not be sent via UDS.",
@@ -801,8 +821,21 @@ async fn analyze(
                                 );
                             }
                             for tx_data in batch {
+                                // Cắt bỏ 8 byte đầu tiên (độ dài message)
+                                const LENGTH_PREFIX_SIZE: usize = 8;
+                                let tx_payload = if tx_data.len() > LENGTH_PREFIX_SIZE {
+                                    tx_data[LENGTH_PREFIX_SIZE..].to_vec()
+                                } else {
+                                    log::warn!(
+                                        "[ANALYZE] Transaction in batch {} has only {} bytes, cannot strip 8-byte length prefix. Keeping as-is.",
+                                        batch_digest,
+                                        tx_data.len()
+                                    );
+                                    tx_data
+                                };
+                                
                                 builder.transactions.push(comm::Transaction {
-                                    digest: tx_data,
+                                    digest: tx_payload,
                                     worker_id: *worker_id as u32,
                                 });
                             }
