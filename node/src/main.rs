@@ -536,6 +536,51 @@ async fn analyze(
             return Ok(());
         }
 
+        // Log chi tiết từng block trước khi gửi
+        for block in &blocks {
+            log::info!(
+                "[UDS SEND] Node ID {} preparing block: epoch={}, height={}, tx_count={}",
+                node_id,
+                block.epoch,
+                block.height,
+                block.transactions.len()
+            );
+            
+            // Log một số transactions mẫu
+            if !block.transactions.is_empty() {
+                for (idx, tx) in block.transactions.iter().enumerate().take(3) {
+                    let tx_hex = hex::encode(&tx.digest);
+                    log::info!(
+                        "[UDS SEND] Node ID {} block height {} tx[{}]: worker_id={}, size={} bytes, hex={}",
+                        node_id,
+                        block.height,
+                        idx,
+                        tx.worker_id,
+                        tx.digest.len(),
+                        if tx.digest.len() <= 64 { 
+                            tx_hex 
+                        } else { 
+                            format!("{}...", &tx_hex[..128])
+                        }
+                    );
+                }
+                if block.transactions.len() > 3 {
+                    log::info!(
+                        "[UDS SEND] Node ID {} block height {} has {} more transactions (not shown)",
+                        node_id,
+                        block.height,
+                        block.transactions.len() - 3
+                    );
+                }
+            } else {
+                log::info!(
+                    "[UDS SEND] Node ID {} block height {} is EMPTY (no transactions)",
+                    node_id,
+                    block.height
+                );
+            }
+        }
+
         let epoch_data = comm::CommittedEpochData { blocks };
 
         let mut proto_buf = BytesMut::new();
@@ -547,7 +592,7 @@ async fn analyze(
         put_uvarint_to_bytes_mut(&mut len_buf, proto_buf.len() as u64);
 
         log::info!(
-            "[ANALYZE] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for {} blocks.",
+            "[UDS SEND] Node ID {} WRITING {} bytes (len) and {} bytes (data) to socket for {} blocks.",
             node_id,
             len_buf.len(),
             proto_buf.len(),
@@ -563,6 +608,12 @@ async fn analyze(
             .write_all(&proto_buf)
             .await
             .map_err(|e| format!("Failed to write payload to socket: {}", e))?;
+
+        log::info!(
+            "[UDS SEND] Node ID {} successfully sent {} blocks to UDS",
+            node_id,
+            epoch_data.blocks.len()
+        );
 
         Ok(())
     }
@@ -803,8 +854,9 @@ async fn analyze(
 
             match store.read(batch_digest.to_vec()).await {
                 Ok(Some(serialized_batch_message)) => {
-                    log::debug!(
-                        "[ANALYZE] Found batch {} from worker {} in store ({} bytes, height {}).",
+                    log::info!(
+                        "[BATCH PROCESSING] Node ID {} found batch {} from worker {} in store ({} bytes, height {}).",
+                        node_id,
                         batch_digest,
                         worker_id,
                         serialized_batch_message.len(),
@@ -812,22 +864,50 @@ async fn analyze(
                     );
                     match bincode::deserialize::<WorkerMessage>(&serialized_batch_message) {
                         Ok(WorkerMessage::Batch(batch)) => {
+                            let batch_tx_count = batch.len();
                             if batch.is_empty() {
                                 log::warn!(
-                                    "[ANALYZE] Batch {} from worker {} decoded with 0 transactions (height {}).",
+                                    "[BATCH PROCESSING] Batch {} from worker {} decoded with 0 transactions (height {}).",
                                     batch_digest,
                                     worker_id,
                                     builder.height
                                 );
+                            } else {
+                                log::info!(
+                                    "[BATCH PROCESSING] Batch {} contains {} transactions, adding to block height {}",
+                                    batch_digest,
+                                    batch_tx_count,
+                                    builder.height
+                                );
                             }
-                            for tx_data in batch {
+                            
+                            for (tx_idx, tx_data) in batch.into_iter().enumerate() {
                                 // Cắt bỏ 8 byte đầu tiên (độ dài message)
                                 const LENGTH_PREFIX_SIZE: usize = 8;
                                 let tx_payload = if tx_data.len() > LENGTH_PREFIX_SIZE {
-                                    tx_data[LENGTH_PREFIX_SIZE..].to_vec()
+                                    let payload = tx_data[LENGTH_PREFIX_SIZE..].to_vec();
+                                    
+                                    // Log mẫu cho 2 transactions đầu
+                                    if tx_idx < 2 {
+                                        let tx_hex = hex::encode(&payload);
+                                        log::info!(
+                                            "[BATCH PROCESSING] Batch {} tx[{}]: original {} bytes -> after strip {} bytes, hex={}",
+                                            batch_digest,
+                                            tx_idx,
+                                            tx_data.len(),
+                                            payload.len(),
+                                            if payload.len() <= 64 { 
+                                                tx_hex 
+                                            } else { 
+                                                format!("{}...", &tx_hex[..128])
+                                            }
+                                        );
+                                    }
+                                    
+                                    payload
                                 } else {
                                     log::warn!(
-                                        "[ANALYZE] Transaction in batch {} has only {} bytes, cannot strip 8-byte length prefix. Keeping as-is.",
+                                        "[BATCH PROCESSING] Transaction in batch {} has only {} bytes, cannot strip 8-byte length prefix. Keeping as-is.",
                                         batch_digest,
                                         tx_data.len()
                                     );
@@ -839,6 +919,12 @@ async fn analyze(
                                     worker_id: *worker_id as u32,
                                 });
                             }
+                            
+                            log::info!(
+                                "[BATCH PROCESSING] Finished processing batch {}, total transactions in block so far: {}",
+                                batch_digest,
+                                builder.transactions.len()
+                            );
                         }
                         Ok(_) => {
                             log::warn!(

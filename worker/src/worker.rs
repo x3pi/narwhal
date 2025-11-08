@@ -261,6 +261,14 @@ struct TxReceiverHandler {
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
+        // Log hex của transaction khi nhận được
+        let tx_hex = hex::encode(&message);
+        log::info!(
+            "[WORKER RX] Received transaction: {} bytes, hex: {}",
+            message.len(),
+            tx_hex 
+        );
+        
         self.tx_batch_maker
             .send(message.to_vec())
             .await
