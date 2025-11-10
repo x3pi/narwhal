@@ -2,6 +2,7 @@
 use crate::primary::PayloadCache; // <--- THÊM USE
 use config::WorkerId;
 use crypto::Digest;
+use log::info;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
 
@@ -29,7 +30,13 @@ impl PayloadReceiver {
     }
 
     async fn run(&mut self) {
-        while let Some((digest, _worker_id, batch)) = self.rx_workers.recv().await {
+        while let Some((digest, worker_id, batch)) = self.rx_workers.recv().await {
+            info!(
+                "PayloadReceiver: received batch {} from worker {} ({} bytes)",
+                digest,
+                worker_id,
+                batch.len()
+            );
             // Ghi vào cache (nhanh)
             self.cache.insert(digest.clone(), batch.clone());
 

@@ -9,7 +9,7 @@ use bytes::Bytes;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::{debug, error, warn};
+use log::{debug, error, info, warn};
 use network::{CancelHandler, ReliableSender};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -285,6 +285,44 @@ impl Core {
             .or_insert_with(|| Box::new(CertificatesAggregator::new()))
             .append(certificate.clone(), &self.committee)?
         {
+            let header_round = certificate.round();
+            let mut parent_summaries = Vec::new();
+            let mut missing_in_store = Vec::new();
+
+            for digest in &parents {
+                match self.store.read(digest.to_vec()).await {
+                    Ok(Some(bytes)) => match bincode::deserialize::<Certificate>(&bytes) {
+                        Ok(parent_cert) => {
+                            parent_summaries.push(format!(
+                                "{{round: {}, origin: {:?}}}",
+                                parent_cert.round(),
+                                parent_cert.origin()
+                            ));
+                        }
+                        Err(e) => {
+                            parent_summaries.push(format!(
+                                "{{digest: {:?}, decode_error: {}}}",
+                                digest, e
+                            ));
+                        }
+                    },
+                    Ok(None) => {
+                        missing_in_store.push(format!("{:?}", digest));
+                    }
+                    Err(e) => {
+                        missing_in_store.push(format!("{:?} (store_error: {})", digest, e));
+                    }
+                }
+            }
+
+            info!(
+                "Core: preparing header round {} with {} parents. parents_details={:?} missing_in_store={:?}",
+                header_round,
+                parents.len(),
+                parent_summaries,
+                missing_in_store
+            );
+
             // Send it to the `Proposer`.
             self.tx_proposer
                 .send((parents, certificate.round()))

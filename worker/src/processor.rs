@@ -47,6 +47,9 @@ impl Processor {
                 // Store the batch.
                 store.write(digest.to_vec(), batch.clone()).await;
 
+                let digest_for_log = digest.clone();
+                let batch_len = batch.len();
+                let message_kind = if own_digest { "OurBatch" } else { "OthersBatch" };
                 // Create the message for the primary.
                 let message = match own_digest {
                     true => WorkerPrimaryMessage::OurBatch(digest, id, batch),
@@ -55,7 +58,11 @@ impl Processor {
                 let serialized_message = bincode::serialize(&message)
                     .expect("Failed to serialize our own worker-primary message");
                 log::info!(
-                    "Processor: Sending batch to primary at {:?}",
+                    "Processor: Sending {} message for batch {} ({} bytes) from worker {} to primary at {:?}",
+                    message_kind,
+                    digest_for_log,
+                    batch_len,
+                    id,
                     primary_address
                 );
                 // SỬA ĐỔI: Gửi trực tiếp đến primary qua mạng.

@@ -470,27 +470,54 @@ impl ConsensusAlgorithm for Bullshark {
             }
             None => {
                 metrics.failed_leader_elections += 1;
-                debug!("No leader found at round {}", leader_round);
+                info!(
+                    "Bullshark: no leader certificate available at round {}, cannot commit (current round {}).",
+                    leader_round,
+                    round
+                );
                 return Ok((Vec::new(), false));
             }
         };
 
         // Check support from current round (2f+1 votes required)
-        let stake: Stake = state
+        let round_certificates = state
             .dag
             .get(&round)
-            .ok_or(ConsensusError::MissingRound(round))?
+            .ok_or(ConsensusError::MissingRound(round))?;
+
+        let mut supporters_set: HashSet<PublicKey> = HashSet::new();
+        let mut supporters_info: Vec<String> = Vec::new();
+
+        let stake: Stake = round_certificates
             .values()
             .filter(|(_, x)| x.header.parents.contains(&leader_digest))
-            .map(|(_, x)| self.committee.stake(&x.origin()))
+            .map(|(_, x)| {
+                let pk = x.origin();
+                supporters_set.insert(pk);
+                let supporter_stake = self.committee.stake(&pk);
+                supporters_info.push(format!("{:?}@{}", pk, supporter_stake));
+                supporter_stake
+            })
             .sum();
+
+        let mut missing_info: Vec<String> = Vec::new();
+        for (pk, authority) in &self.committee.authorities {
+            if !supporters_set.contains(pk) {
+                missing_info.push(format!("{:?}@{}", pk, authority.stake));
+            }
+        }
 
         let required_stake = self.committee.validity_threshold();
 
         if stake < required_stake {
-            debug!(
-                "Leader at round {} has insufficient stake ({}/{})",
-                leader_round, stake, required_stake
+            info!(
+                "Bullshark: leader {:?} at round {} has insufficient support ({}/{}). supporters={:?}, missing={:?}",
+                leader.origin(),
+                leader_round,
+                stake,
+                required_stake,
+                supporters_info,
+                missing_info
             );
             return Ok((Vec::new(), false));
         }
@@ -502,6 +529,7 @@ impl ConsensusAlgorithm for Bullshark {
 
         // Order and commit
         let mut sequence = Vec::new();
+        let prev_committed_round = state.last_committed_round;
         for leader_cert in utils::order_leaders(&leader, state, |r, d| self.leader(r, d))
             .iter()
             .rev()
@@ -513,9 +541,42 @@ impl ConsensusAlgorithm for Bullshark {
         }
 
         let committed = !sequence.is_empty();
+        let sequence_summary = if committed {
+            Some(
+                sequence
+                    .iter()
+                    .map(|cert| format!(
+                        "{{round: {}, origin: {:?}, digest: {:?}}}",
+                        cert.round(),
+                        cert.origin(),
+                        cert.digest()
+                    ))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            None
+        };
         if committed {
             metrics.total_certificates_committed += sequence.len() as u64;
             metrics.last_committed_round = state.last_committed_round;
+            let new_committed_round = state.last_committed_round;
+            let round_gap = new_committed_round.saturating_sub(prev_committed_round);
+            info!(
+                "Bullshark: commit advanced from round {} to {} via leader {} (Δ={} rounds, {} certificates)",
+                prev_committed_round,
+                new_committed_round,
+                leader_round,
+                round_gap,
+                sequence.len()
+            );
+            if let Some(summary) = &sequence_summary {
+                info!(
+                    "Bullshark: committed {} certificates via leader round {} -> {:?}",
+                    summary.len(),
+                    leader_round,
+                    summary
+                );
+            }
         }
 
         Ok((sequence, committed))

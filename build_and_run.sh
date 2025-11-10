@@ -21,6 +21,30 @@ SYNC_RETRY_NODES=3
 BATCH_SIZE=500000
 MAX_BATCH_DELAY=200
 
+# Danh sách prefix phiên tmux cần dọn dẹp
+TMUX_SESSION_PREFIXES=("primary-" "worker-" "executor-")
+
+# Hàm dọn dẹp an toàn các phiên tmux chỉ thuộc benchmark này
+cleanup_tmux_sessions() {
+    if ! command -v tmux &> /dev/null; then
+        return
+    fi
+
+    local sessions
+    if ! sessions=$(tmux list-sessions -F '#{session_name}' 2>/dev/null); then
+        return
+    fi
+
+    while IFS= read -r session_name; do
+        for prefix in "${TMUX_SESSION_PREFIXES[@]}"; do
+            if [[ "$session_name" == "$prefix"* ]]; then
+                tmux kill-session -t "$session_name" 2>/dev/null || true
+                break
+            fi
+        done
+    done <<< "$sessions"
+}
+
 # --- Đường dẫn ---
 BENCHMARK_DIR="benchmark"
 NODE_BINARY="./target/release/node"
@@ -50,6 +74,7 @@ echo "INFO: Forcefully killing any lingering processes..."
 pkill -f "$NODE_BINARY" || true
 pkill -f "$CLIENT_BINARY" || true
 pkill -f "$EXECUTOR_BINARY" || true
+cleanup_tmux_sessions
 sleep 1
 
 echo "INFO: Cleaning up old files..."
@@ -165,4 +190,4 @@ sleep 5
 echo "✅ All processes are now running in tmux sessions."
 echo "   - Use 'tmux ls' to view all sessions."
 echo "   - Use 'tail -f $LOG_DIR/primary-0.log' to monitor a primary node."
-echo "   - Use 'tmux kill-server' to stop all nodes."
+echo "   - Use 'tmux kill-session -t <session_name>' để dừng từng tiến trình mà không ảnh hưởng các phiên tmux khác."

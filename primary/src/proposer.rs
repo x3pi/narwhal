@@ -4,10 +4,7 @@ use crate::primary::{CommittedBatches, Round};
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::debug;
-#[cfg(feature = "benchmark")]
-use log::info;
-use log::warn;
+use log::{debug, info, warn};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -170,6 +167,13 @@ impl Proposer {
             );
         }
 
+        if duplicates_found > 0 || committed_found > 0 {
+            info!(
+                "Header payload sanitized at round {}: duplicates_removed={}, already_committed_removed={}",
+                self.round, duplicates_found, committed_found
+            );
+        }
+
         if deduplicated_payload.is_empty() {
             debug!(
                 "No payload to include in header for round {} (pending_payload_size = {}, queue_len = {})",
@@ -205,6 +209,15 @@ impl Proposer {
             deduplicated_payload.len(),
             self.pending_payload_size,
             self.digests.len()
+        );
+
+        info!(
+            "Creating header for round {} with digests {:?}",
+            self.round,
+            deduplicated_payload
+                .iter()
+                .map(|(digest, _)| digest)
+                .collect::<Vec<_>>()
         );
 
         let header = Header::new(
@@ -362,9 +375,9 @@ impl Proposer {
         }
 
         if marked_count > 0 {
-            debug!(
-                "Marked {} batches as committed (round {}), {} were InFlight",
-                marked_count, committed.round, inflight_count
+            info!(
+                "Mark committed notification for round {}: {} batches transitioned ({} were InFlight)",
+                committed.round, marked_count, inflight_count
             );
         }
 
@@ -413,6 +426,12 @@ impl Proposer {
             if let BatchState::InFlight { round, sent_at } = entry.state {
                 // Skip if already committed - this is critical to prevent duplicates
                 if self.committed_digests.contains_key(&entry.digest) {
+                    info!(
+                        "retry_stale_batches: digest {} sent at round {} already committed (current round {})",
+                        entry.digest,
+                        round,
+                        self.round
+                    );
                     entry.state = BatchState::Committed;
                     skipped_committed += 1;
                     continue;
@@ -447,8 +466,8 @@ impl Proposer {
                     // If we've committed few rounds, batch might still be pending
                     if rounds_committed_since_sent < rounds_since_sent / 2 {
                         // Not many rounds committed since batch was sent - likely still pending
-                        debug!(
-                            "Retrying old batch {} (sent at round {}, current round {}, committed rounds since: {})",
+                        info!(
+                            "Requeue old batch {} (sent at round {}, current round {}, committed rounds since: {})",
                             entry.digest, round, self.round, rounds_committed_since_sent
                         );
                         entry.state = BatchState::Pending;
@@ -456,8 +475,8 @@ impl Proposer {
                         requeued_old += 1;
                     } else {
                         // Many rounds committed since batch was sent - likely already committed
-                        debug!(
-                            "Skipping retry for batch {} - too old and likely committed (sent at round {}, current round {}, committed rounds since: {})",
+                        info!(
+                            "Skip retry for batch {} - too old and likely committed (sent at round {}, current round {}, committed rounds since: {})",
                             entry.digest, round, self.round, rounds_committed_since_sent
                         );
                         skipped_too_old += 1;
@@ -472,10 +491,23 @@ impl Proposer {
                     {
                         // Double-check: verify batch is still not committed before re-queueing
                         if !self.committed_digests.contains_key(&entry.digest) {
+                            info!(
+                                "Requeue batch {} for retry (sent round {}, current round {}, latest_committed_round={})",
+                                entry.digest,
+                                round,
+                                self.round,
+                                self.latest_committed_round
+                            );
                             entry.state = BatchState::Pending;
                             self.pending_payload_size += entry.size;
                             requeued += 1;
                         } else {
+                            info!(
+                                "Batch {} became committed during retry check (sent round {}, current round {})",
+                                entry.digest,
+                                round,
+                                self.round
+                            );
                             entry.state = BatchState::Committed;
                             skipped_committed += 1;
                         }
@@ -485,28 +517,28 @@ impl Proposer {
         }
 
         if requeued > 0 {
-            debug!(
+            info!(
                 "Requeued {} batches for re-inclusion (latest_committed_round = {})",
                 requeued, self.latest_committed_round
             );
         }
 
         if requeued_old > 0 {
-            debug!(
+            info!(
                 "Requeued {} old batches that are likely still pending (latest_committed_round = {})",
                 requeued_old, self.latest_committed_round
             );
         }
 
         if skipped_committed > 0 {
-            debug!(
+            info!(
                 "Skipped {} already-committed batches during retry check",
                 skipped_committed
             );
         }
 
         if skipped_too_old > 0 {
-            debug!(
+            info!(
                 "Skipped {} batches that are too old and likely already committed (max_retry_rounds = {}). These batches remain in InFlight state and will be marked as Committed when commit notification is received.",
                 skipped_too_old, self.max_retry_rounds
             );
@@ -571,7 +603,12 @@ impl Proposer {
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
                     // Skip if already committed
                     if self.committed_digests.contains_key(&digest) {
-                        debug!("Skipping batch {} - already committed", digest);
+                        info!(
+                            "Skip enqueue batch {} from worker {} at round {} because it is already committed",
+                            digest,
+                            worker_id,
+                            self.round
+                        );
                         continue;
                     }
 
@@ -580,10 +617,11 @@ impl Proposer {
                     let raw_len = batch.len();
 
                     if self.digests.iter().any(|entry| entry.digest == digest) {
-                        debug!(
-                            "Ignoring duplicate batch {} from worker {} (already queued; pending_payload_size = {}).",
+                        info!(
+                            "Ignoring duplicate batch {} from worker {} at round {} (already queued; pending_payload_size = {}).",
                             digest,
                             worker_id,
+                            self.round,
                             self.pending_payload_size
                         );
                         continue;
@@ -609,9 +647,11 @@ impl Proposer {
                         state: BatchState::Pending,
                     });
                     self.pending_payload_size += size;
-                    debug!(
-                        "Batch {} enqueued; pending_payload_size = {}, queue_len = {}",
+                    info!(
+                        "Batch {} enqueued from worker {} at round {}; pending_payload_size = {}, queue_len = {}",
                         digest_for_log,
+                        worker_id,
+                        self.round,
                         self.pending_payload_size,
                         self.digests.len()
                     );
