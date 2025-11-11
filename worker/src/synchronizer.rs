@@ -5,7 +5,7 @@ use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error};
+use log::{debug, error, info};
 use network::SimpleSender;
 use primary::PrimaryWorkerMessage;
 use std::collections::HashMap;
@@ -206,12 +206,23 @@ impl Synchronizer {
                         }
                     }
                     if !retry.is_empty() {
-                        let addresses = self.committee
+                        info!(
+                            "Worker {:?}-{}: retrying {} batch digests after {} ms (pending={})",
+                            self.name,
+                            self.id,
+                            retry.len(),
+                            self.sync_retry_delay,
+                            self.pending.len()
+                        );
+                        let addresses = self
+                            .committee
                             .others_workers(&self.name, &self.id)
-                            .iter().map(|(_, address)| address.worker_to_worker)
+                            .iter()
+                            .map(|(_, address)| address.worker_to_worker)
                             .collect();
                         let message = WorkerMessage::BatchRequest(retry, self.name);
-                        let serialized = bincode::serialize(&message).expect("Failed to serialize our own message");
+                        let serialized =
+                            bincode::serialize(&message).expect("Failed to serialize our own message");
                         self.network
                             .lucky_broadcast(addresses, Bytes::from(serialized), self.sync_retry_nodes)
                             .await;

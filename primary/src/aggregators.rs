@@ -4,6 +4,7 @@ use crate::messages::{Certificate, Header, Vote};
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature};
+use log::debug;
 use std::collections::HashSet;
 
 /// Aggregates votes for a particular header into a certificate.
@@ -35,12 +36,40 @@ impl VotesAggregator {
 
         self.votes.push((author, vote.signature));
         self.weight += committee.stake(&author);
-        if self.weight >= committee.quorum_threshold() {
+
+        let threshold = committee.quorum_threshold();
+        let current_weight = self.weight;
+
+        if current_weight >= threshold {
+            debug!(
+                "VotesAggregator: quorum reached for header {} (round {}) with voters: {:?}",
+                header.id, header.round, self.used
+            );
             self.weight = 0; // Ensures quorum is only reached once.
             return Ok(Some(Certificate {
                 header: header.clone(),
                 votes: self.votes.clone(),
             }));
+        }
+
+        let missing_stake = threshold.saturating_sub(current_weight);
+        if missing_stake > 0 {
+            let mut missing: Vec<_> = committee
+                .authorities
+                .keys()
+                .filter(|authority| !self.used.contains(authority))
+                .cloned()
+                .collect();
+            missing.sort();
+            debug!(
+                "VotesAggregator: header {} (round {}) has stake {}/{} (missing {}). Waiting for authorities: {:?}",
+                header.id,
+                header.round,
+                current_weight,
+                threshold,
+                missing_stake,
+                missing
+            );
         }
         Ok(None)
     }

@@ -8,7 +8,7 @@ use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error};
+use log::{debug, error, info};
 use network::SimpleSender;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -258,14 +258,27 @@ impl HeaderWaiter {
                         }
                     }
 
-                    let addresses = self.committee
-                        .others_primaries(&self.name)
-                        .iter()
-                        .map(|(_, x)| x.primary_to_primary)
-                        .collect();
-                    let message = PrimaryMessage::CertificatesRequest(retry, self.name);
-                    let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                    self.network.lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes).await;
+                    if !retry.is_empty() {
+                        info!(
+                            "HeaderWaiter {:?}: retrying {} parent certificates after {} ms (pending headers={})",
+                            self.name,
+                            retry.len(),
+                            self.sync_retry_delay,
+                            self.pending.len()
+                        );
+                        let addresses = self
+                            .committee
+                            .others_primaries(&self.name)
+                            .iter()
+                            .map(|(_, x)| x.primary_to_primary)
+                            .collect();
+                        let message = PrimaryMessage::CertificatesRequest(retry, self.name);
+                        let bytes =
+                            bincode::serialize(&message).expect("Failed to serialize cert request");
+                        self.network
+                            .lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes)
+                            .await;
+                    }
 
                     // Reschedule the timer.
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(TIMER_RESOLUTION));
