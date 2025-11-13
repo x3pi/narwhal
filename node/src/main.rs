@@ -450,7 +450,7 @@ async fn analyze(
         // Thử kết nối một số lần giới hạn, không block vô hạn
         const MAX_CONNECT_ATTEMPTS: u32 = 3;
         const CONNECT_RETRY_DELAY_MS: u64 = 500;
-        
+
         let mut stream = None;
         for attempt in 1..=MAX_CONNECT_ATTEMPTS {
             match UnixStream::connect(&socket_path).await {
@@ -474,7 +474,10 @@ async fn analyze(
                         e
                     );
                     if attempt < MAX_CONNECT_ATTEMPTS {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(CONNECT_RETRY_DELAY_MS)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_millis(
+                            CONNECT_RETRY_DELAY_MS,
+                        ))
+                        .await;
                     }
                 }
             }
@@ -545,7 +548,7 @@ async fn analyze(
                 block.height,
                 block.transactions.len()
             );
-            
+
             // Log một số transactions mẫu
             if !block.transactions.is_empty() {
                 for (idx, tx) in block.transactions.iter().enumerate().take(3) {
@@ -557,9 +560,9 @@ async fn analyze(
                         idx,
                         tx.worker_id,
                         tx.digest.len(),
-                        if tx.digest.len() <= 64 { 
-                            tx_hex 
-                        } else { 
+                        if tx.digest.len() <= 64 {
+                            tx_hex
+                        } else {
                             format!("{}...", &tx_hex[..128])
                         }
                     );
@@ -880,13 +883,13 @@ async fn analyze(
                                     builder.height
                                 );
                             }
-                            
+
                             for (tx_idx, tx_data) in batch.into_iter().enumerate() {
                                 // Cắt bỏ 8 byte đầu tiên (độ dài message)
                                 const LENGTH_PREFIX_SIZE: usize = 8;
                                 let tx_payload = if tx_data.len() > LENGTH_PREFIX_SIZE {
                                     let payload = tx_data[LENGTH_PREFIX_SIZE..].to_vec();
-                                    
+
                                     // Log mẫu cho 2 transactions đầu
                                     if tx_idx < 2 {
                                         let tx_hex = hex::encode(&payload);
@@ -896,14 +899,14 @@ async fn analyze(
                                             tx_idx,
                                             tx_data.len(),
                                             payload.len(),
-                                            if payload.len() <= 64 { 
-                                                tx_hex 
-                                            } else { 
+                                            if payload.len() <= 64 {
+                                                tx_hex
+                                            } else {
                                                 format!("{}...", &tx_hex[..128])
                                             }
                                         );
                                     }
-                                    
+
                                     payload
                                 } else {
                                     log::warn!(
@@ -913,13 +916,13 @@ async fn analyze(
                                     );
                                     tx_data
                                 };
-                                
+
                                 builder.transactions.push(comm::Transaction {
                                     digest: tx_payload,
                                     worker_id: *worker_id as u32,
                                 });
                             }
-                            
+
                             log::info!(
                                 "[BATCH PROCESSING] Finished processing batch {}, total transactions in block so far: {}",
                                 batch_digest,

@@ -10,6 +10,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error, info};
 use network::SimpleSender;
+use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use tokio::time::{sleep, Duration, Instant};
 /// The resolution of the timer that checks whether we received replies to our sync requests, and triggers
 /// new sync requests if we didn't.
 const TIMER_RESOLUTION: u64 = 1_000;
+const BROADCAST_RETRY_THRESHOLD: u32 = 2;
 
 /// The commands that can be sent to the `Waiter`.
 #[derive(Debug)]
@@ -55,7 +57,7 @@ pub struct HeaderWaiter {
     network: SimpleSender,
     /// Keeps the digests of the all certificates for which we sent a sync request,
     /// along with a timestamp (`u128`) indicating when we sent the request.
-    parent_requests: HashMap<Digest, (Round, u128)>,
+    parent_requests: HashMap<Digest, (Round, u128, u32)>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
     /// similarly to `header_requests`.
     batch_requests: HashMap<Digest, Round>,
@@ -203,17 +205,30 @@ impl HeaderWaiter {
                                 .as_millis();
                             let mut requires_sync = Vec::new();
                             for missing in missing {
-                                self.parent_requests.entry(missing.clone()).or_insert_with(|| {
-                                    requires_sync.push(missing);
-                                    (round, now)
-                                });
+                                self.parent_requests
+                                    .entry(missing.clone())
+                                    .or_insert_with(|| {
+                                        requires_sync.push(missing.clone());
+                                        (round, now, 0)
+                                    });
                             }
                             if !requires_sync.is_empty() {
+                                for digest in &requires_sync {
+                                    if let Some((_, ts, attempts)) =
+                                        self.parent_requests.get_mut(digest)
+                                    {
+                                        *ts = now;
+                                        *attempts = attempts.saturating_add(1);
+                                    }
+                                }
                                 let address = self.committee
                                     .primary(&author)
                                     .expect("Author of valid header not in the committee")
                                     .primary_to_primary;
-                                let message = PrimaryMessage::CertificatesRequest(requires_sync, self.name);
+                                let message = PrimaryMessage::CertificatesRequest(
+                                    requires_sync.clone(),
+                                    self.name,
+                                );
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
                                 self.network.send(address, Bytes::from(bytes)).await;
                             }
@@ -250,34 +265,76 @@ impl HeaderWaiter {
                         .expect("Failed to measure time")
                         .as_millis();
 
-                    let mut retry = Vec::new();
-                    for (digest, (_, timestamp)) in &self.parent_requests {
-                        if timestamp + (self.sync_retry_delay as u128) < now {
-                            debug!("Requesting sync for certificate {} (retry)", digest);
-                            retry.push(digest.clone());
+                    let mut retry_targeted = Vec::new();
+                    let mut retry_broadcast = Vec::new();
+                    for (digest, (_, timestamp, attempts)) in self.parent_requests.iter_mut() {
+                        if *timestamp + (self.sync_retry_delay as u128) <= now {
+                            debug!(
+                                "Requesting sync for certificate {} (retry #{})",
+                                digest,
+                                attempts.saturating_add(1)
+                            );
+                            *timestamp = now;
+                            *attempts = attempts.saturating_add(1);
+                            if *attempts >= BROADCAST_RETRY_THRESHOLD {
+                                retry_broadcast.push(digest.clone());
+                            } else {
+                                retry_targeted.push(digest.clone());
+                            }
                         }
                     }
 
-                    if !retry.is_empty() {
-                        info!(
-                            "HeaderWaiter {:?}: retrying {} parent certificates after {} ms (pending headers={})",
-                            self.name,
-                            retry.len(),
-                            self.sync_retry_delay,
-                            self.pending.len()
-                        );
-                        let addresses = self
+                    if !retry_targeted.is_empty() {
+                        let addresses: Vec<_> = self
                             .committee
                             .others_primaries(&self.name)
                             .iter()
                             .map(|(_, x)| x.primary_to_primary)
                             .collect();
-                        let message = PrimaryMessage::CertificatesRequest(retry, self.name);
+                        let message = PrimaryMessage::CertificatesRequest(
+                            retry_targeted.clone(),
+                            self.name,
+                        );
                         let bytes =
-                            bincode::serialize(&message).expect("Failed to serialize cert request");
-                        self.network
-                            .lucky_broadcast(addresses, Bytes::from(bytes), self.sync_retry_nodes)
-                            .await;
+                            Bytes::from(bincode::serialize(&message).expect("Failed to serialize cert request"));
+                        let node_count = if self.sync_retry_nodes == 0 {
+                            addresses.len()
+                        } else {
+                            min(self.sync_retry_nodes, addresses.len())
+                        };
+                        if node_count >= addresses.len() {
+                            self.network.broadcast(addresses, bytes).await;
+                        } else {
+                            self.network
+                                .lucky_broadcast(addresses, bytes, node_count)
+                                .await;
+                        }
+                    }
+
+                    if !retry_broadcast.is_empty() {
+                        let addresses: Vec<_> = self
+                            .committee
+                            .others_primaries(&self.name)
+                            .iter()
+                            .map(|(_, x)| x.primary_to_primary)
+                            .collect();
+                        let message =
+                            PrimaryMessage::CertificatesRequest(retry_broadcast.clone(), self.name);
+                        let bytes =
+                            Bytes::from(bincode::serialize(&message).expect("Failed to serialize cert request"));
+                        self.network.broadcast(addresses, bytes).await;
+                    }
+
+                    if !(retry_targeted.is_empty() && retry_broadcast.is_empty()) {
+                        info!(
+                            "HeaderWaiter {:?}: retrying {} parent certificates after {} ms (pending headers={}, targeted={}, broadcast={})",
+                            self.name,
+                            retry_targeted.len() + retry_broadcast.len(),
+                            self.sync_retry_delay,
+                            self.pending.len(),
+                            retry_targeted.len(),
+                            retry_broadcast.len()
+                        );
                     }
 
                     // Reschedule the timer.
@@ -297,7 +354,8 @@ impl HeaderWaiter {
                 }
                 self.pending.retain(|_, (r, _)| r > &mut gc_round);
                 self.batch_requests.retain(|_, r| r > &mut gc_round);
-                self.parent_requests.retain(|_, (r, _)| r > &mut gc_round);
+                self.parent_requests
+                    .retain(|_, (r, _, _)| r > &mut gc_round);
             }
         }
     }

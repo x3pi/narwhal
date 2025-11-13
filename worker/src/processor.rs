@@ -49,7 +49,11 @@ impl Processor {
 
                 let digest_for_log = digest.clone();
                 let batch_len = batch.len();
-                let message_kind = if own_digest { "OurBatch" } else { "OthersBatch" };
+                let message_kind = if own_digest {
+                    "OurBatch"
+                } else {
+                    "OthersBatch"
+                };
                 // Create the message for the primary.
                 let message = match own_digest {
                     true => WorkerPrimaryMessage::OurBatch(digest, id, batch),

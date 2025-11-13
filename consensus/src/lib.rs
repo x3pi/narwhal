@@ -545,12 +545,14 @@ impl ConsensusAlgorithm for Bullshark {
             Some(
                 sequence
                     .iter()
-                    .map(|cert| format!(
-                        "{{round: {}, origin: {:?}, digest: {:?}}}",
-                        cert.round(),
-                        cert.origin(),
-                        cert.digest()
-                    ))
+                    .map(|cert| {
+                        format!(
+                            "{{round: {}, origin: {:?}, digest: {:?}}}",
+                            cert.round(),
+                            cert.origin(),
+                            cert.digest()
+                        )
+                    })
                     .collect::<Vec<_>>(),
             )
         } else {

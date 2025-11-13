@@ -97,10 +97,10 @@ impl Default for Parameters {
     fn default() -> Self {
         Self {
             header_size: 1_000,
-            max_header_delay: 100,
+            max_header_delay: 50,
             gc_depth: 50,
-            sync_retry_delay: 1_000,
-            sync_retry_nodes: 3,
+            sync_retry_delay: 200,
+            sync_retry_nodes: 10,
             batch_size: 500_000,
             max_batch_delay: 100,
         }

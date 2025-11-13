@@ -266,9 +266,9 @@ impl MessageHandler for TxReceiverHandler {
         log::info!(
             "[WORKER RX] Received transaction: {} bytes, hex: {}",
             message.len(),
-            tx_hex 
+            tx_hex
         );
-        
+
         self.tx_batch_maker
             .send(message.to_vec())
             .await

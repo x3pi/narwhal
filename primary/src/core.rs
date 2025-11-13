@@ -300,10 +300,8 @@ impl Core {
                             ));
                         }
                         Err(e) => {
-                            parent_summaries.push(format!(
-                                "{{digest: {:?}, decode_error: {}}}",
-                                digest, e
-                            ));
+                            parent_summaries
+                                .push(format!("{{digest: {:?}, decode_error: {}}}", digest, e));
                         }
                     },
                     Ok(None) => {
