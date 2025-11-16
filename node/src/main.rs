@@ -308,6 +308,11 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     let node_config =
         NodeConfig::import(key_file).context("Failed to load the node's configuration")?;
+    
+    log::info!("Node config address : {:?}", node_config.name.to_eth_address());
+    log::info!("Node config secp public key (hex) : {}", hex::encode(node_config.name.as_ref()));
+    log::info!("Node config consensus public key (hex) : {}", hex::encode(node_config.consensus_key.as_bytes()));
+
 
     let parameters = match parameters_file {
         Some(filename) => {

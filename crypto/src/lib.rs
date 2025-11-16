@@ -235,6 +235,9 @@ impl ConsensusPublicKey {
             BLS12381PublicKey::from_bytes(&bytes).map_err(|_| FastCryptoError::InvalidInput)?;
         Ok(Self(pk))
     }
+    pub fn as_bytes(&self) -> &[u8] {
+        self.0.as_ref()
+    }
 }
 
 pub struct ConsensusSecretKey(BLS12381PrivateKey);
