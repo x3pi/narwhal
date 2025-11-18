@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use config::{Authority, PrimaryAddresses};
-use crypto::{generate_keypair, SecretKey};
+use crypto::{generate_consensus_keypair, generate_keypair, ConsensusPublicKey, SecretKey};
 use primary::Header;
 use rand::rngs::StdRng;
 use rand::SeedableRng as _;
@@ -10,26 +10,36 @@ use store::Store; // Thêm import cho Store
 use tokio::sync::mpsc::channel;
 
 // Fixture
-fn keys() -> Vec<(PublicKey, SecretKey)> {
+fn keys() -> Vec<(PublicKey, SecretKey, ConsensusPublicKey)> {
     let mut rng = StdRng::from_seed([0; 32]);
-    (0..4).map(|_| generate_keypair(&mut rng)).collect()
+    (0..4)
+        .map(|_| {
+            let (pk, sk) = generate_keypair(&mut rng);
+            let (cpk, _) = generate_consensus_keypair(&mut rng);
+            (pk, sk, cpk)
+        })
+        .collect()
 }
 
 // Fixture
 pub fn mock_committee() -> Committee {
     Committee {
+        epoch: 0,
         authorities: keys()
             .iter()
-            .map(|(id, _)| {
+            .enumerate()
+            .map(|(i, (id, _, consensus_key))| {
                 (
                     *id,
                     Authority {
                         stake: 1,
+                        consensus_key: consensus_key.clone(),
                         primary: PrimaryAddresses {
                             primary_to_primary: "0.0.0.0:0".parse().unwrap(),
                             worker_to_primary: "0.0.0.0:0".parse().unwrap(),
                         },
                         workers: HashMap::default(),
+                        p2p_address: format!("127.0.0.1:{}", 600 + i),
                     },
                 )
             })

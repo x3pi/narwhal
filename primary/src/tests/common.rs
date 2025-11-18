@@ -43,6 +43,7 @@ pub fn keys() -> Vec<(PublicKey, SecretKey, ConsensusPublicKey, ConsensusSecretK
 // Fixture: Cập nhật để thêm consensus_key vào Authority.
 pub fn committee() -> Committee {
     Committee {
+        epoch: 0,
         authorities: keys()
             .into_iter()
             .enumerate()
@@ -68,6 +69,7 @@ pub fn committee() -> Committee {
                         consensus_key,
                         primary,
                         workers,
+                        p2p_address: format!("127.0.0.1:{}", 600 + i),
                     },
                 )
             })

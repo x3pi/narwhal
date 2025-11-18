@@ -30,8 +30,9 @@ impl MessageHandler for TestHandler {
 
 #[tokio::test]
 async fn receive() {
-    // Địa chỉ để listener lắng nghe.
-    let address = "127.0.0.1:4000".parse::<SocketAddr>().unwrap();
+    // Địa chỉ để listener lắng nghe - sử dụng port cao hơn để tránh conflict.
+    // Nếu vẫn bị conflict, có thể thử các port khác như 7001, 7002, etc.
+    let address = "127.0.0.1:7000".parse::<SocketAddr>().unwrap();
     let (tx, mut rx) = channel(1);
 
     // SỬA ĐỔI: Khởi tạo QuicTransport và tạo một listener.

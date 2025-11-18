@@ -41,6 +41,13 @@ pub struct QuicListener {
     endpoint: Endpoint,
 }
 
+impl QuicListener {
+    /// Lấy địa chỉ local mà listener đang lắng nghe.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.endpoint.local_addr().unwrap()
+    }
+}
+
 #[async_trait]
 impl Listener for QuicListener {
     async fn accept(&mut self) -> TransportResult<(Box<dyn Connection>, SocketAddr)> {

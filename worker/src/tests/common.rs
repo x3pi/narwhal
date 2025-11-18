@@ -30,6 +30,7 @@ pub fn keys() -> Vec<(PublicKey, SecretKey, ConsensusPublicKey)> {
 // Fixture to create a committee.
 pub fn committee() -> Committee {
     Committee {
+        epoch: 0,
         authorities: keys()
             .into_iter()
             .enumerate()
@@ -55,6 +56,7 @@ pub fn committee() -> Committee {
                         consensus_key,
                         primary,
                         workers,
+                        p2p_address: format!("127.0.0.1:{}", 600 + i),
                     },
                 )
             })
