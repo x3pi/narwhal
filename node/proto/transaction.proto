@@ -1,0 +1,243 @@
+syntax = "proto3";
+
+package transaction;
+
+option go_package = "/proto";
+
+option java_package = "com.meta_node.protos.compiled.transaction";
+
+enum ACTION {
+  EMPTY = 0;
+  STAKE = 1;
+  UNSTAKE = 2;
+  DEPLOY_SMART_CONTRACT = 3;
+  CALL_SMART_CONTRACT = 4;
+  REWARD = 5;
+  PUNISH = 6;
+  MINE = 7; 
+  OPEN_CHANNEL = 8;
+  JOIN_CHANNEL = 9;
+  COMMIT_ACCOUNT_STATE_CHANNEL = 10;
+  COMMIT_CHANNEL = 11;
+  UPDATE_STORAGE_HOST = 12;
+}
+
+enum FEE_TYPE {
+  USER_CHARGE_FEE = 0;
+  SMART_CONTRACT_CHARGE_FEE = 1;
+}  
+
+message Transaction {
+  bytes ToAddress = 1;
+  bytes Amount = 3;
+  uint64 MaxGas = 4;
+  uint64 MaxGasPrice = 5;
+  uint64 MaxTimeUse = 6;
+  bytes Data = 7;
+  repeated bytes RelatedAddresses = 8;
+  bytes LastDeviceKey = 9;
+  bytes NewDeviceKey = 10;
+  bytes Sign = 11;
+  bytes Nonce = 12;
+  bytes FromAddress = 13;
+  bool ReadOnly = 14;
+  // Bổ sung cho giao dịch eth
+  uint64 ChainID = 15;
+  uint64 Type = 16;
+  bytes R = 17;
+  bytes S = 18;
+  bytes V = 19;
+  // Thêm cho EIP-1559/EIP-2930
+  bytes GasTipCap = 20;
+  bytes GasFeeCap = 21;
+  repeated AccessTuple AccessList = 22;
+}
+
+message AccessTuple {
+  bytes Address = 1;
+  repeated bytes StorageKeys = 2;
+}
+
+message TransactionHashData {
+  bytes FromAddress = 1;
+  bytes ToAddress = 2;
+  bytes Amount = 3;
+  uint64 MaxGas = 4;
+  uint64 MaxGasPrice = 5;
+  uint64 MaxTimeUse = 6;
+  bytes Data = 7;
+  uint64 Type = 8;
+  bytes LastDeviceKey = 9;
+  bytes NewDeviceKey = 10;
+  bytes Nonce = 11;
+  uint64 ChainID = 12;
+  bytes R = 13;
+  bytes S = 14;
+  bytes V = 15;
+  bytes GasTipCap = 16;
+  bytes GasFeeCap = 17;
+  repeated AccessTuple AccessList = 18;
+}
+
+message DeployData {
+  bytes Code = 1;
+  // string StorageHost = 2; // DEPRECATED
+  bytes StorageAddress = 3;
+}
+
+message CallData {
+  bytes Input = 1;
+}
+
+message OpenStateChannelData {
+  repeated bytes ValidatorAddresses = 1;
+}
+
+message UpdateStorageHostData {
+  string StorageHost = 1;
+  bytes StorageAddress = 2;
+}
+
+message MassTransferData {
+  map<string,bytes> MapAddressAmount = 1;
+}
+
+message Transactions {
+  repeated Transaction Transactions = 1;
+}
+
+message VerifyTransactionSignRequest {
+  bytes Hash = 1; 
+  bytes Pubkey = 2; 
+  bytes Sign = 3;
+}
+
+message VerifyTransactionSignResult {
+  bytes Hash = 1; 
+  bool Valid = 2; 
+}
+
+message TransactionError {
+  int64 Code = 1;
+  string Description = 2;
+}
+
+message TransactionHashWithErrorCode {
+  bytes TransactionHash = 1;
+  int64 Code = 2;
+}
+
+message TransactionWithDeviceKey {
+  Transaction Transaction = 1;
+  bytes DeviceKey = 2;
+}
+
+message TransactionsWithBlockNumber {
+  repeated Transaction Transactions = 1;
+  uint64 BlockNumber = 2; 
+}
+
+message ExecuteSCTransactions {
+  repeated Transaction Transactions = 1;
+  uint64 GroupId = 2; 
+  uint64 BlockNumber = 3; 
+}
+
+message FromNodeTransactionsResult {
+  repeated bytes ValidTransactionHashes = 1;
+  repeated TransactionHashWithErrorCode TransactionErrors = 2;
+  uint64 BlockNumber = 3;
+}
+
+message ToNodeTransactionsResult {
+  repeated bytes ValidTransactionHashes = 1;
+  uint64 BlockNumber = 3;
+}
+
+message TransactionsFromLeader {
+  repeated Transaction Transactions = 1;
+  bytes AggSign = 2;
+  uint64 BlockNumber = 3;
+  uint64 TimeStamp = 4;
+}
+
+message TransactionHashWithError {
+  bytes Hash = 1;  // Hash của giao dịch gây lỗi
+  int64 Code = 2;             // Mã lỗi
+  string Description = 3;     // Mô tả lỗi
+  bytes Output = 4; // chuỗi byte do evm return
+}
+
+// Message mới để log từng giao dịch khi worker nhận được
+message TransactionLogEntry {
+  // Hash của giao dịch (quan trọng nhất để log)
+  bytes TransactionHash = 1;
+  
+  // Thông tin cơ bản của giao dịch
+  bytes FromAddress = 2;
+  bytes ToAddress = 3;
+  bytes Amount = 4;
+  bytes Nonce = 5;
+  
+  // Thông tin gas
+  uint64 MaxGas = 6;
+  uint64 MaxGasPrice = 7;
+  bytes GasTipCap = 8;
+  bytes GasFeeCap = 9;
+  
+  // Thông tin chain và type
+  uint64 ChainID = 10;
+  uint64 Type = 11;
+  
+  // Thông tin signature
+  bytes R = 12;
+  bytes S = 13;
+  bytes V = 14;
+  bytes Sign = 15;
+  
+  // Thông tin device key
+  bytes LastDeviceKey = 16;
+  bytes NewDeviceKey = 17;
+  
+  // Thông tin data và related addresses
+  bytes Data = 18;
+  repeated bytes RelatedAddresses = 19;
+  
+  // Thông tin access list (cho EIP-2930)
+  repeated AccessTuple AccessList = 20;
+  
+  // Thông tin khác
+  bool ReadOnly = 21;
+  uint64 MaxTimeUse = 22;
+  
+  // Timestamp khi worker nhận được giao dịch
+  uint64 ReceivedTimestamp = 23;
+  
+  // Worker ID nhận được giao dịch
+  uint32 WorkerId = 24;
+  
+  // Kích thước của giao dịch (bytes)
+  uint64 Size = 25;
+  
+  // Index trong batch Transactions (nếu có)
+  uint32 IndexInBatch = 26;
+}
+
+// Message để log nhiều giao dịch cùng lúc
+message TransactionLogBatch {
+  // Timestamp khi nhận được batch
+  uint64 ReceivedTimestamp = 1;
+  
+  // Worker ID nhận được batch
+  uint32 WorkerId = 2;
+  
+  // Tổng số giao dịch trong batch
+  uint32 TotalTransactions = 3;
+  
+  // Danh sách các log entry cho từng giao dịch
+  repeated TransactionLogEntry TransactionLogs = 4;
+  
+  // Kích thước tổng của batch (bytes)
+  uint64 TotalSize = 5;
+}
+

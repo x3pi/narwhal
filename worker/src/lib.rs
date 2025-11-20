@@ -5,6 +5,7 @@ mod helper;
 mod processor;
 mod quorum_waiter;
 mod synchronizer;
+mod transaction_logger;
 mod worker;
 
 #[cfg(test)]

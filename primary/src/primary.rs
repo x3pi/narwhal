@@ -76,6 +76,7 @@ impl Primary {
             channel::<(Digest, WorkerId, Vec<u8>)>(CHANNEL_CAPACITY);
         let (tx_parents, rx_parents) = channel(CHANNEL_CAPACITY);
         let (tx_headers, rx_proposer) = channel(CHANNEL_CAPACITY);
+        let (tx_headers_to_proposer, rx_headers_from_core) = channel(CHANNEL_CAPACITY);
         let (tx_sync_headers, rx_sync_headers) = channel(CHANNEL_CAPACITY);
         let (tx_sync_certificates, rx_sync_certificates) = channel(CHANNEL_CAPACITY);
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
@@ -163,6 +164,7 @@ impl Primary {
             rx_proposer,
             tx_consensus,
             tx_parents,
+            tx_headers_to_proposer.clone(),
         );
 
         GarbageCollector::spawn(
@@ -202,6 +204,7 @@ impl Primary {
             parameters.max_header_delay,
             parameters.sync_retry_delay,
             rx_parents,
+            rx_headers_from_core,
             rx_our_digests,
             rx_committed_batches,
             tx_headers,

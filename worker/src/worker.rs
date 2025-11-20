@@ -150,7 +150,13 @@ impl Worker {
             .listen(address)
             .await
             .expect("Failed to create transaction listener");
-        Receiver::spawn(listener, TxReceiverHandler { tx_batch_maker });
+        Receiver::spawn(
+            listener,
+            TxReceiverHandler {
+                tx_batch_maker,
+                worker_id: self.id,
+            },
+        );
 
         BatchMaker::spawn(
             self.parameters.batch_size,
@@ -256,12 +262,19 @@ impl Worker {
 #[derive(Clone)]
 struct TxReceiverHandler {
     tx_batch_maker: Sender<Transaction>,
+    worker_id: WorkerId,
 }
 
 #[async_trait]
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
-        // Log hex của transaction khi nhận được
+        // Thử parse như Transactions (nhiều giao dịch)
+        use crate::transaction_logger::parse_and_log_transactions_simple;
+        
+        // Parse và log transactions nếu có thể
+        parse_and_log_transactions_simple(&message, self.worker_id);
+
+        // Log hex của transaction khi nhận được (backward compatible)
         let tx_hex = hex::encode(&message);
         log::info!(
             "[WORKER RX] Received transaction: {} bytes, hex: {}",

@@ -19,6 +19,7 @@ prost = "0.11"
 prost-types = "0.11"
 prost-build = { version = "0.11", optional = true }
 hex = "0.4"
+sha3 = "0.10.6"
 
 
 config = { path = "../config" }
