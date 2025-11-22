@@ -10,7 +10,6 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, error, info};
 use network::SimpleSender;
-use std::cmp::min;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -21,8 +20,8 @@ use tokio::time::{sleep, Duration, Instant};
 
 /// The resolution of the timer that checks whether we received replies to our sync requests, and triggers
 /// new sync requests if we didn't.
-const TIMER_RESOLUTION: u64 = 1_000;
-const BROADCAST_RETRY_THRESHOLD: u32 = 2;
+const TIMER_RESOLUTION: u64 = 100; // Giảm xuống 100ms để check và retry nhanh hơn
+const BROADCAST_RETRY_THRESHOLD: u32 = 1; // Broadcast ngay từ lần retry đầu tiên
 
 /// The commands that can be sent to the `Waiter`.
 #[derive(Debug)]
@@ -161,15 +160,36 @@ impl HeaderWaiter {
                                     round
                                 });
                             }
+                            // ĐỒNG BỘ SIÊU NHANH: Gửi đến nhiều workers song song để tăng tốc độ
                             for (worker_id, digests) in requires_sync {
-                                let address = self.committee
+                                let author_address = self.committee
                                     .worker(&author, &worker_id)
                                     .expect("Author of valid header is not in the committee")
                                     .primary_to_worker;
-                                let message = PrimaryWorkerMessage::Synchronize(digests, author);
+                                let message = PrimaryWorkerMessage::Synchronize(digests.clone(), author);
                                 let bytes = bincode::serialize(&message)
                                     .expect("Failed to serialize batch sync request");
-                                self.network.send(address, Bytes::from(bytes)).await;
+
+                                // ĐỒNG BỘ SIÊU NHANH: Gửi đến TẤT CẢ workers ngay lập tức để tăng tốc độ sync tối đa
+                                // Gửi đến worker của author trước
+                                self.network.send(author_address, Bytes::from(bytes.clone())).await;
+
+                                // Gửi đến TẤT CẢ workers của các node khác để tăng tốc độ sync tối đa
+                                let other_workers: Vec<_> = self.committee.others_primaries(&self.name)
+                                    .iter()
+                                    .filter_map(|(other_author, _)| {
+                                        self.committee.worker(other_author, &worker_id).ok()
+                                            .map(|addr| addr.primary_to_worker)
+                                    })
+                                    .collect(); // Gửi đến TẤT CẢ workers, không giới hạn
+
+                                // Gửi tuần tự đến tất cả workers khác (SimpleSender đã có connection pooling)
+                                for worker_addr in other_workers {
+                                    let message_other = PrimaryWorkerMessage::Synchronize(digests.clone(), author);
+                                    let bytes_other = bincode::serialize(&message_other)
+                                        .expect("Failed to serialize batch sync request");
+                                    self.network.send(worker_addr, Bytes::from(bytes_other)).await;
+                                }
                             }
                         }
 
@@ -221,7 +241,8 @@ impl HeaderWaiter {
                                         *attempts = attempts.saturating_add(1);
                                     }
                                 }
-                                let address = self.committee
+                                
+                                let author_address = self.committee
                                     .primary(&author)
                                     .expect("Author of valid header not in the committee")
                                     .primary_to_primary;
@@ -230,7 +251,22 @@ impl HeaderWaiter {
                                     self.name,
                                 );
                                 let bytes = bincode::serialize(&message).expect("Failed to serialize cert request");
-                                self.network.send(address, Bytes::from(bytes)).await;
+
+                                // ĐỒNG BỘ SIÊU NHANH: Gửi đến TẤT CẢ nodes ngay lập tức để tăng tốc độ sync tối đa
+                                // Gửi đến author trước
+                                self.network.send(author_address, Bytes::from(bytes.clone())).await;
+
+                                // Gửi đến TẤT CẢ nodes khác ngay lập tức (không giới hạn số lượng)
+                                let other_addresses: Vec<_> = self.committee.others_primaries(&self.name)
+                                    .iter()
+                                    .filter(|(pk, _)| *pk != author) // Không gửi lại đến author
+                                    .map(|(_, x)| x.primary_to_primary)
+                                    .collect(); // Gửi đến TẤT CẢ nodes, không giới hạn
+
+                                // Gửi tuần tự đến tất cả nodes khác (SimpleSender đã có connection pooling)
+                                for addr in other_addresses {
+                                    self.network.send(addr, Bytes::from(bytes.clone())).await;
+                                }
                             }
                         }
                     }
@@ -285,6 +321,7 @@ impl HeaderWaiter {
                     }
 
                     if !retry_targeted.is_empty() {
+                        // ĐỒNG BỘ SIÊU NHANH: Khi retry, gửi đến TẤT CẢ nodes để tăng tốc độ sync tối đa
                         let addresses: Vec<_> = self
                             .committee
                             .others_primaries(&self.name)
@@ -297,18 +334,9 @@ impl HeaderWaiter {
                         );
                         let bytes =
                             Bytes::from(bincode::serialize(&message).expect("Failed to serialize cert request"));
-                        let node_count = if self.sync_retry_nodes == 0 {
-                            addresses.len()
-                        } else {
-                            min(self.sync_retry_nodes, addresses.len())
-                        };
-                        if node_count >= addresses.len() {
-                            self.network.broadcast(addresses, bytes).await;
-                        } else {
-                            self.network
-                                .lucky_broadcast(addresses, bytes, node_count)
-                                .await;
-                        }
+                        
+                        // Gửi đến TẤT CẢ nodes khi retry để tăng tốc độ sync tối đa
+                        self.network.broadcast(addresses, bytes).await;
                     }
 
                     if !retry_broadcast.is_empty() {

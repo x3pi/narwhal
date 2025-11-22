@@ -119,8 +119,8 @@ pub fn parse_and_log_transactions(
     worker_id: u32,
 ) -> Result<TransactionLogBatch, String> {
     // Parse Transactions từ bytes
-    let transactions = Transactions::decode(data)
-        .map_err(|e| format!("Failed to decode Transactions: {}", e))?;
+    let transactions =
+        Transactions::decode(data).map_err(|e| format!("Failed to decode Transactions: {}", e))?;
 
     let received_timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -191,7 +191,7 @@ pub fn log_transaction_entry(index: usize, entry: &TransactionLogEntry) {
 /// Cắt bỏ 8-byte length prefix trước khi parse
 pub fn parse_and_log_transactions_simple(data: &Bytes, worker_id: u32) {
     const LENGTH_PREFIX_SIZE: usize = 8;
-    
+
     // Kiểm tra xem có đủ 8 bytes để cắt prefix không
     if data.len() <= LENGTH_PREFIX_SIZE {
         warn!(
@@ -201,10 +201,10 @@ pub fn parse_and_log_transactions_simple(data: &Bytes, worker_id: u32) {
         );
         return;
     }
-    
+
     // Cắt bỏ 8 bytes đầu (length prefix)
     let payload = &data[LENGTH_PREFIX_SIZE..];
-    
+
     match parse_and_log_transactions(payload, worker_id) {
         Ok(log_batch) => {
             log_transaction_batch(&log_batch);
@@ -216,7 +216,10 @@ pub fn parse_and_log_transactions_simple(data: &Bytes, worker_id: u32) {
                     log_transaction_entry(0, &log_entry);
                 }
                 Err(_) => {
-                    warn!("[TX LOG] Failed to parse as Transactions or single Transaction: {}", e);
+                    warn!(
+                        "[TX LOG] Failed to parse as Transactions or single Transaction: {}",
+                        e
+                    );
                 }
             }
         }
@@ -224,12 +227,9 @@ pub fn parse_and_log_transactions_simple(data: &Bytes, worker_id: u32) {
 }
 
 /// Parse một transaction đơn lẻ (không phải Transactions)
-fn parse_single_transaction(
-    data: &[u8],
-    worker_id: u32,
-) -> Result<TransactionLogEntry, String> {
-    let tx = Transaction::decode(data)
-        .map_err(|e| format!("Failed to decode Transaction: {}", e))?;
-    
+fn parse_single_transaction(data: &[u8], worker_id: u32) -> Result<TransactionLogEntry, String> {
+    let tx =
+        Transaction::decode(data).map_err(|e| format!("Failed to decode Transaction: {}", e))?;
+
     Ok(create_transaction_log_entry(&tx, worker_id, 0))
 }

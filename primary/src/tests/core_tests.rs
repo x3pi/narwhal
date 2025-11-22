@@ -3,11 +3,21 @@ use super::*;
 use crate::common::{
     certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
 };
+use crate::rate_control::{
+    AdaptiveRateController, AdaptiveRateControllerHandle, RateControlConfig,
+};
+use config::{Committee, Parameters};
 use dashmap::DashMap; // Thêm import cho DashMap
 use futures::future::try_join_all;
 use std::fs;
 use std::sync::Arc; // Thêm import cho Arc
 use tokio::sync::mpsc::channel;
+
+fn test_rate_controller(committee: &Committee) -> AdaptiveRateControllerHandle {
+    let mut cfg = RateControlConfig::from_parameters(&Parameters::default());
+    cfg.enabled = false; // Tắt điều tốc trong unit test để đơn giản hóa.
+    AdaptiveRateController::new(cfg, committee)
+}
 
 #[tokio::test]
 async fn process_header() {
@@ -17,15 +27,17 @@ async fn process_header() {
     let mut signature_service = SignatureService::new(consensus_secret);
 
     let committee = committee_with_base_port(13_000);
+    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_headers_to_proposer, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
+    let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -48,7 +60,7 @@ async fn process_header() {
         name,
         &committee,
         store.clone(),
-        payload_cache, // Truyền cache vào
+        payload_cache.clone(), // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -68,6 +80,10 @@ async fn process_header() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_headers_to_proposer,
+        rx_batch_rescue,
+        payload_cache.clone(),
+        rate_controller,
     );
 
     // Send a header to the core.
@@ -96,15 +112,18 @@ async fn process_header() {
 async fn process_header_missing_parent() {
     let (name, _, __, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
+    let committee = committee();
+    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_headers_to_proposer, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
+    let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header_missing_parent";
@@ -115,9 +134,9 @@ async fn process_header_missing_parent() {
     let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
-        &committee(),
+        &committee,
         store.clone(),
-        payload_cache, // Truyền cache vào
+        payload_cache.clone(), // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -125,7 +144,7 @@ async fn process_header_missing_parent() {
     // Spawn the core.
     Core::spawn(
         name,
-        committee(),
+        committee,
         store.clone(),
         synchronizer,
         signature_service,
@@ -137,6 +156,10 @@ async fn process_header_missing_parent() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_headers_to_proposer,
+        rx_batch_rescue,
+        payload_cache.clone(),
+        rate_controller,
     );
 
     // Send a header to the core.
@@ -158,15 +181,18 @@ async fn process_header_missing_parent() {
 async fn process_header_missing_payload() {
     let (name, _, __, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
+    let committee = committee();
+    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_headers_to_proposer, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
+    let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header_missing_payload";
@@ -177,9 +203,9 @@ async fn process_header_missing_payload() {
     let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
-        &committee(),
+        &committee,
         store.clone(),
-        payload_cache, // Truyền cache vào
+        payload_cache.clone(), // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -187,7 +213,7 @@ async fn process_header_missing_payload() {
     // Spawn the core.
     Core::spawn(
         name,
-        committee(),
+        committee,
         store.clone(),
         synchronizer,
         signature_service,
@@ -199,6 +225,10 @@ async fn process_header_missing_payload() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_headers_to_proposer,
+        rx_batch_rescue,
+        payload_cache.clone(),
+        rate_controller,
     );
 
     // Send a header to the core.
@@ -222,15 +252,17 @@ async fn process_votes() {
     let signature_service = SignatureService::new(consensus_secret);
 
     let committee = committee_with_base_port(13_100);
+    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(1);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_headers_to_proposer, rx_headers) = channel(1);
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
+    let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_vote";
@@ -243,7 +275,7 @@ async fn process_votes() {
         name,
         &committee,
         store.clone(),
-        payload_cache, // Truyền cache vào
+        payload_cache.clone(), // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -263,6 +295,10 @@ async fn process_votes() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_headers_to_proposer,
+        rx_batch_rescue,
+        payload_cache.clone(),
+        rate_controller,
     );
 
     // Make the certificate we expect to receive.
@@ -296,15 +332,18 @@ async fn process_votes() {
 async fn process_certificates() {
     let (name, _, __, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
+    let committee = committee();
+    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
     let (tx_primary_messages, rx_primary_messages) = channel(3);
     let (_tx_headers_loopback, rx_headers_loopback) = channel(1);
     let (_tx_certificates_loopback, rx_certificates_loopback) = channel(1);
-    let (_tx_headers, rx_headers) = channel(1);
+    let (tx_headers_to_proposer, rx_headers) = channel(1);
     let (tx_consensus, mut rx_consensus) = channel(3);
     let (tx_parents, mut rx_parents) = channel(1);
+    let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_certificates";
@@ -315,9 +354,9 @@ async fn process_certificates() {
     let payload_cache = Arc::new(DashMap::new());
     let synchronizer = Synchronizer::new(
         name,
-        &committee(),
+        &committee,
         store.clone(),
-        payload_cache, // Truyền cache vào
+        payload_cache.clone(), // Truyền cache vào
         /* tx_header_waiter */ tx_sync_headers,
         /* tx_certificate_waiter */ tx_sync_certificates,
     );
@@ -325,7 +364,7 @@ async fn process_certificates() {
     // Spawn the core.
     Core::spawn(
         name,
-        committee(),
+        committee,
         store.clone(),
         synchronizer,
         signature_service,
@@ -337,6 +376,10 @@ async fn process_certificates() {
         /* rx_proposer */ rx_headers,
         tx_consensus,
         /* tx_proposer */ tx_parents,
+        tx_headers_to_proposer,
+        rx_batch_rescue,
+        payload_cache.clone(),
+        rate_controller,
     );
 
     // Send enough certificates to the core.

@@ -454,6 +454,7 @@ impl ConsensusAlgorithm for Bullshark {
         // Bullshark commits leaders every 2 rounds (vs Tusk's 4)
         let r = round - 1;
         if r % 2 != 0 || r < 2 {
+            debug!("[CONSENSUS] Round {} not eligible for commit (r={}, r%2={}, r<2={})", round, r, r % 2, r < 2);
             return Ok((Vec::new(), false));
         }
 
@@ -462,18 +463,19 @@ impl ConsensusAlgorithm for Bullshark {
             return Ok((Vec::new(), false));
         }
 
-        debug!("Checking for leader at round {}", leader_round);
+        info!("[CONSENSUS] Checking for leader at round {} (current round: {})", leader_round, round);
         let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
             Some(x) => {
-                debug!("Found leader {:?} at round {}", x.1.digest(), leader_round);
+                info!("[CONSENSUS] Found leader {:?} at round {}", x.1.origin(), leader_round);
                 x.clone()
             }
             None => {
                 metrics.failed_leader_elections += 1;
                 info!(
-                    "Bullshark: no leader certificate available at round {}, cannot commit (current round {}).",
+                    "[CONSENSUS] Bullshark: no leader certificate available at round {}, cannot commit (current round {}). DAG has rounds: {:?}",
                     leader_round,
-                    round
+                    round,
+                    state.dag.keys().collect::<Vec<_>>()
                 );
                 return Ok((Vec::new(), false));
             }
@@ -720,7 +722,7 @@ impl Consensus {
 
         // Main processing loop
         while let Some(certificate) = self.rx_primary.recv().await {
-            debug!("Received certificate from round {}", certificate.round());
+            info!("[CONSENSUS] Received certificate from round {} (origin: {:?})", certificate.round(), certificate.origin());
 
             let mut metrics = self.metrics.write().await;
 

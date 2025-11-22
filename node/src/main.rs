@@ -312,11 +312,19 @@ async fn run(matches: &ArgMatches<'_>) -> Result<()> {
 
     let node_config =
         NodeConfig::import(key_file).context("Failed to load the node's configuration")?;
-    
-    log::info!("Node config address : {:?}", node_config.name.to_eth_address());
-    log::info!("Node config secp public key (hex) : {}", hex::encode(node_config.name.as_ref()));
-    log::info!("Node config consensus public key (hex) : {}", hex::encode(node_config.consensus_key.as_bytes()));
 
+    log::info!(
+        "Node config address : {:?}",
+        node_config.name.to_eth_address()
+    );
+    log::info!(
+        "Node config secp public key (hex) : {}",
+        hex::encode(node_config.name.as_ref())
+    );
+    log::info!(
+        "Node config consensus public key (hex) : {}",
+        hex::encode(node_config.consensus_key.as_bytes())
+    );
 
     let parameters = match parameters_file {
         Some(filename) => {
@@ -616,11 +624,11 @@ async fn analyze(
 
     // Track height lớn nhất đã gửi cho mỗi epoch (height = ceil(round / 2))
     let mut last_committed_height_per_epoch: HashMap<u64, u64> = HashMap::new();
-    
+
     // Track các batch đã được xử lý và gửi tới unix domain socket
     // Để tránh xử lý lại batch đã được gửi (có thể xuất hiện trong nhiều certificate/round)
     let mut processed_batches: HashSet<Digest> = HashSet::new();
-    
+
     // Track các transaction đã được gửi tới unix domain socket
     // Để tránh thực thi lại transaction đã được gửi (có thể xuất hiện trong nhiều block)
     // NOTE: Đây là execution-level tracking, không ảnh hưởng đến consensus
@@ -791,13 +799,16 @@ async fn analyze(
 
         let payload_len = certificate.header.payload.len();
         let cert_digest = certificate.digest();
-        
+
         // Log chi tiết về payload ngay khi nhận certificate
         if payload_len > 0 {
-            let batch_list: Vec<String> = certificate.header.payload.iter()
+            let batch_list: Vec<String> = certificate
+                .header
+                .payload
+                .iter()
                 .map(|(digest, worker_id)| format!("{} (worker {})", digest, worker_id))
                 .collect();
-        log::info!(
+            log::info!(
                 "[ANALYZE] Node ID {} RECEIVED certificate {} for round {} (epoch {}) from consensus with {} batches in payload: {:?}",
             node_id,
                 cert_digest,
@@ -824,7 +835,7 @@ async fn analyze(
             .get(&epoch)
             .copied()
             .unwrap_or(0);
-        
+
         if height <= last_height_check && payload_len > 0 {
             // Có thể là batch đến muộn - kiểm tra chi tiết
             let is_late = if let Some(current_builder) = current_block.as_ref() {
@@ -834,12 +845,15 @@ async fn analyze(
                 // Không có block đang xây dựng -> block đã finalize
                 true
             };
-            
+
             if is_late {
-                let batch_list: Vec<String> = certificate.header.payload.iter()
+                let batch_list: Vec<String> = certificate
+                    .header
+                    .payload
+                    .iter()
                     .map(|(digest, worker_id)| format!("{} (worker {})", digest, worker_id))
                     .collect();
-                
+
                 log::error!(
                     "[LATE BATCH DETECTION] ⚠️ Node ID {} EARLY DETECTION: Certificate {} round {} (height {}) arrived LATE! Last committed: {}, Currently building: {}. {} batches will be SKIPPED: {:?}",
                     node_id,
@@ -851,7 +865,7 @@ async fn analyze(
                     payload_len,
                     batch_list
                 );
-                
+
                 // Log chi tiết từng batch để dễ trace
                 for (batch_digest, worker_id) in certificate.header.payload.iter() {
                     log::error!(
@@ -880,7 +894,7 @@ async fn analyze(
                             finished.certificate_count
                         );
                     } else {
-                    log::info!(
+                        log::info!(
                         "[ANALYZE] Node ID {} Finalizing block for height {} (leader round {}) containing {} unique transactions ({} certificates).",
                         node_id,
                         finished.height,
@@ -957,12 +971,13 @@ async fn analyze(
             if payload_len > 0 {
                 // Kiểm tra xem có thể xử lý late batch trong block hiện tại không
                 if let Some(current_builder) = current_block.as_mut() {
-                    if current_builder.height > height 
-                        && !current_builder.late_batches_from_height.contains(&height) {
+                    if current_builder.height > height
+                        && !current_builder.late_batches_from_height.contains(&height)
+                    {
                         // AN TOÀN: Thêm batch vào block hiện tại
                         // Certificate đã được commit, tất cả node sẽ xử lý giống nhau (deterministic)
                         let height_diff = current_builder.height - height;
-            log::warn!(
+                        log::warn!(
                             "[LATE BATCH HANDLING] Node ID {} received late certificate {} round {} (height {}) but last committed height is {}. Will process {} batches in CURRENT block {} (height {}, {} blocks ahead) to avoid batch being dropped. Certificate was committed, so all nodes will handle this the same way (deterministic).",
                 node_id,
                             cert_digest,
@@ -974,18 +989,21 @@ async fn analyze(
                             current_builder.height,
                             height_diff
                         );
-                        
+
                         // Đánh dấu đã có late batch từ height này
                         current_builder.late_batches_from_height.insert(height);
-                        
+
                         // Tiếp tục xử lý batch bên dưới
                         // Batch sẽ được thêm vào builder.height
                     } else {
                         // Không thể xử lý an toàn - skip
-                        let batch_list: Vec<String> = certificate.header.payload.iter()
+                        let batch_list: Vec<String> = certificate
+                            .header
+                            .payload
+                            .iter()
                             .map(|(digest, worker_id)| format!("{} (worker {})", digest, worker_id))
                             .collect();
-                        
+
                         if current_builder.height <= height {
                             log::warn!(
                                 "[ANALYZE] Node ID {} received certificate {} round {} (height {}) but last committed height is {}, and currently building block for height {} (not > height). Cannot safely add late batches. SKIPPING to avoid fork. WARNING: {} batches will NOT be processed: {:?}",
@@ -1028,12 +1046,12 @@ async fn analyze(
                         next_height,
                         payload_len
                     );
-                    
+
                     // Tạo block mới cho height + 1
                     let mut new_builder = BlockBuilder::new(epoch, next_height);
                     new_builder.late_batches_from_height.insert(height);
                     current_block = Some(new_builder);
-                    
+
                     // Tiếp tục xử lý batch bên dưới với height = next_height
                 }
             } else {
@@ -1046,10 +1064,10 @@ async fn analyze(
                 height,
                 last_height
             );
-            continue;
+                continue;
             }
         }
-        
+
         // Nếu height == last_height, kiểm tra xem có đang xây dựng block cho height đó không
         // CHỈ xử lý batch nếu đang xây dựng block cho đúng height đó
         // KHÔNG tạo block mới cho height đã được finalize (tránh fork)
@@ -1079,12 +1097,13 @@ async fn analyze(
                         // 1. Certificate đã được commit (tất cả node đều thấy) - deterministic
                         // 2. Đang xây dựng block cho height > height (block tiếp theo hoặc xa hơn)
                         // 3. Chưa có late batch từ height này trong block hiện tại (tránh duplicate)
-                        // 
+                        //
                         // Lý do an toàn: Certificate đã commit, tất cả node sẽ xử lý giống nhau
                         // Nếu đang xây dựng block height + 2, +3..., vẫn có thể xử lý batch
                         // từ height cũ trong block đó, vì tất cả node sẽ làm giống nhau (certificate đã commit)
-                        if current_builder.height > height 
-                            && !current_builder.late_batches_from_height.contains(&height) {
+                        if current_builder.height > height
+                            && !current_builder.late_batches_from_height.contains(&height)
+                        {
                             // AN TOÀN: Thêm batch vào block hiện tại (có thể là height + 1, +2, +3...)
                             // Certificate đã được commit, tất cả node sẽ xử lý giống nhau (deterministic)
                             let height_diff = current_builder.height - height;
@@ -1100,18 +1119,23 @@ async fn analyze(
                                 current_builder.height,
                                 height_diff
                             );
-                            
+
                             // Đánh dấu đã có late batch từ height này
                             current_builder.late_batches_from_height.insert(height);
-                            
+
                             // Tiếp tục xử lý batch bên dưới
                             // Batch sẽ được thêm vào builder.height (có thể là height + 1, +2, +3...)
                         } else {
                             // Không thể xử lý an toàn - skip để tránh duplicate hoặc fork
-                            let batch_list: Vec<String> = certificate.header.payload.iter()
-                                .map(|(digest, worker_id)| format!("{} (worker {})", digest, worker_id))
+                            let batch_list: Vec<String> = certificate
+                                .header
+                                .payload
+                                .iter()
+                                .map(|(digest, worker_id)| {
+                                    format!("{} (worker {})", digest, worker_id)
+                                })
                                 .collect();
-                            
+
                             if current_builder.height <= height {
                                 log::warn!(
                                     "[ANALYZE] Node ID {} received certificate {} round {} (height {}) same as last committed height {}, but currently building block for height {} (not > height). Cannot safely add late batches. SKIPPING to avoid fork. WARNING: {} batches will NOT be processed: {:?}",
@@ -1172,12 +1196,12 @@ async fn analyze(
                         next_height,
                         payload_len
                     );
-                    
+
                     // Tạo block mới cho height + 1
                     let mut new_builder = BlockBuilder::new(epoch, next_height);
                     new_builder.late_batches_from_height.insert(height);
                     current_block = Some(new_builder);
-                    
+
                     // Tiếp tục xử lý batch bên dưới với height = next_height
                     // (sẽ được xử lý như batch của block mới)
                 } else {
@@ -1250,14 +1274,17 @@ async fn analyze(
                 // Kiểm tra xem có phải là late batch đã được quyết định xử lý không
                 // Nếu đã có late batch từ height này trong block hiện tại, tiếp tục xử lý
                 // (có thể là height + 1, +2, +3...)
-                let is_late_batch_being_handled = builder_ref.height > height 
+                let is_late_batch_being_handled = builder_ref.height > height
                     && builder_ref.late_batches_from_height.contains(&height);
-                
+
                 if !is_late_batch_being_handled {
                     // Không phải late batch đang được xử lý - skip như bình thường
                     let payload_len = certificate.header.payload.len();
                     if payload_len > 0 {
-                        let batch_list: Vec<String> = certificate.header.payload.iter()
+                        let batch_list: Vec<String> = certificate
+                            .header
+                            .payload
+                            .iter()
                             .map(|(digest, worker_id)| format!("{} (worker {})", digest, worker_id))
                             .collect();
                         log::warn!(
@@ -1270,7 +1297,7 @@ async fn analyze(
                             batch_list
                         );
                     } else {
-                log::warn!(
+                        log::warn!(
                     "[ANALYZE] Node ID {} encountered out-of-order certificate (round {}, height {}) already building height {}. Skipping.",
                     node_id,
                     commit_round,
@@ -1278,7 +1305,7 @@ async fn analyze(
                     builder_ref.height
                 );
                     }
-                continue;
+                    continue;
                 }
                 // Nếu là late batch đang được xử lý, tiếp tục xử lý bên dưới
             } else if builder_ref.height < height {
@@ -1286,7 +1313,7 @@ async fn analyze(
                     let leader_round = finished.height * 2;
                     let tx_count = finished.transactions.len();
                     if tx_count == 0 {
-                    log::warn!(
+                        log::warn!(
                             "[ANALYZE] Node ID {} forcing flush of EMPTY unfinished block height {} (leader round {}) with {} transactions ({} certificates) due to new height {}. This may indicate batches were not processed correctly!",
                         node_id,
                         finished.height,
@@ -1368,12 +1395,12 @@ async fn analyze(
 
         let cert_digest = certificate.digest();
         let payload_len = certificate.header.payload.len();
-        
+
         // Kiểm tra xem có phải là late batch không
         // Late batch là batch từ height cũ được thêm vào block có height cao hơn
-        let is_late_batch = builder.late_batches_from_height.contains(&height) 
-            && builder.height > height;
-        
+        let is_late_batch =
+            builder.late_batches_from_height.contains(&height) && builder.height > height;
+
         // Log chi tiết về payload của certificate
         if is_late_batch {
             let height_diff = builder.height - height;
@@ -1397,10 +1424,13 @@ async fn analyze(
             builder.height
         );
         }
-        
+
         // Log danh sách batch digests trong payload
         if payload_len > 0 {
-            let batch_list: Vec<String> = certificate.header.payload.iter()
+            let batch_list: Vec<String> = certificate
+                .header
+                .payload
+                .iter()
                 .map(|(digest, worker_id)| format!("{} (worker {})", digest, worker_id))
                 .collect();
             log::info!(
@@ -1443,7 +1473,7 @@ async fn analyze(
                 );
                 continue;
             }
-            
+
             // CRITICAL: Kiểm tra batch đã được xử lý trong blocks trước đó
             // Đây là cần thiết vì batch có thể xuất hiện trong nhiều certificates khác nhau
             // (do logic extract batches từ parent certificates)
@@ -1466,7 +1496,7 @@ async fn analyze(
                 builder.batch_hashes.remove(batch_digest);
                 continue;
             }
-            
+
             // Log bắt đầu xử lý batch
             log::info!(
                 "[BATCH TRACK] Node ID {} PROCESSING batch {} from worker {} in certificate {} (round {}, height {}), current block height: {}",
@@ -1513,8 +1543,8 @@ async fn analyze(
                                         builder.height,
                                         height_diff
                                 );
-                            } else {
-                                log::info!(
+                                } else {
+                                    log::info!(
                                     "[BATCH PROCESSING] Batch {} contains {} transactions, adding to block height {}",
                                     batch_digest,
                                     batch_tx_count,
@@ -1560,7 +1590,7 @@ async fn analyze(
                                 // Sử dụng hash của transaction payload (sau khi strip length prefix)
                                 use sha3::{Digest as Sha3Digest, Keccak256};
                                 let tx_hash = Keccak256::digest(&tx_payload).to_vec();
-                                
+
                                 // Kiểm tra duplicate transaction trong cùng block
                                 if !builder.transaction_hashes.insert(tx_hash.clone()) {
                                     // Transaction đã tồn tại trong block này - skip để tránh duplicate
@@ -1575,12 +1605,12 @@ async fn analyze(
                                     );
                                     continue; // Skip transaction này
                                 }
-                                
+
                                 // NOTE: Không sử dụng processed_transactions để skip transaction vì nó là local state
                                 // có thể khác nhau giữa các node, gây fork. Thay vào đó, chỉ dựa vào
                                 // transaction_hashes trong BlockBuilder để đảm bảo deterministic.
                                 // processed_transactions chỉ dùng để track sau khi gửi, không dùng để quyết định skip.
-                                // 
+                                //
                                 // Nếu transaction xuất hiện trong nhiều block khác nhau (do batch được commit ở nhiều round),
                                 // tất cả node sẽ xử lý transaction trong cùng block (vì certificate đã commit).
                                 // Việc duplicate transaction giữa các block sẽ được xử lý ở execution layer (application layer).
@@ -1598,11 +1628,11 @@ async fn analyze(
                                     digest: tx_payload,
                                     worker_id: *worker_id as u32,
                                 });
-                                
+
                                 // Track transaction hash để mark as processed sau khi gửi block
                                 builder.transaction_hashes_in_block.push(tx_hash);
                             }
-                            
+
                             // Track batch digest để mark as processed sau khi gửi block
                             builder.batch_digests.push(batch_digest.clone());
                             batches_processed += 1;
@@ -1678,7 +1708,7 @@ async fn analyze(
                 }
             }
         }
-        
+
         // Log summary về batches trong certificate này
         if batches_in_cert > 0 {
             log::info!(

@@ -270,7 +270,7 @@ impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         // Thử parse như Transactions (nhiều giao dịch)
         use crate::transaction_logger::parse_and_log_transactions_simple;
-        
+
         // Parse và log transactions nếu có thể
         parse_and_log_transactions_simple(&message, self.worker_id);
 

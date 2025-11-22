@@ -1,11 +1,12 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::messages::{Certificate, Header};
-use crate::primary::{CommittedBatches, Round};
+use crate::primary::{BatchRescue, CommittedBatches, Round};
+// RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, info, warn};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
@@ -21,12 +22,19 @@ struct BatchEntry {
     size: usize,
     state: BatchState,
     retry_count: usize, // Track number of times this batch has been retried
+    rescue_sent: bool,
 }
+
+const RESCUE_RETRY_THRESHOLD: usize = 25;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchState {
     Pending,
-    InFlight { round: Round, sent_at: Instant, retry_count: usize },
+    InFlight {
+        round: Round,
+        sent_at: Instant,
+        retry_count: usize,
+    },
     Committed,
 }
 
@@ -55,6 +63,8 @@ pub struct Proposer {
     rx_committed: Receiver<CommittedBatches>,
     /// Sends newly created headers to the `Core`.
     tx_core: Sender<Header>,
+    /// Sends batch rescue requests to the `Core` when batches are stuck.
+    tx_batch_rescue: Sender<BatchRescue>,
 
     /// The current round of the dag.
     round: Round,
@@ -75,6 +85,17 @@ pub struct Proposer {
     /// Maximum number of committed digests to keep in memory before cleanup.
     /// Older digests (from rounds before latest_committed_round - max_retry_rounds * 2) will be removed.
     max_committed_digests: usize,
+    /// Track when we last received parent certificates from Core.
+    /// Used to detect if proposer is stuck and needs to force advance round.
+    last_parent_received_at: Option<Instant>,
+    /// Maximum time to wait for parent certificates before force advancing round.
+    /// This prevents proposer from being stuck indefinitely when Core stops sending parent certificates.
+    max_parent_wait: Duration,
+    // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+    /// CATCH-UP MODE: Receive catch-up mode notifications from Core
+    rx_catchup_mode: Receiver<bool>,
+    /// CATCH-UP MODE: Track if node is in catch-up mode
+    is_catchup_mode: bool,
 }
 
 impl Proposer {
@@ -92,6 +113,9 @@ impl Proposer {
         rx_workers: Receiver<(Digest, WorkerId, Vec<u8>)>,
         rx_committed: Receiver<CommittedBatches>,
         tx_core: Sender<Header>,
+        tx_batch_rescue: Sender<BatchRescue>,
+        // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+        rx_catchup_mode: Receiver<bool>, // CATCH-UP MODE: Receive catch-up mode notifications
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
@@ -111,6 +135,7 @@ impl Proposer {
                 rx_workers,
                 rx_committed,
                 tx_core,
+                tx_batch_rescue,
                 round: 1,
                 last_parents: genesis,
                 digests: VecDeque::with_capacity(2 * header_size.max(1)),
@@ -119,6 +144,12 @@ impl Proposer {
                 committed_digests: HashMap::new(),
                 max_retry_rounds: 1000, // Don't retry batches that have been InFlight for more than 1000 rounds
                 max_committed_digests: 10000, // Cleanup old digests when this limit is reached
+                last_parent_received_at: Some(Instant::now()), // Initialize with current time
+                max_parent_wait: Duration::from_secs(10), // Force advance after 10 seconds without parent certificates
+                // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+                // CATCH-UP MODE: Initialize catch-up mode state
+                rx_catchup_mode,
+                is_catchup_mode: false,
             }
             .run()
             .await;
@@ -144,10 +175,11 @@ impl Proposer {
                 "[MAKE_HEADER] Removing {} already-committed batches from queue before creating header for round {}",
                 committed_removed, self.round
             );
-            self.digests.retain(|entry| !committed_digests_ref.contains_key(&entry.digest));
+            self.digests
+                .retain(|entry| !committed_digests_ref.contains_key(&entry.digest));
             self.pending_payload_size = self.pending_payload_size.saturating_sub(size_to_subtract);
         }
-        
+
         let payload: Vec<(Digest, WorkerId)> = self.collect_payload_for_header();
 
         // Final check: ensure no duplicates and no committed batches in payload before creating header
@@ -218,12 +250,33 @@ impl Proposer {
             );
             // Still create an empty header if we have parents (for round advancement)
             // This is needed for empty rounds where no batches are available
-            if !self.last_parents.is_empty() {
+            // PHASE 1: Also allow creating empty header with empty parents if force advance is enabled
+            // This prevents proposer from being stuck when no parent certificates are received
+            let force_advance = self
+                .last_parent_received_at
+                .map(|t| t.elapsed() > self.max_parent_wait)
+                .unwrap_or(false);
+
+            if !self.last_parents.is_empty() || force_advance {
+                // PHASE 1: Log warning if creating header with empty parents due to force advance
+                if self.last_parents.is_empty() && force_advance {
+                    warn!(
+                        "[FORCE ADVANCE HEADER] Creating header for round {} with EMPTY parents due to force advance. This header may not be committed by consensus (requires quorum parents), but allows proposer to continue and avoid being stuck.",
+                        self.round
+                    );
+                }
+
+                let parents_for_header = if self.last_parents.is_empty() {
+                    BTreeSet::new() // Empty parents when force advance
+                } else {
+                    self.last_parents.drain(..).collect()
+                };
+
                 let header = Header::new(
                     self.name,
                     self.round,
                     BTreeMap::new(),
-                    self.last_parents.drain(..).collect(),
+                    parents_for_header,
                     &mut self.signature_service,
                 )
                 .await;
@@ -345,7 +398,7 @@ impl Proposer {
                     entry.state = BatchState::Committed;
                     continue;
                 }
-                
+
                 accumulated_size += entry.size;
                 seen_digests.insert(entry.digest.clone());
                 collected.push((entry.digest.clone(), entry.worker_id));
@@ -470,9 +523,15 @@ impl Proposer {
         let mut skipped_too_old = 0usize;
         let mut requeued_old = 0usize;
         let mut removed_too_old = 0usize;
+        let mut batches_to_rescue: Vec<(Digest, WorkerId)> = Vec::new();
 
         for entry in self.digests.iter_mut() {
-            if let BatchState::InFlight { round, sent_at, retry_count } = entry.state {
+            if let BatchState::InFlight {
+                round,
+                sent_at,
+                retry_count,
+            } = entry.state
+            {
                 // Skip if already committed - this is critical to prevent duplicates
                 if self.committed_digests.contains_key(&entry.digest) {
                     info!(
@@ -503,7 +562,7 @@ impl Proposer {
                 }
 
                 // Calculate how long batch has been InFlight
-                    let rounds_since_sent = self.round.saturating_sub(round);
+                let rounds_since_sent = self.round.saturating_sub(round);
                 let rounds_committed_since_sent = self.latest_committed_round.saturating_sub(round);
 
                 // SAFE RETRY WINDOW: Only retry if we're confident batch hasn't been committed
@@ -511,15 +570,16 @@ impl Proposer {
                 // If latest_committed_round is close to or past the round batch was sent,
                 // batch might be committed but notification hasn't arrived yet
                 const SAFE_RETRY_BUFFER: Round = 2; // Don't retry if latest_committed_round >= round - 2
-                
+
                 // CRITICAL: Check if batch is actually committed
                 // If latest_committed_round >= sent_round but batch is not in committed_digests,
                 // it means certificate of this primary was not committed (another primary's certificate was committed instead)
                 // In this case, we should retry immediately to avoid waiting for max_retry_rounds
-                let batch_is_actually_committed = self.committed_digests.contains_key(&entry.digest);
-                let own_certificate_not_committed = !batch_is_actually_committed 
-                    && self.latest_committed_round >= round;
-                
+                let batch_is_actually_committed =
+                    self.committed_digests.contains_key(&entry.digest);
+                let own_certificate_not_committed =
+                    !batch_is_actually_committed && self.latest_committed_round >= round;
+
                 // IMPROVED: If batch has been InFlight for a long time (>= max_retry_rounds),
                 // and latest_committed_round is still close to sent round, batch is likely stuck
                 // Force retry to avoid batch being dropped forever
@@ -531,7 +591,7 @@ impl Proposer {
                 // batch is stuck forever and should be removed to prevent system deadlock
                 const MAX_RETRY_COUNT: usize = 1000; // Nếu retry > 1000, batch bị stuck forever
                 let is_stuck_forever = retry_count > MAX_RETRY_COUNT;
-                
+
                 if is_stuck_forever {
                     // Force remove batch - hệ thống không thể commit batch này
                     // Đây là biện pháp cuối cùng để ngăn chặn hệ thống bị đứng vĩnh viễn
@@ -543,7 +603,10 @@ impl Proposer {
                     removed_too_old += 1;
                     continue;
                 }
-                let safe_to_retry = if rounds_since_sent_long || has_been_retried_multiple_times || own_certificate_not_committed {
+                let safe_to_retry = if rounds_since_sent_long
+                    || has_been_retried_multiple_times
+                    || own_certificate_not_committed
+                {
                     // Batch is old enough, has been retried multiple times, or certificate of this primary was not committed
                     // Force retry to avoid batch being dropped forever
                     true
@@ -551,7 +614,7 @@ impl Proposer {
                     // Normal case: only retry if latest_committed_round is far enough behind
                     self.latest_committed_round < round.saturating_sub(SAFE_RETRY_BUFFER)
                 };
-                
+
                 if is_too_old {
                     // For very old batches, we need to be more careful
                     // Only retry if we're confident batch hasn't been committed
@@ -567,7 +630,7 @@ impl Proposer {
                         // Keep it in InFlight state - will be marked as Committed when commit notification is received
                         continue;
                     }
-                    
+
                     // Safe to retry: either latest_committed_round is far enough behind, or batch is old enough to force retry
                     // CRITICAL: Double-check batch is still not committed before retry (even for force retry)
                     // This prevents duplicate even if commit notification arrives late
@@ -581,25 +644,32 @@ impl Proposer {
                         skipped_committed += 1;
                         continue;
                     }
-                    
+
                     // Batch is likely truly stale and needs retry
                     let retry_reason = if own_certificate_not_committed {
                         format!("certificate of this primary was not committed at round {} (latest_committed_round={}, batch not in committed_digests) - retry immediately", round, self.latest_committed_round)
                     } else if rounds_since_sent_long {
-                        format!("batch is old enough ({} rounds >= {}) to force retry", rounds_since_sent, self.max_retry_rounds)
+                        format!(
+                            "batch is old enough ({} rounds >= {}) to force retry",
+                            rounds_since_sent, self.max_retry_rounds
+                        )
                     } else {
-                        format!("latest_committed_round is {} rounds behind sent round", round.saturating_sub(self.latest_committed_round))
+                        format!(
+                            "latest_committed_round is {} rounds behind sent round",
+                            round.saturating_sub(self.latest_committed_round)
+                        )
                     };
                     info!(
                         "Requeue old batch {} for retry (sent at round {}, current round {}, latest_committed_round={}, rounds since sent: {}, committed rounds since: {}). {}",
                         entry.digest, round, self.round, self.latest_committed_round, rounds_since_sent, rounds_committed_since_sent,
                         retry_reason
                         );
-                        entry.state = BatchState::Pending;
+                    entry.state = BatchState::Pending;
                     entry.retry_count += 1; // Increment retry count when requeuing
-                        self.pending_payload_size += entry.size;
-                        requeued_old += 1;
-                    } else {
+                    Self::maybe_schedule_batch_rescue(&mut batches_to_rescue, entry);
+                    self.pending_payload_size += entry.size;
+                    requeued_old += 1;
+                } else {
                     // Batch is not too old - normal retry logic
                     // CRITICAL: Only retry if safe (latest_committed_round is far enough behind)
                     // This prevents requeueing batch that might be committed but notification hasn't arrived
@@ -615,10 +685,11 @@ impl Proposer {
                         // Keep it in InFlight state - will be marked as Committed when commit notification is received
                         continue;
                     }
-                    
+
                     // Only retry if batch hasn't been committed and meets retry conditions
                     // IMPROVED: If own certificate was not committed, retry immediately without waiting for retry_delay
-                    let should_retry_now = own_certificate_not_committed || now.duration_since(sent_at) >= self.retry_delay;
+                    let should_retry_now = own_certificate_not_committed
+                        || now.duration_since(sent_at) >= self.retry_delay;
                     if should_retry_now {
                         // Double-check: verify batch is still not committed before re-queueing
                         if !self.committed_digests.contains_key(&entry.digest) {
@@ -637,6 +708,7 @@ impl Proposer {
                             );
                             entry.state = BatchState::Pending;
                             entry.retry_count += 1; // Increment retry count when requeuing
+                            Self::maybe_schedule_batch_rescue(&mut batches_to_rescue, entry);
                             self.pending_payload_size += entry.size;
                             requeued += 1;
                         } else {
@@ -689,14 +761,75 @@ impl Proposer {
             );
         }
 
+        if !batches_to_rescue.is_empty() {
+            self.dispatch_batch_rescue_requests(batches_to_rescue);
+        }
+
         self.digests
             .retain(|entry| !matches!(entry.state, BatchState::Committed));
+    }
+
+    fn maybe_schedule_batch_rescue(pending: &mut Vec<(Digest, WorkerId)>, entry: &mut BatchEntry) {
+        if entry.rescue_sent || entry.retry_count < RESCUE_RETRY_THRESHOLD {
+            return;
+        }
+        entry.rescue_sent = true;
+        pending.push((entry.digest.clone(), entry.worker_id));
+    }
+
+    fn dispatch_batch_rescue_requests(&self, pending: Vec<(Digest, WorkerId)>) {
+        if pending.is_empty() {
+            return;
+        }
+
+        let mut store = self.store.clone();
+        let tx = self.tx_batch_rescue.clone();
+        let origin = self.name.clone();
+        tokio::spawn(async move {
+            for (digest, worker_id) in pending {
+                match store.read(digest.to_vec()).await {
+                    Ok(Some(batch)) => {
+                        if let Err(e) = tx
+                            .send(BatchRescue {
+                                digest: digest.clone(),
+                                worker_id,
+                                batch,
+                                origin: origin.clone(),
+                            })
+                            .await
+                        {
+                            warn!(
+                                "[BATCH RESCUE] Failed to send rescue request for batch {}: {}",
+                                digest, e
+                            );
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        warn!(
+                            "[BATCH RESCUE] Unable to rescue batch {} - payload missing from store",
+                            digest
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            "[BATCH RESCUE] Error reading batch {} from store for rescue: {}",
+                            digest, e
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Extract batches from parent certificates and add them to queue if not committed
     /// This allows leader to include batches from other primaries, ensuring faster commit
     /// and reducing the need for retry
-    async fn extract_batches_from_parents(&mut self, parent_digests: &[Digest], parent_round: Round) {
+    async fn extract_batches_from_parents(
+        &mut self,
+        parent_digests: &[Digest],
+        parent_round: Round,
+    ) {
         let mut batches_extracted = 0usize;
         let mut batches_skipped_committed = 0usize;
         let mut batches_skipped_duplicate = 0usize;
@@ -731,13 +864,17 @@ impl Proposer {
                                 // If batch is in InFlight state and not committed, we should STILL extract it
                                 // because this primary (possibly leader) can include it immediately,
                                 // reducing the need for retry and making the system smoother
-                                let already_in_queue = self.digests.iter().any(|entry| entry.digest == *batch_digest);
+                                let already_in_queue = self
+                                    .digests
+                                    .iter()
+                                    .any(|entry| entry.digest == *batch_digest);
                                 if already_in_queue {
                                     // Check if batch is in Pending state
-                                    let is_pending = self.digests.iter()
-                                        .any(|entry| entry.digest == *batch_digest 
-                                            && matches!(entry.state, BatchState::Pending));
-                                    
+                                    let is_pending = self.digests.iter().any(|entry| {
+                                        entry.digest == *batch_digest
+                                            && matches!(entry.state, BatchState::Pending)
+                                    });
+
                                     if is_pending {
                                         // Batch is already in Pending state - skip extraction
                                         // It will be included in next header anyway
@@ -760,8 +897,9 @@ impl Proposer {
                                     // 4. This prevents batch from waiting for retry logic
                                     let mut converted = false;
                                     for entry in self.digests.iter_mut() {
-                                        if entry.digest == *batch_digest 
-                                            && matches!(entry.state, BatchState::InFlight { .. }) {
+                                        if entry.digest == *batch_digest
+                                            && matches!(entry.state, BatchState::InFlight { .. })
+                                        {
                                             // Convert InFlight to Pending to allow immediate inclusion
                                             self.pending_payload_size += entry.size;
                                             entry.state = BatchState::Pending;
@@ -798,7 +936,7 @@ impl Proposer {
                                 match self.store.read(batch_digest.to_vec()).await {
                                     Ok(Some(_batch_data)) => {
                                         let size = batch_digest.size();
-                                        
+
                                         // Add to queue as Pending
                                         self.digests.push_back(BatchEntry {
                                             digest: batch_digest.clone(),
@@ -806,6 +944,7 @@ impl Proposer {
                                             size,
                                             state: BatchState::Pending,
                                             retry_count: 0,
+                                            rescue_sent: false,
                                         });
                                         self.pending_payload_size += size;
                                         batches_added += 1;
@@ -880,7 +1019,7 @@ impl Proposer {
     /// Extract batches from verified headers of other primaries
     /// This allows any primary (especially leader) to include batches from non-leader primaries,
     /// ensuring faster commit and preventing batches from being stuck indefinitely.
-    /// 
+    ///
     /// SAFETY: This method is deterministic because:
     /// 1. Headers are already verified and stored before being sent here
     /// 2. All primaries receive the same headers via network (deterministic source)
@@ -901,9 +1040,11 @@ impl Proposer {
         let is_header_too_old = header.round < self.round.saturating_sub(self.max_retry_rounds);
         if is_header_too_old {
             // Check if ALL batches in this header are already committed
-            let all_batches_committed = header.payload.iter()
+            let all_batches_committed = header
+                .payload
+                .iter()
                 .all(|(batch_digest, _)| self.committed_digests.contains_key(batch_digest));
-            
+
             if all_batches_committed {
                 // All batches are committed - safe to skip this old header
                 debug!(
@@ -957,13 +1098,16 @@ impl Proposer {
             }
 
             // CRITICAL: Check if batch is already in queue
-            let already_in_queue = self.digests.iter().any(|entry| entry.digest == *batch_digest);
+            let already_in_queue = self
+                .digests
+                .iter()
+                .any(|entry| entry.digest == *batch_digest);
             if already_in_queue {
                 // Check if batch is in Pending state
-                let is_pending = self.digests.iter()
-                    .any(|entry| entry.digest == *batch_digest 
-                        && matches!(entry.state, BatchState::Pending));
-                
+                let is_pending = self.digests.iter().any(|entry| {
+                    entry.digest == *batch_digest && matches!(entry.state, BatchState::Pending)
+                });
+
                 if is_pending {
                     // Batch is already in Pending state - skip extraction
                     batches_skipped_duplicate += 1;
@@ -977,14 +1121,15 @@ impl Proposer {
                     );
                     continue;
                 }
-                
+
                 // If batch is in InFlight state, convert it back to Pending state
                 // This allows this primary (possibly leader) to include batch immediately,
                 // reducing the need for retry and making the system smoother
                 let mut converted = false;
                 for entry in self.digests.iter_mut() {
-                    if entry.digest == *batch_digest 
-                        && matches!(entry.state, BatchState::InFlight { .. }) {
+                    if entry.digest == *batch_digest
+                        && matches!(entry.state, BatchState::InFlight { .. })
+                    {
                         // CRITICAL: Double-check batch is still not committed before converting
                         // This prevents race conditions where batch was committed between first check and now
                         if self.committed_digests.contains_key(batch_digest) {
@@ -1002,7 +1147,7 @@ impl Proposer {
                             converted = true; // Set to true to skip adding this batch
                             break; // Break out of entry iteration loop
                         }
-                        
+
                         // Convert InFlight to Pending to allow immediate inclusion
                         // SAFETY: pending_payload_size was decreased when Pending -> InFlight,
                         // so increasing it back is correct
@@ -1025,7 +1170,7 @@ impl Proposer {
                     // If converted (either InFlight->Pending or marked as Committed), skip to next batch
                     continue;
                 }
-                
+
                 // Batch is in queue but not in InFlight state - skip
                 batches_skipped_duplicate += 1;
                 debug!(
@@ -1059,7 +1204,7 @@ impl Proposer {
                     }
 
                     let size = batch_digest.size();
-                    
+
                     // Add to queue as Pending
                     self.digests.push_back(BatchEntry {
                         digest: batch_digest.clone(),
@@ -1067,6 +1212,7 @@ impl Proposer {
                         size,
                         state: BatchState::Pending,
                         retry_count: 0,
+                        rescue_sent: false,
                     });
                     self.pending_payload_size += size;
                     batches_added += 1;
@@ -1126,7 +1272,7 @@ impl Proposer {
 
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
-        debug!("Dag starting at round {}", self.round);
+        info!("[PROPOSER] Dag starting at round {}", self.round);
 
         let header_timer = sleep(Duration::from_millis(self.max_header_delay));
         tokio::pin!(header_timer);
@@ -1135,36 +1281,139 @@ impl Proposer {
         tokio::pin!(retry_timer);
 
         loop {
+            // RATE CONTROL ĐÃ BỊ BỎ - Không còn record queue
+            
+            // CATCH-UP MODE: Check for catch-up mode notifications
+            if let Ok(is_catchup) = self.rx_catchup_mode.try_recv() {
+                self.is_catchup_mode = is_catchup;
+                if is_catchup {
+                    info!("[CATCH-UP] Proposer entering catch-up mode - pausing header creation to focus on syncing");
+                } else {
+                    info!("[CATCH-UP] Proposer resuming normal operation - node has caught up");
+                }
+            }
+
+            // CATCH-UP MODE: Skip creating headers if in catch-up mode
+            if self.is_catchup_mode {
+                debug!("[CATCH-UP] Proposer paused - node is catching up, skipping header creation for round {}", self.round);
+                // Still process other messages (parents, headers, batches) but don't create new headers
+                // This allows node to continue syncing while paused
+            }
+
+            // PHASE 1: Check if we're stuck (no parent certificates received for too long)
+            // Force advance round to prevent proposer from being stuck indefinitely
+            let mut just_force_advanced = false;
+            let effective_max_wait = if self.round <= 5 {
+                Duration::from_secs(3) // Chỉ chờ 3 giây trong giai đoạn khởi động
+            } else {
+                self.max_parent_wait
+            };
+            
+            if let Some(last_received) = self.last_parent_received_at {
+                if last_received.elapsed() > effective_max_wait {
+                    // Force advance round with empty parents
+                    warn!(
+                        "[FORCE ADVANCE] Primary {} force advancing round {} -> {} due to no parent certificates received for {} seconds. This prevents proposer from being stuck when Core stops sending parent certificates.",
+                        self.name,
+                        self.round,
+                        self.round + 1,
+                        last_received.elapsed().as_secs()
+                    );
+                    self.round += 1;
+                    self.last_parents = Vec::new(); // Clear old parents
+                    self.last_parent_received_at = Some(Instant::now()); // Reset timer
+                    just_force_advanced = true; // Đánh dấu vừa force advance để cho phép tạo header ngay
+                    debug!(
+                        "[FORCE ADVANCE] Dag force advanced to round {} (last_parents cleared)",
+                        self.round
+                    );
+                }
+            } else {
+                // CRITICAL: Nếu last_parent_received_at là None (chưa nhận được parents lần nào)
+                // và timer đã hết, cho phép force advance ngay để tránh hệ thống bị kẹt vĩnh viễn
+                let timer_expired = header_timer.is_elapsed();
+                if timer_expired {
+                    warn!(
+                        "[FORCE ADVANCE] Primary {} chưa nhận được parents lần nào, cho phép force advance round {} để tránh kẹt",
+                        self.name, self.round
+                    );
+                    just_force_advanced = true;
+                }
+            }
+
             // Check if we can propose a new header. We propose a new header when one of the following
             // conditions is met:
             // 1. We have a quorum of certificates from the previous round and enough batches' digests;
             // 2. We have a quorum of certificates from the previous round and the specified maximum
             // inter-header delay has passed.
+            // PHASE 1: Also allow creating header with empty parents if we're force advancing
             let enough_parents = !self.last_parents.is_empty();
             let enough_digests = self.pending_payload_size >= self.header_size;
             let timer_expired = header_timer.is_elapsed();
-            if (timer_expired || enough_digests) && enough_parents {
+            
+            // PHASE 1: Allow force advance (creating header even with empty parents) if timeout exceeded
+            // CRITICAL: Đảm bảo force_advance luôn true nếu vừa force advance hoặc timeout quá lâu
+            let force_advance = just_force_advanced || self
+                .last_parent_received_at
+                .map(|t| t.elapsed() > effective_max_wait)
+                .unwrap_or_else(|| {
+                    // Nếu chưa nhận được parents lần nào và timer đã hết, cho phép force advance
+                    // KHÔNG giới hạn round để tránh hệ thống bị kẹt vĩnh viễn
+                    timer_expired
+                });
+
+            let ready_to_make_header =
+                (timer_expired || enough_digests) && (enough_parents || force_advance);
+
+            // Log debug để theo dõi điều kiện tạo header - chỉ log khi có thay đổi đáng kể
+            // Giảm log spam bằng cách chỉ log khi timer expired và có vấn đề (không ready)
+            if timer_expired && !ready_to_make_header {
+                debug!(
+                    "[PROPOSER] Điều kiện tạo header round {}: timer_expired={}, enough_digests={}, enough_parents={}, force_advance={}, ready={}, last_parent_received={:?}s",
+                    self.round, timer_expired, enough_digests, enough_parents, force_advance, ready_to_make_header,
+                    self.last_parent_received_at.map(|t| t.elapsed().as_secs())
+                );
+            }
+
+            // RATE CONTROL ĐÃ BỊ BỎ - Không còn chặn tạo header
+            // Hệ thống sẽ tạo header ngay khi có điều kiện để đảm bảo tiến triển nhanh nhất
+            // CATCH-UP MODE: Don't create headers when in catch-up mode
+            let should_create_header = ready_to_make_header && !self.is_catchup_mode;
+
+            if should_create_header {
                 // Make a new header.
+                // PHASE 1: Header can be created even with empty parents if force_advance is true
+                info!("[PROPOSER] Attempting to create header for round {} (force_advance={}, enough_parents={}, enough_digests={})", 
+                    self.round, force_advance, enough_parents, enough_digests);
                 if self.make_header().await {
+                    info!("[PROPOSER] Successfully created header for round {}", self.round);
                     // Reschedule the timer.
                     let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                     header_timer.as_mut().reset(deadline);
-                } else if timer_expired {
-                    // Nothing to send but timer elapsed: reschedule to avoid busy loop.
-                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
-                    header_timer.as_mut().reset(deadline);
+                } else {
+                    warn!("[PROPOSER] Failed to create header for round {} (no payload or parents)", self.round);
+                    if timer_expired {
+                        // Nothing to send but timer elapsed: reschedule to avoid busy loop.
+                        let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                        header_timer.as_mut().reset(deadline);
+                    }
                 }
             }
 
             tokio::select! {
                 Some((parents, round)) = self.rx_core.recv() => {
+                    // PHASE 1: Update last_parent_received_at when we receive parent certificates
+                    self.last_parent_received_at = Some(Instant::now());
+                    info!("[PROPOSER] Received {} parents for round {} (current round: {})", parents.len(), round, self.round);
+
                     if round < self.round {
+                        warn!("[PROPOSER] Ignoring parents for round {} (current round: {})", round, self.round);
                         continue;
                     }
 
                     // Advance to the next round.
                     self.round = round + 1;
-                    debug!("Dag moved to round {}", self.round);
+                    info!("[PROPOSER] Dag moved to round {} with {} parents", self.round, parents.len());
 
                     // IMPROVED: Extract batches from parent certificates to help leader commit batches from other primaries
                     // This ensures batches are committed faster and reduces the need for retry
@@ -1175,12 +1424,18 @@ impl Proposer {
 
                     // Signal that we have enough parent certificates to propose a new header.
                     self.last_parents = parents;
+                    
+                    // CẢI THIỆN: Sau khi nhận parents và chuyển sang round mới, reset timer để tạo header sớm hơn
+                    // Điều này giúp hệ thống tiến triển nhanh hơn thay vì phải chờ timer hết
+                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                    header_timer.as_mut().reset(deadline);
+                    info!("[PROPOSER] Reset header timer after receiving parents for round {} (new round: {})", round, self.round);
                 }
                 Some(header) = self.rx_headers.recv() => {
                     // IMPROVED: Extract batches from verified headers of other primaries
                     // This allows any primary (especially leader) to include batches from non-leader primaries,
                     // ensuring faster commit and preventing batches from being stuck indefinitely.
-                    // 
+                    //
                     // SAFETY: This is deterministic because:
                     // 1. Headers are already verified and stored before being sent here
                     // 2. All primaries receive the same headers via network (deterministic source)
@@ -1233,6 +1488,7 @@ impl Proposer {
                         size,
                         state: BatchState::Pending,
                         retry_count: 0,
+                        rescue_sent: false,
                     });
                     self.pending_payload_size += size;
                     info!(

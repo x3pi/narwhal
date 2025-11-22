@@ -82,6 +82,46 @@ pub trait Export: Serialize {
 pub type Stake = u32;
 pub type WorkerId = u32;
 
+#[inline]
+fn default_adaptive_rate_enabled() -> bool {
+    true
+}
+
+#[inline]
+fn default_adaptive_rate_lag_tolerance() -> u64 {
+    8
+}
+
+#[inline]
+fn default_adaptive_rate_severe_lag() -> u64 {
+    120
+}
+
+#[inline]
+fn default_adaptive_rate_priority_window() -> u64 {
+    12
+}
+
+#[inline]
+fn default_adaptive_rate_high_load_threshold() -> usize {
+    350
+}
+
+#[inline]
+fn default_adaptive_rate_min_delay_ms() -> u64 {
+    50 // Tăng từ 25ms lên 50ms để kiên nhẫn hơn
+}
+
+#[inline]
+fn default_adaptive_rate_max_delay_ms() -> u64 {
+    300 // Tăng từ 150ms lên 300ms để kiên nhẫn hơn
+}
+
+#[inline]
+fn default_adaptive_rate_priority_wait_ms() -> u64 {
+    100 // Tăng từ 40ms lên 100ms để kiên nhẫn hơn với node có backlog lớn
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Parameters {
     pub header_size: usize,
@@ -91,6 +131,22 @@ pub struct Parameters {
     pub sync_retry_nodes: usize,
     pub batch_size: usize,
     pub max_batch_delay: u64,
+    #[serde(default = "default_adaptive_rate_enabled")]
+    pub adaptive_rate_enabled: bool,
+    #[serde(default = "default_adaptive_rate_lag_tolerance")]
+    pub adaptive_rate_lag_tolerance: u64,
+    #[serde(default = "default_adaptive_rate_severe_lag")]
+    pub adaptive_rate_severe_lag: u64,
+    #[serde(default = "default_adaptive_rate_priority_window")]
+    pub adaptive_rate_priority_window: u64,
+    #[serde(default = "default_adaptive_rate_high_load_threshold")]
+    pub adaptive_rate_high_load_threshold: usize,
+    #[serde(default = "default_adaptive_rate_min_delay_ms")]
+    pub adaptive_rate_min_delay_ms: u64,
+    #[serde(default = "default_adaptive_rate_max_delay_ms")]
+    pub adaptive_rate_max_delay_ms: u64,
+    #[serde(default = "default_adaptive_rate_priority_wait_ms")]
+    pub adaptive_rate_priority_wait_ms: u64,
 }
 
 impl Default for Parameters {
@@ -99,10 +155,18 @@ impl Default for Parameters {
             header_size: 1_000,
             max_header_delay: 50,
             gc_depth: 50,
-            sync_retry_delay: 200,
-            sync_retry_nodes: 10,
+            sync_retry_delay: 30, // Giảm xuống 30ms để retry nhanh hơn (đồng bộ siêu nhanh)
+            sync_retry_nodes: 20, // Số nodes để query khi retry (không giới hạn khi sync lần đầu)
             batch_size: 500_000,
             max_batch_delay: 100,
+            adaptive_rate_enabled: default_adaptive_rate_enabled(),
+            adaptive_rate_lag_tolerance: default_adaptive_rate_lag_tolerance(),
+            adaptive_rate_severe_lag: default_adaptive_rate_severe_lag(),
+            adaptive_rate_priority_window: default_adaptive_rate_priority_window(),
+            adaptive_rate_high_load_threshold: default_adaptive_rate_high_load_threshold(),
+            adaptive_rate_min_delay_ms: default_adaptive_rate_min_delay_ms(),
+            adaptive_rate_max_delay_ms: default_adaptive_rate_max_delay_ms(),
+            adaptive_rate_priority_wait_ms: default_adaptive_rate_priority_wait_ms(),
         }
     }
 }
@@ -119,6 +183,17 @@ impl Parameters {
         info!("Sync retry nodes set to {} nodes", self.sync_retry_nodes);
         info!("Batch size set to {} B", self.batch_size);
         info!("Max batch delay set to {} ms", self.max_batch_delay);
+        info!(
+            "Adaptive rate control: enabled={}, lag_tolerance={} rounds, severe_lag_cutoff={} rounds, priority_window={} rounds, high_load_threshold={} batches, min_delay={} ms, max_delay={} ms, priority_wait={} ms",
+            self.adaptive_rate_enabled,
+            self.adaptive_rate_lag_tolerance,
+            self.adaptive_rate_severe_lag,
+            self.adaptive_rate_priority_window,
+            self.adaptive_rate_high_load_threshold,
+            self.adaptive_rate_min_delay_ms,
+            self.adaptive_rate_max_delay_ms,
+            self.adaptive_rate_priority_wait_ms
+        );
     }
 }
 

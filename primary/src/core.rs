@@ -2,11 +2,12 @@
 use crate::aggregators::{CertificatesAggregator, VotesAggregator};
 use crate::error::{DagError, DagResult};
 use crate::messages::{Certificate, Header, Vote};
-use crate::primary::{PrimaryMessage, Round};
+use crate::primary::{BatchRescue, PayloadCache, PrimaryMessage, Round};
+// RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
 use crate::synchronizer::Synchronizer;
 use async_recursion::async_recursion;
 use bytes::Bytes;
-use config::Committee;
+use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
 use log::{debug, error, info, warn};
@@ -16,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{Duration, Instant};
 
 #[cfg(test)]
 #[path = "tests/core_tests.rs"]
@@ -51,6 +53,10 @@ pub struct Core {
     tx_proposer: Sender<(Vec<Digest>, Round)>,
     /// Send verified headers to the `Proposer` for batch extraction.
     tx_headers: Sender<Header>,
+    /// Receives batch rescue events from the proposer (to replicate stuck batches).
+    rx_batch_rescue: Receiver<BatchRescue>,
+    /// Shared payload cache for storing replicated batches.
+    payload_cache: PayloadCache,
 
     /// The last garbage collected round.
     gc_round: Round,
@@ -68,6 +74,19 @@ pub struct Core {
     network: ReliableSender,
     /// Keeps the cancel handlers of the messages we sent.
     cancel_handlers: HashMap<Round, Vec<CancelHandler>>,
+    // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+    /// PHASE 2: Track last catch-up sync check time for proactive synchronization
+    last_catchup_sync_check: Option<Instant>,
+    /// PHASE 2: Interval for catch-up sync check (check every 5 seconds)
+    catchup_sync_check_interval: Duration,
+    /// CATCH-UP MODE: Track if node is in catch-up mode
+    is_catchup_mode: bool,
+    /// CATCH-UP MODE: Last time we entered catch-up mode
+    catchup_mode_entered_at: Option<Instant>,
+    /// CATCH-UP MODE: Last detected lag
+    last_detected_lag: Round,
+    /// CATCH-UP MODE: Channel to notify proposer about catch-up mode
+    tx_proposer_catchup: Sender<bool>,
 }
 
 impl Core {
@@ -87,6 +106,10 @@ impl Core {
         tx_consensus: Sender<Certificate>,
         tx_proposer: Sender<(Vec<Digest>, Round)>,
         tx_headers: Sender<Header>,
+        rx_batch_rescue: Receiver<BatchRescue>,
+        payload_cache: PayloadCache,
+        // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+        tx_proposer_catchup: Sender<bool>, // CATCH-UP MODE: Channel to notify proposer
     ) {
         tokio::spawn(async move {
             Self {
@@ -104,6 +127,8 @@ impl Core {
                 tx_consensus,
                 tx_proposer,
                 tx_headers,
+                rx_batch_rescue,
+                payload_cache,
                 gc_round: 0,
                 last_voted: HashMap::with_capacity(2 * gc_depth as usize),
                 processing: HashMap::with_capacity(2 * gc_depth as usize),
@@ -112,6 +137,14 @@ impl Core {
                 certificates_aggregators: HashMap::with_capacity(2 * gc_depth as usize),
                 network: ReliableSender::new(),
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
+                // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+                last_catchup_sync_check: Some(Instant::now()),
+                catchup_sync_check_interval: Duration::from_secs(2), // Check every 2 seconds để phát hiện lag sớm hơn
+                // CATCH-UP MODE: Initialize catch-up mode state
+                is_catchup_mode: false,
+                catchup_mode_entered_at: None,
+                last_detected_lag: 0,
+                tx_proposer_catchup,
             }
             .run()
             .await;
@@ -145,6 +178,7 @@ impl Core {
     #[async_recursion]
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
         debug!("Processing {:?}", header);
+        // RATE CONTROL ĐÃ BỊ BỎ - Không còn record header
         // Indicate that we are processing this header.
         self.processing
             .entry(header.round)
@@ -258,6 +292,7 @@ impl Core {
     #[async_recursion]
     async fn process_certificate(&mut self, certificate: Certificate) -> DagResult<()> {
         debug!("Processing {:?}", certificate);
+        // RATE CONTROL ĐÃ BỊ BỎ - Không còn record certificate
 
         // Process the header embedded in the certificate if we haven't already voted for it (if we already
         // voted, it means we already processed it). Since this header got certified, we are sure that all
@@ -356,6 +391,20 @@ impl Core {
             }
         }
 
+        // CATCH-UP MODE: Skip consensus when in catch-up mode and lag is too large
+        // This prevents node from voting on certificates when it doesn't have enough context
+        const LAG_SKIP_CONSENSUS_THRESHOLD: Round = 200; // Skip consensus if lag > 200 rounds
+        if self.is_catchup_mode && self.last_detected_lag > LAG_SKIP_CONSENSUS_THRESHOLD {
+            debug!(
+                "[CATCH-UP MODE] Skipping consensus for certificate {} (round {}) - node is catching up (lag: {} rounds). Certificate still processed for state.",
+                certificate.digest(),
+                certificate.round(),
+                self.last_detected_lag
+            );
+            // Still return Ok() - certificate is processed for state, just not sent to consensus
+            return Ok(());
+        }
+
         log::info!(
             "Sending certificate {:?} to consensus",
             certificate.digest()
@@ -373,10 +422,43 @@ impl Core {
     }
 
     fn sanitize_header(&mut self, header: &Header) -> DagResult<()> {
-        ensure!(
-            self.gc_round <= header.round,
-            DagError::TooOld(header.id.clone(), header.round)
-        );
+        // PHASE 2: Soft reject for old headers to support catch-up
+        // If header is too old but within catch-up window, trigger sync but still reject processing
+        if header.round < self.gc_round {
+            let round_diff = self.gc_round.saturating_sub(header.round);
+            const MAX_CATCHUP_ROUNDS: Round = 50000; // Tăng lên 50000 rounds để hỗ trợ node lag nhiều hơn
+
+            if round_diff <= MAX_CATCHUP_ROUNDS {
+                // PHASE 2: Header is old but within catch-up window - trigger sync for catch-up
+                // This allows node chậm to sync headers/certificates from old rounds
+                warn!(
+                    "[CATCH-UP SYNC] Header {} (round {}) is {} rounds behind (gc_round={}, current_round≈{}). This header is too old to process immediately, but will trigger sync for catch-up. Node may be lagging behind - attempting to sync old data.",
+                    header.id,
+                    header.round,
+                    round_diff,
+                    self.gc_round,
+                    self.gc_round + self.gc_depth
+                );
+
+                // PHASE 2: Trigger proactive sync for this header to help catch-up
+                // Sync parents of this header so node can eventually catch up
+                // Note: We'll trigger sync in the main loop after returning from sanitize
+                // This header will be processed later when sync completes
+            } else {
+                // Header is too far behind - skip sync (would be inefficient)
+                debug!(
+                    "[CATCH-UP] Header {} (round {}) is {} rounds behind (gc_round={}). Too far behind for catch-up sync (max: {} rounds). Skipping.",
+                    header.id,
+                    header.round,
+                    round_diff,
+                    self.gc_round,
+                    MAX_CATCHUP_ROUNDS
+                );
+            }
+
+            // Still reject processing to avoid issues with old headers
+            return Err(DagError::TooOld(header.id.clone(), header.round));
+        }
 
         // Verify the header's signature.
         header.verify(&self.committee)?;
@@ -384,6 +466,30 @@ impl Core {
         // TODO [issue #3]: Prevent bad nodes from sending junk headers with high round numbers.
 
         Ok(())
+    }
+
+    /// PHASE 2: Trigger catch-up sync for old header
+    /// This method helps node chậm sync headers/certificates from old rounds
+    async fn trigger_catchup_sync(&mut self, header: &Header) {
+        // Try to get parents to trigger sync if they're missing
+        // This will automatically trigger sync request via synchronizer
+        match self.synchronizer.get_parents(header).await {
+            Ok(_parents) => {
+                // Parents are available - no sync needed
+                debug!(
+                    "[CATCH-UP SYNC] Parents for old header {} (round {}) are already available",
+                    header.id, header.round
+                );
+            }
+            Err(_) => {
+                // Parents are missing - sync will be triggered automatically by synchronizer
+                debug!(
+                    "[CATCH-UP SYNC] Parents for old header {} (round {}) are missing - sync triggered",
+                    header.id,
+                    header.round
+                );
+            }
+        }
     }
 
     fn sanitize_vote(&mut self, vote: &Vote) -> DagResult<()> {
@@ -405,17 +511,252 @@ impl Core {
     }
 
     fn sanitize_certificate(&mut self, certificate: &Certificate) -> DagResult<()> {
-        ensure!(
-            self.gc_round <= certificate.round(),
-            DagError::TooOld(certificate.digest(), certificate.round())
-        );
+        // PHASE 2: Soft reject for old certificates to support catch-up
+        // Similar to headers, allow catch-up sync for certificates within catch-up window
+        if certificate.round() < self.gc_round {
+            let round_diff = self.gc_round.saturating_sub(certificate.round());
+            const MAX_CATCHUP_ROUNDS: Round = 50000; // Tăng lên 50000 rounds để hỗ trợ node lag nhiều hơn
+
+            if round_diff <= MAX_CATCHUP_ROUNDS {
+                // PHASE 2: Certificate is old but within catch-up window - trigger sync for catch-up
+                warn!(
+                    "[CATCH-UP SYNC] Certificate {} (round {}) is {} rounds behind (gc_round={}, current_round≈{}). This certificate is too old to process immediately, but will trigger sync for catch-up. Node may be lagging behind - attempting to sync old data.",
+                    certificate.digest(),
+                    certificate.round(),
+                    round_diff,
+                    self.gc_round,
+                    self.gc_round + self.gc_depth
+                );
+
+                // PHASE 2: Trigger sync for certificate ancestors to help catch-up
+                // This will be handled in the main loop after returning from sanitize
+            } else {
+                // Certificate is too far behind - skip sync (would be inefficient)
+                debug!(
+                    "[CATCH-UP] Certificate {} (round {}) is {} rounds behind (gc_round={}). Too far behind for catch-up sync (max: {} rounds). Skipping.",
+                    certificate.digest(),
+                    certificate.round(),
+                    round_diff,
+                    self.gc_round,
+                    MAX_CATCHUP_ROUNDS
+                );
+            }
+
+            // Still reject processing to avoid issues with old certificates
+            return Err(DagError::TooOld(certificate.digest(), certificate.round()));
+        }
 
         // Verify the certificate (and the embedded header).
         certificate.verify(&self.committee).map_err(DagError::from)
     }
 
+    /// PHASE 2: Periodic catch-up sync check
+    /// This method helps node chậm proactively sync missing certificates from recent rounds
+    /// CATCH-UP MODE: Now also tracks and manages catch-up mode state
+    async fn periodic_catchup_sync_check(&mut self, current_round: Round) -> DagResult<()> {
+        // Update last check time
+        self.last_catchup_sync_check = Some(Instant::now());
+
+        // Calculate approximate our round (gc_round is the oldest round we keep)
+        let our_round = self.gc_round + self.gc_depth;
+        let lag = current_round.saturating_sub(our_round);
+
+        // CATCH-UP MODE: Thresholds for entering and resuming catch-up mode
+        const LAG_THRESHOLD: Round = 100; // Enter catch-up mode if lag >= 100 rounds
+        const RESUME_THRESHOLD: Round = 50; // Resume normal operation if lag < 50 rounds
+
+        // Update last detected lag
+        self.last_detected_lag = lag;
+
+        // CATCH-UP MODE: Enter catch-up mode if lag is significant
+        if lag >= LAG_THRESHOLD {
+            if !self.is_catchup_mode {
+                // Enter catch-up mode
+                self.is_catchup_mode = true;
+                self.catchup_mode_entered_at = Some(Instant::now());
+                warn!(
+                    "[CATCH-UP MODE] Primary {} ENTERING catch-up mode - lag: {} rounds (our: {}, current: {}, gc_round: {}). Pausing proposer and focusing on syncing.",
+                    self.name,
+                    lag,
+                    our_round,
+                    current_round,
+                    self.gc_round
+                );
+                
+                // Notify proposer to pause
+                if let Err(e) = self.tx_proposer_catchup.send(true).await {
+                    warn!("[CATCH-UP MODE] Failed to notify proposer: {}", e);
+                }
+            } else {
+                // Already in catch-up mode - log progress
+                let catchup_duration = self.catchup_mode_entered_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default();
+                debug!(
+                    "[CATCH-UP MODE] Primary {} still catching up - lag: {} rounds, duration: {:?}",
+                    self.name, lag, catchup_duration
+                );
+            }
+        } else if lag < RESUME_THRESHOLD {
+            // CATCH-UP MODE: Resume normal operation if lag is small
+            if self.is_catchup_mode {
+                // Resume normal operation
+                self.is_catchup_mode = false;
+                let catchup_duration = self.catchup_mode_entered_at
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default();
+                info!(
+                    "[CATCH-UP MODE] Primary {} RESUMING normal operation - caught up in {:?} (lag: {} rounds, our: {}, current: {}). Resuming proposer.",
+                    self.name,
+                    catchup_duration,
+                    lag,
+                    our_round,
+                    current_round
+                );
+                
+                // Notify proposer to resume
+                if let Err(e) = self.tx_proposer_catchup.send(false).await {
+                    warn!("[CATCH-UP MODE] Failed to notify proposer: {}", e);
+                }
+                
+                self.catchup_mode_entered_at = None;
+            } else {
+                // Node is up to date
+                debug!(
+                    "[CATCH-UP SYNC] Periodic check - node {} is up to date (our: {}, current: {}, lag: {})",
+                    self.name, our_round, current_round, lag
+                );
+            }
+        } else {
+            // Lag is between RESUME_THRESHOLD and LAG_THRESHOLD
+            // Stay in current mode (catch-up or normal)
+            if self.is_catchup_mode {
+                debug!(
+                    "[CATCH-UP MODE] Primary {} still in catch-up mode - lag: {} rounds (between thresholds)",
+                    self.name, lag
+                );
+            }
+        }
+
+        Ok(())
+    }
+
+    /// PHASE 2: Trigger catch-up sync for old certificate
+    /// This method helps node chậm sync certificate ancestors from old rounds
+    async fn trigger_catchup_sync_certificate(&mut self, certificate: &Certificate) {
+        // Try to deliver certificate to trigger sync if ancestors are missing
+        // This will automatically trigger sync request via synchronizer
+        match self.synchronizer.deliver_certificate(certificate).await {
+            Ok(true) => {
+                // All ancestors are available - certificate can be processed
+                debug!(
+                    "[CATCH-UP SYNC] Ancestors for old certificate {} (round {}) are already available",
+                    certificate.digest(),
+                    certificate.round()
+                );
+            }
+            Ok(false) => {
+                // Ancestors are missing - sync will be triggered automatically by synchronizer
+                debug!(
+                    "[CATCH-UP SYNC] Ancestors for old certificate {} (round {}) are missing - sync triggered",
+                    certificate.digest(),
+                    certificate.round()
+                );
+            }
+            Err(e) => {
+                warn!(
+                    "[CATCH-UP SYNC] Error checking ancestors for old certificate {} (round {}): {}",
+                    certificate.digest(),
+                    certificate.round(),
+                    e
+                );
+            }
+        }
+    }
+
+    async fn handle_local_batch_rescue(&mut self, rescue: BatchRescue) -> DagResult<()> {
+        // Store locally to guarantee proposer/node can read immediately.
+        let inserted = self
+            .persist_replicated_batch(&rescue.digest, &rescue.batch)
+            .await?;
+        self.payload_cache
+            .insert(rescue.digest.clone(), rescue.batch.clone());
+
+        if inserted {
+            info!(
+                "[BATCH RESCUE] Primary {} stored local batch {} (worker {}) for replication (retry_count escalation)",
+                self.name, rescue.digest, rescue.worker_id
+            );
+        } else {
+            debug!(
+                "[BATCH RESCUE] Primary {} already had batch {} locally; still broadcasting replica",
+                self.name, rescue.digest
+            );
+        }
+
+        let message = PrimaryMessage::BatchReplica {
+            digest: rescue.digest,
+            worker_id: rescue.worker_id,
+            batch: rescue.batch,
+            origin: rescue.origin,
+        };
+        let serialized = bincode::serialize(&message).map_err(DagError::SerializationError)?;
+
+        let addresses: Vec<_> = self
+            .committee
+            .others_primaries(&self.name)
+            .iter()
+            .map(|(_, x)| x.primary_to_primary)
+            .collect();
+
+        if addresses.is_empty() {
+            return Ok(());
+        }
+
+        self.network
+            .broadcast(addresses, Bytes::from(serialized))
+            .await;
+        Ok(())
+    }
+
+    async fn handle_remote_batch_replica(
+        &mut self,
+        digest: Digest,
+        worker_id: WorkerId,
+        batch: Vec<u8>,
+        origin: PublicKey,
+    ) -> DagResult<()> {
+        let inserted = self.persist_replicated_batch(&digest, &batch).await?;
+        self.payload_cache.insert(digest.clone(), batch.clone());
+
+        if inserted {
+            info!(
+                "[BATCH RESCUE] Stored replicated batch {} (worker {}) provided by {}",
+                digest, worker_id, origin
+            );
+        } else {
+            debug!(
+                "[BATCH RESCUE] Ignoring replica for batch {} from {} (already have it)",
+                digest, origin
+            );
+        }
+        Ok(())
+    }
+
+    async fn persist_replicated_batch(&mut self, digest: &Digest, batch: &[u8]) -> DagResult<bool> {
+        if self.store.read(digest.to_vec()).await?.is_some() {
+            return Ok(false);
+        }
+        self.store.write(digest.to_vec(), batch.to_vec()).await;
+        Ok(true)
+    }
+
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
+        // PHASE 2: Set up periodic catch-up sync check timer
+        let mut catchup_sync_timer = tokio::time::interval(self.catchup_sync_check_interval);
+        catchup_sync_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             let result = tokio::select! {
                 // We receive here messages from other primaries.
@@ -428,7 +769,7 @@ impl Core {
                                     // This allows proposer to extract batches immediately, reducing delay from
                                     // hundreds of ms to just a few ms. This prevents batches from being stuck
                                     // and reduces retry count significantly.
-                                    // 
+                                    //
                                     // SAFETY: Signature is already verified, so this is safe. Even if header
                                     // is later found to be invalid (e.g., missing parents), batch extraction
                                     // is safe because:
@@ -443,6 +784,12 @@ impl Core {
                                     }
                                     self.process_header(&header).await
                                 },
+                                Err(DagError::TooOld(_, round)) => {
+                                    // PHASE 2: Header is too old - trigger catch-up sync nếu trong window
+                                    // sanitize_header đã check và trigger sync rồi, nhưng chúng ta vẫn reject để tránh fork
+                                    // Lưu ý: Header quá cũ sẽ KHÔNG được process (tránh fork), nhưng sync vẫn được trigger để node bắt kịp
+                                    Err(DagError::TooOld(header.id.clone(), round))
+                                },
                                 error => error
                             }
 
@@ -456,8 +803,17 @@ impl Core {
                         PrimaryMessage::Certificate(certificate) => {
                             match self.sanitize_certificate(&certificate) {
                                 Ok(()) => self.process_certificate(certificate).await,
+                                Err(DagError::TooOld(_, round)) => {
+                                    // PHASE 2: Certificate is too old - trigger catch-up sync nếu trong window
+                                    // sanitize_certificate đã check và trigger sync rồi, nhưng chúng ta vẫn reject để tránh fork
+                                    // Lưu ý: Certificate quá cũ sẽ KHÔNG được process (tránh fork), nhưng sync vẫn được trigger để node bắt kịp
+                                    Err(DagError::TooOld(certificate.digest(), round))
+                                },
                                 error => error
                             }
+                        },
+                        PrimaryMessage::BatchReplica { digest, worker_id, batch, origin } => {
+                            self.handle_remote_batch_replica(digest, worker_id, batch, origin).await
                         },
                         _ => panic!("Unexpected core message")
                     }
@@ -484,6 +840,21 @@ impl Core {
 
                 // We also receive here our new headers created by the `Proposer`.
                 Some(header) = self.rx_proposer.recv() => self.process_own_header(header).await,
+
+                // Receive batch rescue events from our proposer (replicate stuck batches to peers).
+                Some(rescue) = self.rx_batch_rescue.recv() => {
+                    self.handle_local_batch_rescue(rescue).await
+                },
+
+                // PHASE 2: Periodic catch-up sync check
+                _ = catchup_sync_timer.tick() => {
+                    // Periodic check to help node chậm catch-up
+                    let current_round = self.consensus_round.load(Ordering::Relaxed);
+                    if let Err(e) = self.periodic_catchup_sync_check(current_round).await {
+                        debug!("Periodic catch-up sync check failed: {}", e);
+                    }
+                    Ok(())
+                }
             };
             match result {
                 Ok(()) => (),

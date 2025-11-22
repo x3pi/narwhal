@@ -8,6 +8,7 @@ use crate::helper::Helper;
 use crate::messages::{Certificate, Header, Vote};
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
+// RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
 use crate::synchronizer::Synchronizer;
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -45,6 +46,12 @@ pub enum PrimaryMessage {
     Vote(Vote),
     Certificate(Certificate),
     CertificatesRequest(Vec<Digest>, PublicKey),
+    BatchReplica {
+        digest: Digest,
+        worker_id: WorkerId,
+        batch: Vec<u8>,
+        origin: PublicKey,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -57,6 +64,14 @@ pub enum PrimaryWorkerMessage {
 pub enum WorkerPrimaryMessage {
     OurBatch(Digest, WorkerId, Vec<u8>),
     OthersBatch(Digest, WorkerId, Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchRescue {
+    pub digest: Digest,
+    pub worker_id: WorkerId,
+    pub batch: Vec<u8>,
+    pub origin: PublicKey,
 }
 
 pub struct Primary;
@@ -84,7 +99,9 @@ impl Primary {
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
         let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
         let (tx_committed_batches, rx_committed_batches) = channel(CHANNEL_CAPACITY);
+        let (tx_batch_rescue, rx_batch_rescue) = channel(CHANNEL_CAPACITY);
         let payload_cache = Arc::new(DashMap::new());
+        // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
 
         parameters.log();
         let name = keypair.name;
@@ -150,6 +167,9 @@ impl Primary {
 
         let signature_service = SignatureService::new(consensus_secret);
 
+        // CATCH-UP MODE: Create channel to notify proposer about catch-up mode
+        let (tx_proposer_catchup, rx_proposer_catchup) = channel(10);
+        
         Core::spawn(
             name,
             committee.clone(),
@@ -165,6 +185,10 @@ impl Primary {
             tx_consensus,
             tx_parents,
             tx_headers_to_proposer.clone(),
+            rx_batch_rescue,
+            payload_cache.clone(),
+            // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+            tx_proposer_catchup, // CATCH-UP MODE: Pass sender to Core
         );
 
         GarbageCollector::spawn(
@@ -208,6 +232,9 @@ impl Primary {
             rx_our_digests,
             rx_committed_batches,
             tx_headers,
+            tx_batch_rescue,
+            // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
+            rx_proposer_catchup, // CATCH-UP MODE: Pass receiver to Proposer
         );
 
         Helper::spawn(committee.clone(), store, rx_cert_requests);
