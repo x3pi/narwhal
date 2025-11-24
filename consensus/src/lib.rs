@@ -764,8 +764,26 @@ impl Consensus {
                         }
 
                         // Send to output
-                        if let Err(e) = self.tx_output.send(certificate).await {
-                            warn!("Failed to output certificate: {}", e);
+                        // CRITICAL: Log chi tiết khi gửi certificate tới rx_output
+                        // Nếu channel đầy, đây là bottleneck nghiêm trọng
+                        let cert_digest = certificate.digest();
+                        let cert_round = certificate.round();
+                        let batch_count = certificate.header.payload.len();
+                        match self.tx_output.send(certificate).await {
+                            Ok(()) => {
+                                info!(
+                                    "[CONSENSUS OUTPUT] Successfully sent certificate {} (round {}, {} batches) to rx_output channel",
+                                    cert_digest, cert_round, batch_count
+                                );
+                            }
+                            Err(e) => {
+                                // CRITICAL ERROR: Channel đầy hoặc đóng - certificates không được gửi
+                                // Đây là nguyên nhân chính khiến batches không được xử lý
+                                error!(
+                                    "[CONSENSUS OUTPUT] CRITICAL: Failed to send certificate {} (round {}, {} batches) to rx_output channel: {}. This will cause batches to be stuck and not sent to UDS!",
+                                    cert_digest, cert_round, batch_count, e
+                                );
+                            }
                         }
                     }
                 }

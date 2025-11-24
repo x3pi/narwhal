@@ -31,7 +31,12 @@ use store::Store;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 
-pub const CHANNEL_CAPACITY: usize = 1_000;
+// CHANNEL_CAPACITY: Buffer size của tokio mpsc channel
+// - Channel tự động dọn dẹp khi receiver nhận messages
+// - Nếu receiver (proposer) xử lý chậm hơn sender (core), channel sẽ tích lũy
+// - Capacity lớn chỉ là workaround tạm thời, giải pháp tốt nhất là đảm bảo proposer xử lý nhanh
+// - 10_000 là đủ cho burst headers, không quá lớn để tránh memory leak
+pub const CHANNEL_CAPACITY: usize = 10_000;
 pub type Round = u64;
 
 #[derive(Debug, Clone)]

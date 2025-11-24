@@ -697,22 +697,31 @@ async fn analyze(
                 block.transactions.len()
             );
 
-            // Log một số transactions mẫu
+            // Log một số transactions mẫu với transaction hash
             if !block.transactions.is_empty() {
-                for (idx, tx) in block.transactions.iter().enumerate().take(3) {
-                    let tx_hex = hex::encode(&tx.digest);
+                for (idx, tx) in block.transactions.iter().enumerate().take(10) {
+                    // Tính transaction hash để log (giống với logic trong batch processing)
+                    use transaction::Transaction;
+                    let tx_hash_hex = match Transaction::decode(tx.digest.as_slice()) {
+                        Ok(tx_parsed) => {
+                            let tx_hash = tx_logger::calculate_transaction_hash(&tx_parsed);
+                            hex::encode(&tx_hash)
+                        }
+                        Err(_) => {
+                            // Fallback: hash từ raw payload
+                            use sha3::{Digest as Sha3Digest, Keccak256};
+                            let tx_hash = Keccak256::digest(&tx.digest).to_vec();
+                            hex::encode(&tx_hash)
+                        }
+                    };
                     log::info!(
-                        "[UDS SEND] Node ID {} block height {} tx[{}]: worker_id={}, size={} bytes, hex={}",
+                        "[UDS SEND] Node ID {} block height {} tx[{}]: hash={}, worker_id={}, size={} bytes",
                         node_id,
                         block.height,
                         idx,
+                        tx_hash_hex,
                         tx.worker_id,
-                        tx.digest.len(),
-                        if tx.digest.len() <= 64 {
-                            tx_hex
-                        } else {
-                            format!("{}...", &tx_hex[..128])
-                        }
+                        tx.digest.len()
                     );
                 }
                 if block.transactions.len() > 3 {
@@ -1641,12 +1650,25 @@ async fn analyze(
                                 // Việc duplicate transaction giữa các block sẽ được xử lý ở execution layer (application layer).
 
                                 // Log từng transaction với hash và các thông tin chi tiết
+                                let tx_hash_hex = hex::encode(&tx_hash);
                                 tx_logger::parse_and_log_transaction(
                                     &tx_payload,
                                     batch_digest,
                                     tx_idx,
                                     *worker_id as u32,
                                     builder.height,
+                                );
+
+                                // CRITICAL: Log transaction hash để track transaction cụ thể
+                                // Đặc biệt quan trọng để debug khi transaction không được gửi tới UDS
+                                log::info!(
+                                    "[TX TRACK] Node ID {} ADDING transaction {} to block height {} (batch: {}, tx_idx: {}, worker: {})",
+                                    node_id,
+                                    tx_hash_hex,
+                                    builder.height,
+                                    batch_digest,
+                                    tx_idx,
+                                    worker_id
                                 );
 
                                 builder.transactions.push(comm::Transaction {

@@ -927,27 +927,44 @@ impl Core {
                                     // 2. Batch will be checked again when creating header
                                     // 3. Invalid headers won't be committed anyway
                                     // BATCH TRACKING: Log when sending header to proposer for batch extraction
+                                    let header_id = header.id.clone();
+                                    let header_round = header.round;
+                                    let header_author = header.author;
+                                    let header_payload_len = header.payload.len();
+                                    let header_payload_keys: Vec<_> = header.payload.keys().take(5).collect();
                                     info!(
                                         "[BATCH TRACK CORE] Core {} sending header {} (round {}, author: {}) to proposer for batch extraction. Header contains {} batches: {:?}",
                                         self.name,
-                                        header.id,
-                                        header.round,
-                                        header.author,
-                                        header.payload.len(),
-                                        header.payload.keys().take(5).collect::<Vec<_>>()
+                                        header_id,
+                                        header_round,
+                                        header_author,
+                                        header_payload_len,
+                                        header_payload_keys
                                     );
-                                    if let Err(e) = self.tx_headers.send(header.clone()).await {
-                                        // Channel closed or full - CRITICAL ERROR - log as warning
-                                        warn!(
-                                            "[BATCH TRACK CORE] CRITICAL: Failed to send header {} (round {}, author: {}) to proposer for batch extraction: {}. This may cause batches to be stuck!",
-                                            header.id, header.round, header.author, e
-                                        );
-                                    } else {
-                                        debug!(
-                                            "[BATCH TRACK CORE] Successfully sent header {} (round {}, author: {}) to proposer for batch extraction",
-                                            header.id, header.round, header.author
-                                        );
-                                    }
+                                    
+                                    // CRITICAL FIX: Spawn task để gửi header không blocking main loop
+                                    // Điều này đảm bảo headers được gửi ngay lập tức, không bị delay
+                                    // Nếu channel đầy, task sẽ đợi nhưng không block main loop
+                                    let tx_headers = self.tx_headers.clone();
+                                    let header_clone = header.clone();
+                                    let header_id_log = header_id.clone();
+                                    tokio::spawn(async move {
+                                        match tx_headers.send(header_clone).await {
+                                            Ok(()) => {
+                                                debug!(
+                                                    "[BATCH TRACK CORE] Successfully sent header {} (round {}, author: {}) to proposer for batch extraction",
+                                                    header_id_log, header_round, header_author
+                                                );
+                                            }
+                                            Err(e) => {
+                                                // Channel closed or full - CRITICAL ERROR - log as warning
+                                                warn!(
+                                                    "[BATCH TRACK CORE] CRITICAL: Failed to send header {} (round {}, author: {}) to proposer for batch extraction: {}. This may cause batches to be stuck!",
+                                                    header_id_log, header_round, header_author, e
+                                                );
+                                            }
+                                        }
+                                    });
                                     self.process_header(&header).await
                                 },
                                 Err(DagError::TooOld(_, round)) => {
