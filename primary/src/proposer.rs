@@ -299,13 +299,17 @@ impl Proposer {
             self.digests.len()
         );
 
+        // BATCH TRACKING: Log which batches are included in header
+        let batch_digests: Vec<_> = deduplicated_payload
+            .iter()
+            .map(|(digest, _)| digest)
+            .collect();
         info!(
-            "Creating header for round {} with digests {:?}",
+            "[BATCH TRACK HEADER] Primary {} creating header for round {} with {} batches: {:?}",
+            self.name,
             self.round,
-            deduplicated_payload
-                .iter()
-                .map(|(digest, _)| digest)
-                .collect::<Vec<_>>()
+            batch_digests.len(),
+            batch_digests
         );
 
         let header = Header::new(
@@ -441,6 +445,17 @@ impl Proposer {
     }
 
     fn mark_committed(&mut self, committed: CommittedBatches) {
+        // BATCH TRACKING: Log when batches are marked as committed
+        if !committed.digests.is_empty() {
+            info!(
+                "[BATCH COMMIT] Primary {} marking {} batches as committed at round {}: {:?}",
+                self.name,
+                committed.digests.len(),
+                committed.round,
+                committed.digests.iter().take(10).collect::<Vec<_>>()
+            );
+        }
+        
         self.latest_committed_round = self.latest_committed_round.max(committed.round);
 
         if committed.digests.is_empty() {
@@ -596,8 +611,15 @@ impl Proposer {
                     // Force remove batch - hệ thống không thể commit batch này
                     // Đây là biện pháp cuối cùng để ngăn chặn hệ thống bị đứng vĩnh viễn
                     warn!(
-                        "FORCE REMOVING stuck batch {} (retry_count={}, sent_round={}, current_round={}, rounds_since_sent={}). Batch cannot be committed after {} retries - removing to prevent system deadlock. Transactions in this batch will be LOST.",
-                        entry.digest, retry_count, round, self.round, rounds_since_sent, MAX_RETRY_COUNT
+                        "[BATCH STUCK] Primary {} FORCE REMOVING stuck batch {} (retry_count={}, sent_round={}, current_round={}, rounds_since_sent={}, latest_committed_round={}). Batch cannot be committed after {} retries - removing to prevent system deadlock. Transactions in this batch will be LOST.",
+                        self.name,
+                        entry.digest,
+                        retry_count,
+                        round,
+                        self.round,
+                        rounds_since_sent,
+                        self.latest_committed_round,
+                        MAX_RETRY_COUNT
                     );
                     entry.state = BatchState::Committed; // Mark as committed to remove
                     removed_too_old += 1;
@@ -666,6 +688,17 @@ impl Proposer {
                         );
                     entry.state = BatchState::Pending;
                     entry.retry_count += 1; // Increment retry count when requeuing
+                    info!(
+                        "[BATCH RETRY] Primary {} RETRYING batch {} (retry_count={}, sent_round={}, current_round={}, rounds_since_sent={}, latest_committed_round={}, own_cert_not_committed={})",
+                        self.name,
+                        entry.digest,
+                        entry.retry_count,
+                        round,
+                        self.round,
+                        rounds_since_sent,
+                        self.latest_committed_round,
+                        own_certificate_not_committed
+                    );
                     Self::maybe_schedule_batch_rescue(&mut batches_to_rescue, entry);
                     self.pending_payload_size += entry.size;
                     requeued_old += 1;
@@ -1026,9 +1059,55 @@ impl Proposer {
     /// 3. Extraction logic is deterministic (same order, same checks)
     /// 4. Only batches from other primaries are extracted (skip own headers)
     async fn extract_batches_from_headers(&mut self, header: &Header) {
-        // CRITICAL: Skip our own headers - we already know about these batches
+        // CRITICAL: For own headers, only skip if ALL batches are already committed or in Pending state
+        // This allows leader to extract batches from own headers when they're in InFlight state,
+        // preventing batches from being stuck when own certificate is not committed
         if header.author == self.name {
-            return;
+            // Check if all batches in this own header are either:
+            // 1. Already committed, OR
+            // 2. Already in queue in Pending state (not InFlight)
+            let all_batches_safe = header.payload.iter().all(|(batch_digest, _)| {
+                // Skip if already committed
+                if self.committed_digests.contains_key(batch_digest) {
+                    return true;
+                }
+                
+                // Check if batch is in queue
+                if let Some(entry) = self.digests.iter().find(|e| e.digest == *batch_digest) {
+                    // If batch is in Pending state, it's safe to skip (already available for inclusion)
+                    if matches!(entry.state, BatchState::Pending) {
+                        return true;
+                    }
+                    // If batch is in InFlight state, we should NOT skip - need to extract to convert to Pending
+                    // This allows leader to include batch even if own certificate wasn't committed
+                    if matches!(entry.state, BatchState::InFlight { .. }) {
+                        return false; // Not safe to skip - need to process
+                    }
+                }
+                
+                // Batch not in queue - safe to skip (will be added when received from worker)
+                true
+            });
+            
+            if all_batches_safe {
+                // All batches are safe to skip - return early
+                debug!(
+                    "[BATCH EXTRACTION] Primary {} SKIP extracting from own header {} (round {}) - all batches are committed or in Pending state",
+                    self.name,
+                    header.id,
+                    header.round
+                );
+                return;
+            } else {
+                // Some batches are in InFlight state - continue to extract them
+                // This allows leader to convert InFlight batches to Pending for immediate inclusion
+                info!(
+                    "[BATCH EXTRACTION] Primary {} PROCESSING own header {} (round {}) - contains InFlight batches that need to be converted to Pending. This allows leader to include batches even if own certificate wasn't committed.",
+                    self.name,
+                    header.id,
+                    header.round
+                );
+            }
         }
 
         // PERFORMANCE: Skip headers that are too old (more than max_retry_rounds behind current round)
@@ -1079,6 +1158,18 @@ impl Proposer {
         let mut batches_added = 0usize;
         let mut batches_not_in_store = 0usize;
 
+        // BATCH TRACKING: Log start of extraction
+        info!(
+            "[BATCH EXTRACTION START] Primary {} starting extraction from header {} (round {}, author: {}). Header contains {} batches. Current round: {}, max_retry_rounds: {}",
+            self.name,
+            header.id,
+            header.round,
+            header.author,
+            header.payload.len(),
+            self.round,
+            self.max_retry_rounds
+        );
+        
         // Extract batches from header payload
         for (batch_digest, worker_id) in header.payload.iter() {
             batches_extracted += 1;
@@ -1218,14 +1309,16 @@ impl Proposer {
                     batches_added += 1;
 
                     info!(
-                        "[BATCH EXTRACTION] Primary {} EXTRACTED batch {} (worker {}) from header {} (round {}, author: {}) into queue. Batch from non-leader primary can now be committed by this primary. Batch size: {} bytes",
+                        "[BATCH EXTRACTION SUCCESS] Primary {} EXTRACTED batch {} (worker {}) from header {} (round {}, author: {}) into queue. Batch from non-leader primary can now be committed by this primary. Batch size: {} bytes, queue_len: {}, pending_payload_size: {}",
                         self.name,
                         batch_digest,
                         worker_id,
                         header.id,
                         header.round,
                         header.author,
-                        size
+                        size,
+                        self.digests.len(),
+                        self.pending_payload_size
                     );
                 }
                 Ok(None) => {
@@ -1254,20 +1347,23 @@ impl Proposer {
             }
         }
 
-        if batches_extracted > 0 {
-            info!(
-                "[BATCH EXTRACTION] Primary {} extracted batches from header {} (round {}, author: {}): {} total, {} added to queue, {} skipped (committed), {} skipped (duplicate), {} not in store yet",
-                self.name,
-                header.id,
-                header.round,
-                header.author,
-                batches_extracted,
-                batches_added,
-                batches_skipped_committed,
-                batches_skipped_duplicate,
-                batches_not_in_store
-            );
-        }
+        // BATCH TRACKING: Always log extraction summary (even if 0 batches extracted)
+        info!(
+            "[BATCH EXTRACTION SUMMARY] Primary {} completed extraction from header {} (round {}, author: {}): {} total batches in header, {} extracted, {} added to queue, {} skipped (committed), {} skipped (duplicate), {} not in store. Current round: {}, queue_len: {}, pending_payload_size: {}",
+            self.name,
+            header.id,
+            header.round,
+            header.author,
+            header.payload.len(),
+            batches_extracted,
+            batches_added,
+            batches_skipped_committed,
+            batches_skipped_duplicate,
+            batches_not_in_store,
+            self.round,
+            self.digests.len(),
+            self.pending_payload_size
+        );
     }
 
     // Main loop listening to incoming messages.
@@ -1440,43 +1536,59 @@ impl Proposer {
                     // 1. Headers are already verified and stored before being sent here
                     // 2. All primaries receive the same headers via network (deterministic source)
                     // 3. Extraction logic is deterministic (same order, same checks)
+                    
+                    // BATCH TRACKING: Log when receiving header for batch extraction
+                    info!(
+                        "[BATCH TRACK PROPOSER] Proposer {} received header {} (round {}, author: {}) from Core for batch extraction. Header contains {} batches: {:?}",
+                        self.name,
+                        header.id,
+                        header.round,
+                        header.author,
+                        header.payload.len(),
+                        header.payload.keys().take(5).collect::<Vec<_>>()
+                    );
                     self.extract_batches_from_headers(&header).await;
                 }
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
+                    // BATCH TRACKING: Log when receiving batch from worker
+                    info!(
+                        "[BATCH TRACK WORKER] Proposer {} received batch {} from worker {} at round {} (batch size: {} bytes, raw payload: {} bytes)",
+                        self.name,
+                        digest,
+                        worker_id,
+                        self.round,
+                        digest.size(),
+                        batch.len()
+                    );
+                    
                     // Skip if already committed
                     if self.committed_digests.contains_key(&digest) {
-                        info!(
-                            "Skip enqueue batch {} from worker {} at round {} because it is already committed",
+                        warn!(
+                            "[BATCH TRACK WORKER] Proposer {} SKIP enqueue batch {} from worker {} at round {} - ALREADY COMMITTED at round {}",
+                            self.name,
                             digest,
                             worker_id,
-                            self.round
+                            self.round,
+                            self.committed_digests.get(&digest).copied().unwrap_or(0)
                         );
                         continue;
                     }
 
                     // Store the batch in the primary's store for the `analyze` function to find.
                     let size = digest.size();
-                    let raw_len = batch.len();
 
                     if self.digests.iter().any(|entry| entry.digest == digest) {
-                        info!(
-                            "Ignoring duplicate batch {} from worker {} at round {} (already queued; pending_payload_size = {}).",
+                        warn!(
+                            "[BATCH TRACK WORKER] Proposer {} IGNORING duplicate batch {} from worker {} at round {} (already queued; pending_payload_size = {}, queue_len = {})",
+                            self.name,
                             digest,
                             worker_id,
                             self.round,
-                            self.pending_payload_size
+                            self.pending_payload_size,
+                            self.digests.len()
                         );
                         continue;
                     }
-
-                    debug!(
-                        "Received batch {} from worker {} (digest size {} bytes, raw payload {} bytes) at round {}.",
-                        digest,
-                        worker_id,
-                        size,
-                        raw_len,
-                        self.round
-                    );
 
                     self.store.write(digest.clone().to_vec(), batch).await;
 
@@ -1492,7 +1604,8 @@ impl Proposer {
                     });
                     self.pending_payload_size += size;
                     info!(
-                        "Batch {} enqueued from worker {} at round {}; pending_payload_size = {}, queue_len = {}",
+                        "[BATCH TRACK WORKER] Proposer {} ENQUEUED batch {} from worker {} at round {}; pending_payload_size = {}, queue_len = {}",
+                        self.name,
                         digest_for_log,
                         worker_id,
                         self.round,
@@ -1501,6 +1614,13 @@ impl Proposer {
                     );
                 }
                 Some(committed) = self.rx_committed.recv() => {
+                    // BATCH TRACKING: Log when receiving committed batches notification
+                    info!(
+                        "[BATCH COMMIT NOTIFICATION] Proposer {} received committed batches notification: {} batches committed at round {}",
+                        self.name,
+                        committed.digests.len(),
+                        committed.round
+                    );
                     self.mark_committed(committed);
                 }
                 () = &mut header_timer => {

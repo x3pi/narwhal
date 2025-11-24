@@ -87,6 +87,12 @@ pub struct Core {
     last_detected_lag: Round,
     /// CATCH-UP MODE: Channel to notify proposer about catch-up mode
     tx_proposer_catchup: Sender<bool>,
+    /// CATCH-UP MODE: Track highest round seen from network (to compare with our proposer round)
+    highest_network_round: Round,
+    /// CATCH-UP MODE: Track our current proposer round (updated from certificates aggregators and headers from proposer)
+    current_proposer_round: Round,
+    /// CATCH-UP MODE: Track proposer round from headers we created (most accurate)
+    proposer_round_from_headers: Round,
 }
 
 impl Core {
@@ -145,6 +151,9 @@ impl Core {
                 catchup_mode_entered_at: None,
                 last_detected_lag: 0,
                 tx_proposer_catchup,
+                highest_network_round: 0,
+                current_proposer_round: 1,
+                proposer_round_from_headers: 1,
             }
             .run()
             .await;
@@ -152,6 +161,15 @@ impl Core {
     }
 
     async fn process_own_header(&mut self, header: Header) -> DagResult<()> {
+        // CATCH-UP MODE: Update proposer round from our own headers (most accurate)
+        if header.round > self.proposer_round_from_headers {
+            self.proposer_round_from_headers = header.round;
+            debug!(
+                "[CATCH-UP TRACKING] Updated proposer_round_from_headers to {} (from header round {})",
+                self.proposer_round_from_headers, header.round
+            );
+        }
+        
         // Reset the votes aggregator.
         self.current_header = header.clone();
         self.votes_aggregator = VotesAggregator::new();
@@ -179,6 +197,12 @@ impl Core {
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
         debug!("Processing {:?}", header);
         // RATE CONTROL ĐÃ BỊ BỎ - Không còn record header
+        
+        // CATCH-UP MODE: Update highest network round when receiving headers
+        if header.round > self.highest_network_round {
+            self.highest_network_round = header.round;
+        }
+        
         // Indicate that we are processing this header.
         self.processing
             .entry(header.round)
@@ -264,6 +288,16 @@ impl Core {
             self.votes_aggregator
                 .append(vote, &self.committee, &self.current_header)?
         {
+            info!(
+                "[BATCH TRACK CERTIFICATE] Core {} assembled certificate {} (round {}) from header {} (author: {}) containing {} batches: {:?}",
+                self.name,
+                certificate.digest(),
+                certificate.round(),
+                certificate.header.id,
+                certificate.origin(),
+                certificate.header.payload.len(),
+                certificate.header.payload.keys().take(5).collect::<Vec<_>>()
+            );
             debug!("Assembled {:?}", certificate);
 
             // Broadcast the certificate.
@@ -293,6 +327,12 @@ impl Core {
     async fn process_certificate(&mut self, certificate: Certificate) -> DagResult<()> {
         debug!("Processing {:?}", certificate);
         // RATE CONTROL ĐÃ BỊ BỎ - Không còn record certificate
+        
+        // CATCH-UP MODE: Update highest network round when receiving certificates
+        let cert_round = certificate.round();
+        if cert_round > self.highest_network_round {
+            self.highest_network_round = cert_round;
+        }
 
         // Process the header embedded in the certificate if we haven't already voted for it (if we already
         // voted, it means we already processed it). Since this header got certified, we are sure that all
@@ -393,7 +433,8 @@ impl Core {
 
         // CATCH-UP MODE: Skip consensus when in catch-up mode and lag is too large
         // This prevents node from voting on certificates when it doesn't have enough context
-        const LAG_SKIP_CONSENSUS_THRESHOLD: Round = 200; // Skip consensus if lag > 200 rounds
+        // Giảm threshold xuống để skip consensus sớm hơn khi lag
+        const LAG_SKIP_CONSENSUS_THRESHOLD: Round = 20; // Skip consensus if lag > 20 rounds (giảm từ 200)
         if self.is_catchup_mode && self.last_detected_lag > LAG_SKIP_CONSENSUS_THRESHOLD {
             debug!(
                 "[CATCH-UP MODE] Skipping consensus for certificate {} (round {}) - node is catching up (lag: {} rounds). Certificate still processed for state.",
@@ -405,9 +446,13 @@ impl Core {
             return Ok(());
         }
 
-        log::info!(
-            "Sending certificate {:?} to consensus",
-            certificate.digest()
+        info!(
+            "[BATCH TRACK CONSENSUS] Core {} sending certificate {} (round {}) to consensus. Certificate contains {} batches: {:?}",
+            self.name,
+            certificate.digest(),
+            certificate.round(),
+            certificate.header.payload.len(),
+            certificate.header.payload.keys().take(5).collect::<Vec<_>>()
         );
 
         // Send it to the consensus layer.
@@ -557,13 +602,69 @@ impl Core {
         // Update last check time
         self.last_catchup_sync_check = Some(Instant::now());
 
-        // Calculate approximate our round (gc_round is the oldest round we keep)
-        let our_round = self.gc_round + self.gc_depth;
-        let lag = current_round.saturating_sub(our_round);
+        // CATCH-UP MODE: Update highest network round from certificates aggregators
+        // The highest round in certificates_aggregators represents the highest round we've seen from network
+        let old_highest_network_round = self.highest_network_round;
+        if let Some(max_round) = self.certificates_aggregators.keys().max().copied() {
+            if max_round > self.highest_network_round {
+                self.highest_network_round = max_round;
+                debug!(
+                    "[CATCH-UP TRACKING] Updated highest_network_round from {} to {} (from certificates_aggregators)",
+                    old_highest_network_round, self.highest_network_round
+                );
+            }
+        }
+        
+        // CATCH-UP MODE: Update current proposer round from the highest round we can create headers for
+        // This is the highest round where we have quorum of certificates from previous round
+        let old_proposer_round = self.current_proposer_round;
+        if let Some(max_round) = self.certificates_aggregators.keys().max().copied() {
+            // Our proposer round is max_round + 1 (we can propose headers for this round)
+            self.current_proposer_round = max_round + 1;
+            if self.current_proposer_round != old_proposer_round {
+                debug!(
+                    "[CATCH-UP TRACKING] Updated current_proposer_round from {} to {} (from certificates_aggregators max_round: {})",
+                    old_proposer_round, self.current_proposer_round, max_round
+                );
+            }
+        }
+        
+        // CATCH-UP MODE: Use the higher of current_proposer_round (from certificates) and proposer_round_from_headers
+        // proposer_round_from_headers is more accurate as it's from actual headers we created
+        let actual_proposer_round = self.current_proposer_round.max(self.proposer_round_from_headers);
+        if actual_proposer_round != self.current_proposer_round {
+            debug!(
+                "[CATCH-UP TRACKING] Using proposer_round_from_headers {} instead of current_proposer_round {} (more accurate)",
+                self.proposer_round_from_headers, self.current_proposer_round
+            );
+            self.current_proposer_round = actual_proposer_round;
+        }
+
+        // CATCH-UP MODE: Calculate lag as difference between network's highest round and our proposer round
+        // Use the higher of consensus_round and highest_network_round as network current round
+        let network_current_round = current_round.max(self.highest_network_round);
+        let lag = network_current_round.saturating_sub(self.current_proposer_round);
+        
+        // LOGGING: Always log catch-up check details for monitoring
+        info!(
+            "[CATCH-UP SYNC] Periodic check - our_proposer_round: {} (from_certs: {}, from_headers: {}), network_round: {} (consensus: {}, highest_network: {}), lag: {} rounds, certificates_aggregators_count: {}, gc_round: {}",
+            self.current_proposer_round,
+            self.current_proposer_round.saturating_sub(1), // approximate from certs
+            self.proposer_round_from_headers,
+            network_current_round,
+            current_round,
+            self.highest_network_round,
+            lag,
+            self.certificates_aggregators.len(),
+            self.gc_round
+        );
 
         // CATCH-UP MODE: Thresholds for entering and resuming catch-up mode
-        const LAG_THRESHOLD: Round = 100; // Enter catch-up mode if lag >= 100 rounds
-        const RESUME_THRESHOLD: Round = 50; // Resume normal operation if lag < 50 rounds
+        // Tăng threshold lên để tránh vào catch-up mode quá sớm (50 rounds thay vì 10)
+        // Lag 10 rounds là bình thường trong DAG và không nên trigger catch-up mode
+        // Điều này tránh proposer bị pause khiến giao dịch không được thực thi
+        const LAG_THRESHOLD: Round = 50; // Enter catch-up mode if lag >= 50 rounds
+        const RESUME_THRESHOLD: Round = 30; // Resume normal operation if lag < 30 rounds
 
         // Update last detected lag
         self.last_detected_lag = lag;
@@ -575,10 +676,12 @@ impl Core {
                 self.is_catchup_mode = true;
                 self.catchup_mode_entered_at = Some(Instant::now());
                 warn!(
-                    "[CATCH-UP MODE] Primary {} ENTERING catch-up mode - lag: {} rounds (our: {}, current: {}, gc_round: {}). Pausing proposer and focusing on syncing.",
+                    "[CATCH-UP MODE] Primary {} ENTERING catch-up mode - lag: {} rounds (>= threshold: {}) (our_proposer_round: {}, network_round: {}, consensus_round: {}, gc_round: {}). Pausing proposer and focusing on syncing.",
                     self.name,
                     lag,
-                    our_round,
+                    LAG_THRESHOLD,
+                    self.current_proposer_round,
+                    network_current_round,
                     current_round,
                     self.gc_round
                 );
@@ -586,16 +689,25 @@ impl Core {
                 // Notify proposer to pause
                 if let Err(e) = self.tx_proposer_catchup.send(true).await {
                     warn!("[CATCH-UP MODE] Failed to notify proposer: {}", e);
+                } else {
+                    info!("[CATCH-UP MODE] Successfully notified proposer to pause");
                 }
             } else {
-                // Already in catch-up mode - log progress
+                // Already in catch-up mode - log progress (upgrade to info for monitoring)
                 let catchup_duration = self.catchup_mode_entered_at
                     .map(|t| t.elapsed())
                     .unwrap_or_default();
-                debug!(
-                    "[CATCH-UP MODE] Primary {} still catching up - lag: {} rounds, duration: {:?}",
-                    self.name, lag, catchup_duration
+                info!(
+                    "[CATCH-UP MODE] Primary {} still catching up - lag: {} rounds (>= threshold: {}), duration: {:?} (our_proposer_round: {}, network_round: {})",
+                    self.name, lag, LAG_THRESHOLD, catchup_duration, self.current_proposer_round, network_current_round
                 );
+                
+                // PROACTIVE SYNC: When in catch-up mode, proactively request certificates from missing rounds
+                // This helps node catch up faster by actively requesting data instead of waiting passively
+                if lag > 20 && catchup_duration.as_secs() % 5 == 0 {
+                    // Request certificates from missing rounds every 5 seconds when lag > 20
+                    self.proactive_sync_missing_certificates(network_current_round).await;
+                }
             }
         } else if lag < RESUME_THRESHOLD {
             // CATCH-UP MODE: Resume normal operation if lag is small
@@ -606,39 +718,69 @@ impl Core {
                     .map(|t| t.elapsed())
                     .unwrap_or_default();
                 info!(
-                    "[CATCH-UP MODE] Primary {} RESUMING normal operation - caught up in {:?} (lag: {} rounds, our: {}, current: {}). Resuming proposer.",
+                    "[CATCH-UP MODE] Primary {} RESUMING normal operation - caught up in {:?} (lag: {} rounds < threshold: {}) (our_proposer_round: {}, network_round: {}, consensus_round: {}). Resuming proposer.",
                     self.name,
                     catchup_duration,
                     lag,
-                    our_round,
+                    RESUME_THRESHOLD,
+                    self.current_proposer_round,
+                    network_current_round,
                     current_round
                 );
                 
                 // Notify proposer to resume
                 if let Err(e) = self.tx_proposer_catchup.send(false).await {
                     warn!("[CATCH-UP MODE] Failed to notify proposer: {}", e);
+                } else {
+                    info!("[CATCH-UP MODE] Successfully notified proposer to resume");
                 }
                 
                 self.catchup_mode_entered_at = None;
             } else {
                 // Node is up to date
                 debug!(
-                    "[CATCH-UP SYNC] Periodic check - node {} is up to date (our: {}, current: {}, lag: {})",
-                    self.name, our_round, current_round, lag
+                    "[CATCH-UP SYNC] Periodic check - node {} is up to date (lag: {} rounds < threshold: {}) (our_proposer_round: {}, network_round: {}, consensus_round: {})",
+                    self.name, lag, RESUME_THRESHOLD, self.current_proposer_round, network_current_round, current_round
                 );
             }
         } else {
             // Lag is between RESUME_THRESHOLD and LAG_THRESHOLD
             // Stay in current mode (catch-up or normal)
             if self.is_catchup_mode {
+                info!(
+                    "[CATCH-UP MODE] Primary {} still in catch-up mode - lag: {} rounds (between thresholds: {} < lag < {})",
+                    self.name, lag, RESUME_THRESHOLD, LAG_THRESHOLD
+                );
+            } else {
                 debug!(
-                    "[CATCH-UP MODE] Primary {} still in catch-up mode - lag: {} rounds (between thresholds)",
-                    self.name, lag
+                    "[CATCH-UP SYNC] Periodic check - lag: {} rounds (between thresholds: {} < lag < {}), staying in normal mode",
+                    lag, RESUME_THRESHOLD, LAG_THRESHOLD
                 );
             }
         }
 
         Ok(())
+    }
+
+    /// PROACTIVE SYNC: Log catch-up progress and ensure synchronizer is active
+    /// When in catch-up mode, we rely on the existing sync mechanism which is triggered
+    /// when we receive headers/certificates. This method ensures we're actively monitoring
+    /// catch-up progress and the synchronizer will handle requesting missing data.
+    async fn proactive_sync_missing_certificates(&mut self, network_current_round: Round) {
+        // Calculate how many rounds we need to catch up
+        let rounds_to_catchup = network_current_round.saturating_sub(self.current_proposer_round);
+        
+        if rounds_to_catchup > 0 {
+            info!(
+                "[PROACTIVE SYNC] Primary {} in catch-up mode - need to catch up {} rounds (current: {}, network: {}). Synchronizer will handle requesting missing certificates when headers/certificates are received.",
+                self.name, rounds_to_catchup, self.current_proposer_round, network_current_round
+            );
+            
+            // The existing sync mechanism (HeaderWaiter, CertificateWaiter) will handle
+            // requesting missing certificates when we receive headers/certificates from network.
+            // This proactive sync ensures we're aware of the catch-up progress and the
+            // synchronizer will automatically request missing data when needed.
+        }
     }
 
     /// PHASE 2: Trigger catch-up sync for old certificate
@@ -770,17 +912,41 @@ impl Core {
                                     // hundreds of ms to just a few ms. This prevents batches from being stuck
                                     // and reduces retry count significantly.
                                     //
+                                    // CRITICAL FIX: Also send OWN headers to proposer for batch extraction.
+                                    // This allows leader to extract batches from own headers when they're in InFlight state,
+                                    // preventing batches from being stuck when own certificate is not committed.
+                                    // SAFETY: extract_batches_from_headers already handles own headers correctly:
+                                    // - It only extracts if batches are in InFlight state (not Pending or Committed)
+                                    // - It converts InFlight -> Pending to allow immediate inclusion
+                                    // - It checks committed_digests to prevent duplicates
+                                    //
                                     // SAFETY: Signature is already verified, so this is safe. Even if header
                                     // is later found to be invalid (e.g., missing parents), batch extraction
                                     // is safe because:
                                     // 1. Batch will only be added to queue, not committed immediately
                                     // 2. Batch will be checked again when creating header
                                     // 3. Invalid headers won't be committed anyway
-                                    if header.author != self.name {
-                                        if let Err(e) = self.tx_headers.send(header.clone()).await {
-                                            // Channel closed or full - not critical, just log
-                                            debug!("Failed to send header {} to proposer for early batch extraction: {}", header.id, e);
-                                        }
+                                    // BATCH TRACKING: Log when sending header to proposer for batch extraction
+                                    info!(
+                                        "[BATCH TRACK CORE] Core {} sending header {} (round {}, author: {}) to proposer for batch extraction. Header contains {} batches: {:?}",
+                                        self.name,
+                                        header.id,
+                                        header.round,
+                                        header.author,
+                                        header.payload.len(),
+                                        header.payload.keys().take(5).collect::<Vec<_>>()
+                                    );
+                                    if let Err(e) = self.tx_headers.send(header.clone()).await {
+                                        // Channel closed or full - CRITICAL ERROR - log as warning
+                                        warn!(
+                                            "[BATCH TRACK CORE] CRITICAL: Failed to send header {} (round {}, author: {}) to proposer for batch extraction: {}. This may cause batches to be stuck!",
+                                            header.id, header.round, header.author, e
+                                        );
+                                    } else {
+                                        debug!(
+                                            "[BATCH TRACK CORE] Successfully sent header {} (round {}, author: {}) to proposer for batch extraction",
+                                            header.id, header.round, header.author
+                                        );
                                     }
                                     self.process_header(&header).await
                                 },

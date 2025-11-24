@@ -14,7 +14,9 @@ use transaction::{
     AccessTuple, Transaction, TransactionLogBatch, TransactionLogEntry, Transactions,
 };
 
-/// Tính hash của transaction (sử dụng Keccak256 như Ethereum)
+/// Tính hash của transaction từ Transaction object
+/// Thống nhất với Go: Tạo TransactionHashData từ Transaction, encode thành protobuf, rồi tính Keccak256 hash
+/// Đảm bảo hash khớp giữa Go và Rust vì cả hai đều tính từ TransactionHashData (protobuf encoded)
 pub fn calculate_transaction_hash(tx: &Transaction) -> Vec<u8> {
     // Tạo TransactionHashData từ Transaction
     let hash_data = transaction::TransactionHashData {
@@ -114,6 +116,7 @@ pub fn create_transaction_log_entry(
 }
 
 /// Parse Transactions từ bytes và tạo TransactionLogBatch
+/// Tính hash từ raw protobuf payload cho từng transaction để đảm bảo khớp với Node
 pub fn parse_and_log_transactions(
     data: &[u8],
     worker_id: u32,
@@ -130,8 +133,10 @@ pub fn parse_and_log_transactions(
     let total_transactions = transactions.transactions.len() as u32;
 
     // Tạo log entry cho từng transaction
+    // Tính hash từ TransactionHashData (protobuf encoded) - thống nhất với Go
     let mut transaction_logs = Vec::new();
     for (index, tx) in transactions.transactions.iter().enumerate() {
+        // Sử dụng create_transaction_log_entry để tính hash từ TransactionHashData
         let log_entry = create_transaction_log_entry(tx, worker_id, index as u32);
         transaction_logs.push(log_entry);
     }
@@ -227,9 +232,60 @@ pub fn parse_and_log_transactions_simple(data: &Bytes, worker_id: u32) {
 }
 
 /// Parse một transaction đơn lẻ (không phải Transactions)
+/// Tính hash từ TransactionHashData (protobuf encoded) để đảm bảo khớp với Go
 fn parse_single_transaction(data: &[u8], worker_id: u32) -> Result<TransactionLogEntry, String> {
+    // Parse Transaction từ payload
     let tx =
         Transaction::decode(data).map_err(|e| format!("Failed to decode Transaction: {}", e))?;
+    
+    // Tính hash từ TransactionHashData (protobuf encoded) - thống nhất với Go
+    let transaction_hash = calculate_transaction_hash(&tx);
 
-    Ok(create_transaction_log_entry(&tx, worker_id, 0))
+    let received_timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Tính size của transaction (approximate)
+    let mut size = 0u64;
+    size += tx.data.len() as u64;
+    size += 8; // max_gas
+    size += 8; // max_gas_price
+    size += tx.related_addresses.len() as u64 * 32; // approximate per address
+
+    Ok(TransactionLogEntry {
+        transaction_hash, // Sử dụng hash từ raw payload
+        from_address: tx.from_address.clone(),
+        to_address: tx.to_address.clone(),
+        amount: tx.amount.clone(),
+        nonce: tx.nonce.clone(),
+        max_gas: tx.max_gas,
+        max_gas_price: tx.max_gas_price,
+        gas_tip_cap: tx.gas_tip_cap.clone(),
+        gas_fee_cap: tx.gas_fee_cap.clone(),
+        chain_id: tx.chain_id,
+        r#type: tx.r#type,
+        r: tx.r.clone(),
+        s: tx.s.clone(),
+        v: tx.v.clone(),
+        sign: tx.sign.clone(),
+        last_device_key: tx.last_device_key.clone(),
+        new_device_key: tx.new_device_key.clone(),
+        data: tx.data.clone(),
+        related_addresses: tx.related_addresses.clone(),
+        access_list: tx
+            .access_list
+            .iter()
+            .map(|at| AccessTuple {
+                address: at.address.clone(),
+                storage_keys: at.storage_keys.clone(),
+            })
+            .collect(),
+        read_only: tx.read_only,
+        max_time_use: tx.max_time_use,
+        received_timestamp,
+        worker_id,
+        size,
+        index_in_batch: 0,
+    })
 }

@@ -484,6 +484,7 @@ mod tx_logger {
     }
 
     /// Parse và log transaction từ payload
+    /// Tính hash từ TransactionHashData (protobuf encoded) để đảm bảo khớp với Go
     pub fn parse_and_log_transaction(
         payload: &[u8],
         batch_digest: &crypto::Digest,
@@ -494,8 +495,10 @@ mod tx_logger {
         // Thử parse như Transaction
         match Transaction::decode(payload) {
             Ok(tx) => {
+                // Tính hash từ TransactionHashData (protobuf encoded) - thống nhất với Go
                 let transaction_hash = calculate_transaction_hash(&tx);
                 let hash_hex = hex::encode(&transaction_hash);
+                
                 let from_hex = hex::encode(&tx.from_address);
                 let to_hex = hex::encode(&tx.to_address);
                 let amount_hex = hex::encode(&tx.amount);
@@ -517,17 +520,23 @@ mod tx_logger {
                 );
             }
             Err(e) => {
-                // Nếu parse failed, log hex để debug
+                // Nếu parse failed, không thể tính hash từ TransactionHashData
+                // Fallback: tính hash từ raw payload (không khớp với Go)
+                use sha3::{Digest as Sha3Digest, Keccak256};
+                let transaction_hash = Keccak256::digest(payload).to_vec();
+                let hash_hex = hex::encode(&transaction_hash);
+                
                 let payload_hex = if payload.len() <= 64 {
                     hex::encode(payload)
                 } else {
                     format!("{}...", hex::encode(&payload[..64]))
                 };
                 log::warn!(
-                    "[CONSENSUS TX LOG] Batch {} tx[{}] (height {}): Failed to parse Transaction: {}. Payload hex: {}",
+                    "[CONSENSUS TX LOG] Batch {} tx[{}] (height {}): Hash={} (fallback from raw payload), Failed to parse Transaction: {}. Payload hex: {}",
                     batch_digest,
                     tx_idx,
                     height,
+                    hash_hex,
                     e,
                     payload_hex
                 );
@@ -1587,9 +1596,25 @@ async fn analyze(
                                 };
 
                                 // Tính hash của transaction để kiểm tra duplicate
-                                // Sử dụng hash của transaction payload (sau khi strip length prefix)
-                                use sha3::{Digest as Sha3Digest, Keccak256};
-                                let tx_hash = Keccak256::digest(&tx_payload).to_vec();
+                                // Thống nhất với Go: Parse Transaction, tạo TransactionHashData, encode, rồi tính hash
+                                use transaction::Transaction;
+                                let tx_hash = match Transaction::decode(tx_payload.as_slice()) {
+                                    Ok(tx) => {
+                                        // Tính hash từ TransactionHashData (protobuf encoded) - thống nhất với Go
+                                        tx_logger::calculate_transaction_hash(&tx)
+                                    }
+                                    Err(e) => {
+                                        // Nếu parse failed, fallback: tính hash từ raw payload
+                                        log::warn!(
+                                            "[BATCH PROCESSING] Failed to parse Transaction in batch {} tx[{}] for hash calculation: {}. Using fallback hash from raw payload.",
+                                            batch_digest,
+                                            tx_idx,
+                                            e
+                                        );
+                                        use sha3::{Digest as Sha3Digest, Keccak256};
+                                        Keccak256::digest(&tx_payload).to_vec()
+                                    }
+                                };
 
                                 // Kiểm tra duplicate transaction trong cùng block
                                 if !builder.transaction_hashes.insert(tx_hash.clone()) {
