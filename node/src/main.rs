@@ -39,7 +39,9 @@ pub mod transaction {
 }
 
 /// The default channel capacity.
-pub const CHANNEL_CAPACITY: usize = 10_000;
+// Giảm capacity xuống một nửa để phát hiện lỗi sớm hơn (thay vì chờ 2 tiếng)
+// Nếu channel đầy, lỗi sẽ xuất hiện nhanh hơn → dễ debug hơn
+pub const CHANNEL_CAPACITY: usize = 5_000;
 const CONSENSUS_STATE_KEY: &[u8] = b"consensus_state";
 
 async fn fetch_validators_via_uds(socket_path: &str, block_number: u64) -> Result<ValidatorInfo> {

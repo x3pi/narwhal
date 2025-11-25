@@ -6,6 +6,7 @@ use crate::primary::PayloadCache;
 use config::Committee;
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
+use log::{info, warn};
 use std::collections::HashMap;
 use store::Store;
 use tokio::sync::mpsc::Sender;
@@ -57,20 +58,57 @@ impl Synchronizer {
         }
 
         let mut missing = HashMap::new();
+        let mut found_in_cache = 0usize;
+        let mut found_in_store = 0usize;
+        
         for (digest, worker_id) in header.payload.iter() {
             // KIỂM TRA CACHE TRƯỚC
             if self.cache.contains_key(digest) {
+                found_in_cache += 1;
                 continue; // Tìm thấy trong RAM, không cần làm gì thêm
             }
 
             // Nếu không có trong cache, kiểm tra store (phương án dự phòng)
-            if self.store.read(digest.to_vec()).await?.is_none() {
-                missing.insert(digest.clone(), *worker_id);
+            match self.store.read(digest.to_vec()).await? {
+                Some(_) => {
+                    found_in_store += 1;
+                    // Batch có trong store - OK
+                }
+                None => {
+                    // CRITICAL: Batch không có trong cache và store - cần sync
+                    missing.insert(digest.clone(), *worker_id);
+                }
             }
         }
 
         if missing.is_empty() {
             return Ok(false);
+        }
+
+        // CRITICAL: Log chi tiết về missing batches để debug
+        let missing_count = missing.len();
+        let missing_digests: Vec<_> = missing.keys().take(5).cloned().collect();
+        warn!(
+            "[SYNC TRIGGER] Primary {} detected {} missing batches in header {} (round {}, author: {}). Found {} in cache, {} in store, {} missing. Triggering sync request to HeaderWaiter.",
+            self.name,
+            missing_count,
+            header.id,
+            header.round,
+            header.author,
+            found_in_cache,
+            found_in_store,
+            missing_count
+        );
+        
+        if missing_count > 0 {
+            info!(
+                "[SYNC TRIGGER DETAIL] Primary {} missing batches (sample): {:?} from header {} (round {}, author: {}). Sync request will be sent to HeaderWaiter.",
+                self.name,
+                missing_digests,
+                header.id,
+                header.round,
+                header.author
+            );
         }
 
         self.tx_header_waiter

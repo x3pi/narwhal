@@ -8,7 +8,7 @@ use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use network::SimpleSender;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -130,10 +130,21 @@ impl HeaderWaiter {
                 Some(message) = self.rx_synchronizer.recv() => {
                     match message {
                         WaiterMessage::SyncBatches(missing, header) => {
-                            debug!("Synching the payload of {}", header);
                             let header_id = header.id.clone();
                             let round = header.round;
                             let author = header.author;
+                            let missing_count = missing.len();
+                            let missing_digests_sample: Vec<_> = missing.keys().take(5).cloned().collect();
+                            
+                            info!(
+                                "[SYNC BATCHES REQUEST] HeaderWaiter {} received sync request for {} missing batches from header {} (round {}, author: {}). Sample batches: {:?}. Will request from ALL workers in parallel.",
+                                self.name,
+                                missing_count,
+                                header_id,
+                                round,
+                                author,
+                                missing_digests_sample
+                            );
 
                             // Ensure we sync only once per header.
                             if self.pending.contains_key(&header_id) {
@@ -162,6 +173,18 @@ impl HeaderWaiter {
                             }
                             // ĐỒNG BỘ SIÊU NHANH: Gửi đến nhiều workers song song để tăng tốc độ
                             for (worker_id, digests) in requires_sync {
+                                let batch_count = digests.len();
+                                let digests_sample: Vec<_> = digests.iter().take(3).cloned().collect();
+                                
+                                info!(
+                                    "[SYNC BATCHES SEND] HeaderWaiter {} sending sync request for {} batches (worker {}, author: {}). Sample: {:?}. Sending to ALL workers in parallel for maximum speed.",
+                                    self.name,
+                                    batch_count,
+                                    worker_id,
+                                    author,
+                                    digests_sample
+                                );
+                                
                                 let author_address = self.committee
                                     .worker(&author, &worker_id)
                                     .expect("Author of valid header is not in the committee")
@@ -173,6 +196,10 @@ impl HeaderWaiter {
                                 // ĐỒNG BỘ SIÊU NHANH: Gửi đến TẤT CẢ workers ngay lập tức để tăng tốc độ sync tối đa
                                 // Gửi đến worker của author trước
                                 self.network.send(author_address, Bytes::from(bytes.clone())).await;
+                                info!(
+                                    "[SYNC BATCHES SEND] HeaderWaiter {} sent sync request to author worker {} ({}) for {} batches",
+                                    self.name, author, author_address, batch_count
+                                );
 
                                 // Gửi đến TẤT CẢ workers của các node khác để tăng tốc độ sync tối đa
                                 let other_workers: Vec<_> = self.committee.others_primaries(&self.name)
@@ -183,6 +210,14 @@ impl HeaderWaiter {
                                     })
                                     .collect(); // Gửi đến TẤT CẢ workers, không giới hạn
 
+                                let other_workers_count = other_workers.len();
+                                if other_workers_count > 0 {
+                                    info!(
+                                        "[SYNC BATCHES SEND] HeaderWaiter {} sending sync request to {} other workers in parallel for {} batches (worker {})",
+                                        self.name, other_workers_count, batch_count, worker_id
+                                    );
+                                }
+                                
                                 // Gửi tuần tự đến tất cả workers khác (SimpleSender đã có connection pooling)
                                 for worker_addr in other_workers {
                                     let message_other = PrimaryWorkerMessage::Synchronize(digests.clone(), author);
@@ -194,7 +229,7 @@ impl HeaderWaiter {
                         }
 
                         WaiterMessage::SyncParents(missing, header) => {
-                            debug!("Synching the parents of {}", header);
+                            info!("[SYNC PARENTS] HeaderWaiter {} synching the parents of header {} (round {}, author: {}). Missing {} parents.", self.name, header.id, header.round, header.author, missing.len());
                             let header_id = header.id.clone();
                             let round = header.round;
                             let author = header.author;

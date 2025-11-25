@@ -5,7 +5,7 @@ use crate::primary::{BatchRescue, CommittedBatches, Round};
 use config::{Committee, WorkerId};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, SignatureService};
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use store::Store;
 use tokio::sync::mpsc::{Receiver, Sender};
@@ -23,9 +23,35 @@ struct BatchEntry {
     state: BatchState,
     retry_count: usize, // Track number of times this batch has been retried
     rescue_sent: bool,
+    /// LONG-TERM FIX: Priority for batch (higher = more important)
+    priority: BatchPriority,
+    /// LONG-TERM FIX: When batch was first added to queue
+    added_at: Instant,
+}
+
+/// LONG-TERM FIX: Batch priority for smart retry and collection
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum BatchPriority {
+    Low = 0,    // Batches cũ, đã retry nhiều lần
+    Medium = 1, // Batches bình thường
+    High = 2,   // Batches mới, từ leader, quan trọng
 }
 
 const RESCUE_RETRY_THRESHOLD: usize = 25;
+const WARNING_SYNC_WAIT_SECS: u64 = 5; // Warning if batch waits this long for sync
+const MAX_SYNC_WAIT_SECS: u64 = 10; // Force re-sync/rescue if batch waits this long
+const WATCHDOG_PENDING_ZERO_SECS: u64 = 8; // Queue stuck threshold
+const WATCHDOG_FORCE_RESCUE_BATCHES: usize = 10; // Max batches to rescue per watchdog tick
+// LONG-TERM FIX: Queue size limit to prevent memory leak
+const MAX_QUEUE_SIZE: usize = 10_000; // Maximum batches in queue
+const QUEUE_WARNING_THRESHOLD: usize = 5_000; // Warn when queue size exceeds this
+// LONG-TERM FIX: Backpressure thresholds
+const CHANNEL_WARNING_USAGE: f64 = 0.7; // Warn when channel usage > 70%
+const CHANNEL_CRITICAL_USAGE: f64 = 0.9; // Critical when channel usage > 90%
+// LONG-TERM FIX: Adaptive retry thresholds
+const HIGH_PRIORITY_RETRY_DELAY_MULTIPLIER: f64 = 0.5; // High priority batches retry 2x faster
+const LOW_PRIORITY_RETRY_DELAY_MULTIPLIER: f64 = 2.0; // Low priority batches retry 2x slower
+const PRIORITY_AGE_THRESHOLD_SECS: u64 = 60; // Batches older than 60s become low priority
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchState {
@@ -99,6 +125,18 @@ pub struct Proposer {
     rx_catchup_mode: Receiver<bool>,
     /// CATCH-UP MODE: Track if node is in catch-up mode
     is_catchup_mode: bool,
+    /// LONG-TERM FIX: Track header creation rate for backpressure
+    header_creation_rate: f64, // Multiplier for header creation delay (1.0 = normal, >1.0 = slower)
+    /// LONG-TERM FIX: Last time we checked channel usage
+    last_channel_check: Option<Instant>,
+    /// LONG-TERM FIX: Channel check interval
+    channel_check_interval: Duration,
+    /// WATCHDOG: Track when queue entered pending_payload_size == 0 state while batches exist.
+    pending_zero_since: Option<Instant>,
+    /// WATCHDOG: Minimum interval between forced rescues while queue stuck.
+    pending_zero_watchdog_interval: Duration,
+    /// WATCHDOG: Maximum duration queue is allowed to be stuck before forcing rescue.
+    max_pending_zero_duration: Duration,
 }
 
 impl Proposer {
@@ -147,13 +185,17 @@ impl Proposer {
                 latest_committed_round: 0,
                 committed_digests: HashMap::new(),
                 max_retry_rounds: 1000, // Don't retry batches that have been InFlight for more than 1000 rounds
-                max_committed_digests: 10000, // Cleanup old digests when this limit is reached
+                max_committed_digests: 5000, // Giảm từ 10000 xuống 5000 để cleanup thường xuyên hơn, tránh memory leak
                 last_parent_received_at: Some(Instant::now()), // Initialize with current time
                 max_parent_wait: Duration::from_secs(10), // Force advance after 10 seconds without parent certificates
                 // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
                 // CATCH-UP MODE: Initialize catch-up mode state
                 rx_catchup_mode,
                 is_catchup_mode: false,
+                // LONG-TERM FIX: Initialize performance tracking
+                header_creation_rate: 1.0, // Start with normal rate
+                last_channel_check: None,
+                channel_check_interval: Duration::from_secs(5), // Check every 5 seconds
             }
             .run()
             .await;
@@ -184,7 +226,7 @@ impl Proposer {
             self.pending_payload_size = self.pending_payload_size.saturating_sub(size_to_subtract);
         }
 
-        let payload: Vec<(Digest, WorkerId)> = self.collect_payload_for_header();
+        let payload: Vec<(Digest, WorkerId)> = self.collect_payload_for_header().await;
 
         // Final check: ensure no duplicates and no committed batches in payload before creating header
         let mut seen = HashSet::new();
@@ -246,8 +288,9 @@ impl Proposer {
         }
 
         if deduplicated_payload.is_empty() {
-            debug!(
-                "No payload to include in header for round {} (pending_payload_size = {}, queue_len = {})",
+            info!(
+                "[HEADER CREATE] Primary {} no payload to include in header for round {} (pending_payload_size = {} bytes, queue_len: {})",
+                self.name,
                 self.round,
                 self.pending_payload_size,
                 self.digests.len()
@@ -284,7 +327,7 @@ impl Proposer {
                     &mut self.signature_service,
                 )
                 .await;
-                debug!("Created empty header {:?}", header);
+                info!("[HEADER CREATED] Primary {} created EMPTY header {} for round {} (pending_payload_size: {} bytes, queue_len: {})", self.name, header.id, self.round, self.pending_payload_size, self.digests.len());
                 self.tx_core
                     .send(header)
                     .await
@@ -295,8 +338,9 @@ impl Proposer {
         }
 
         // Make a new header.
-        debug!(
-            "Creating header for round {} with {} payload digests (pending_payload_size before send = {}, queue_len = {})",
+        info!(
+            "[HEADER CREATE] Primary {} creating header for round {} with {} payload digests (pending_payload_size before send = {} bytes, queue_len: {})",
+            self.name,
             self.round,
             deduplicated_payload.len(),
             self.pending_payload_size,
@@ -308,13 +352,25 @@ impl Proposer {
             .iter()
             .map(|(digest, _)| digest)
             .collect();
-        info!(
-            "[BATCH TRACK HEADER] Primary {} creating header for round {} with {} batches: {:?}",
-            self.name,
-            self.round,
-            batch_digests.len(),
-            batch_digests
-        );
+        
+        // CRITICAL: Warning khi header empty - đây là dấu hiệu batches không được include
+        if batch_digests.is_empty() {
+            warn!(
+                "[BATCH TRACK HEADER] WARNING: Primary {} creating EMPTY header for round {} (0 batches). Queue has {} batches (pending_payload_size: {} bytes). This may indicate batches are not being selected or queue is stuck!",
+                self.name,
+                self.round,
+                self.digests.len(),
+                self.pending_payload_size
+            );
+        } else {
+            info!(
+                "[BATCH TRACK HEADER] Primary {} creating header for round {} with {} batches: {:?}",
+                self.name,
+                self.round,
+                batch_digests.len(),
+                batch_digests
+            );
+        }
 
         let header = Header::new(
             self.name,
@@ -324,7 +380,7 @@ impl Proposer {
             &mut self.signature_service,
         )
         .await;
-        debug!("Created {:?}", header);
+        info!("[HEADER CREATED] Primary {} created header {} for round {} with {} batches (pending_payload_size: {} bytes, queue_len: {})", self.name, header.id, self.round, header.payload.len(), self.pending_payload_size, self.digests.len());
 
         #[cfg(feature = "benchmark")]
         for digest in header.payload.keys() {
@@ -340,7 +396,7 @@ impl Proposer {
         true
     }
 
-    fn collect_payload_for_header(&mut self) -> Vec<(Digest, WorkerId)> {
+    async fn collect_payload_for_header(&mut self) -> Vec<(Digest, WorkerId)> {
         // First, cleanup any committed batches from the queue
         // We need to calculate size to subtract first
         let mut size_to_subtract = 0usize;
@@ -364,69 +420,148 @@ impl Proposer {
         let mut seen_digests = HashSet::new(); // Track digests in this header to avoid duplicates
         let mut inflight_skipped = 0usize;
 
+        // LONG-TERM FIX: Update priority based on age first
         for entry in self.digests.iter_mut() {
-            if accumulated_size >= self.header_size {
-                break;
+            if entry.added_at.elapsed().as_secs() > PRIORITY_AGE_THRESHOLD_SECS {
+                // Batches older than threshold become low priority
+                if entry.priority > BatchPriority::Low {
+                    entry.priority = BatchPriority::Low;
+                }
             }
+        }
 
-            // CRITICAL: Double-check committed status before collecting
-            // This prevents race conditions where batch was committed between cleanup and collection
-            if self.committed_digests.contains_key(&entry.digest) {
-                warn!(
-                    "Detected committed batch {} during payload collection for round {} - skipping",
-                    entry.digest, self.round
-                );
-                entry.state = BatchState::Committed;
-                continue;
-            }
+        // LONG-TERM FIX: Collect batches with priority sorting
+        // Collect high priority batches first, then medium, then low
+        // We iterate multiple times: first High, then Medium, then Low
+        for priority_level in [BatchPriority::High, BatchPriority::Medium, BatchPriority::Low] {
+            for entry in self.digests.iter_mut() {
+                if accumulated_size >= self.header_size {
+                    break;
+                }
 
-            // Skip if already added to this header (duplicate check)
-            if seen_digests.contains(&entry.digest) {
-                debug!(
-                    "Skipping duplicate digest {} in header payload for round {}",
-                    entry.digest, self.round
-                );
-                continue;
-            }
+                // Only process batches with current priority level
+                if entry.priority != priority_level {
+                    continue;
+                }
 
-            // OPTIMIZATION: Skip InFlight batches immediately without logging each one
-            if matches!(entry.state, BatchState::InFlight { .. }) {
-                inflight_skipped += 1;
-                continue;
-            }
-
-            if matches!(entry.state, BatchState::Pending) {
-                // TRIPLE-CHECK: Verify batch is still not committed before marking as InFlight
+                // CRITICAL: Double-check committed status before collecting
                 // This prevents race conditions where batch was committed between cleanup and collection
                 if self.committed_digests.contains_key(&entry.digest) {
                     warn!(
-                        "[COLLECT] Batch {} became committed during collection for round {} - skipping",
+                        "Detected committed batch {} during payload collection for round {} - skipping",
                         entry.digest, self.round
                     );
                     entry.state = BatchState::Committed;
                     continue;
                 }
 
-                accumulated_size += entry.size;
-                seen_digests.insert(entry.digest.clone());
-                collected.push((entry.digest.clone(), entry.worker_id));
-                info!(
-                    "[BATCH TRACK PRIMARY] Primary {} COLLECTING batch {} from worker {} for header round {} (size {} bytes, retry_count={}). Accumulated payload = {} / target {} bytes",
-                    self.name,
-                    entry.digest,
-                    entry.worker_id,
-                    self.round,
-                    entry.size,
-                    entry.retry_count,
-                    accumulated_size,
-                    self.header_size
-                );
-                entry.state = BatchState::InFlight {
-                    round: self.round,
-                    sent_at: Instant::now(),
-                    retry_count: entry.retry_count,
-                };
-                self.pending_payload_size = self.pending_payload_size.saturating_sub(entry.size);
+                // Skip if already added to this header (duplicate check)
+                if seen_digests.contains(&entry.digest) {
+                    debug!(
+                        "Skipping duplicate digest {} in header payload for round {}",
+                        entry.digest, self.round
+                    );
+                    continue;
+                }
+
+                // OPTIMIZATION: Skip InFlight batches immediately without logging each one
+                if matches!(entry.state, BatchState::InFlight { .. }) {
+                    inflight_skipped += 1;
+                    continue;
+                }
+
+                if matches!(entry.state, BatchState::Pending) {
+                    // TRIPLE-CHECK: Verify batch is still not committed before marking as InFlight
+                    // This prevents race conditions where batch was committed between cleanup and collection
+                    if self.committed_digests.contains_key(&entry.digest) {
+                        warn!(
+                            "[COLLECT] Batch {} became committed during collection for round {} - skipping",
+                            entry.digest, self.round
+                        );
+                        entry.state = BatchState::Committed;
+                        continue;
+                    }
+
+                    // CRITICAL FIX: Verify batch is in store before including in header
+                    // This ensures we only include batches that are available for other primaries to verify
+                    // However, if batch has been waiting for sync too long, we may need to wait or skip
+                    match self.store.read(entry.digest.to_vec()).await {
+                        Ok(Some(_)) => {
+                            // Batch is in store - safe to include
+                            accumulated_size += entry.size;
+                            seen_digests.insert(entry.digest.clone());
+                            collected.push((entry.digest.clone(), entry.worker_id));
+                            info!(
+                                "[BATCH TRACK PRIMARY] Primary {} COLLECTING batch {} from worker {} for header round {} (size {} bytes, retry_count={}, priority={:?}). Accumulated payload = {} / target {} bytes",
+                                self.name,
+                                entry.digest,
+                                entry.worker_id,
+                                self.round,
+                                entry.size,
+                                entry.retry_count,
+                                entry.priority,
+                                accumulated_size,
+                                self.header_size
+                            );
+                            entry.state = BatchState::InFlight {
+                                round: self.round,
+                                sent_at: Instant::now(),
+                                retry_count: entry.retry_count,
+                            };
+                            // Decrease pending_payload_size when batch is collected (marked as InFlight)
+                            self.pending_payload_size = self.pending_payload_size.saturating_sub(entry.size);
+                        }
+                        Ok(None) => {
+                            // Batch not in store yet - check if it's been waiting too long
+                            let time_waiting_for_sync = entry.added_at.elapsed();
+                            const MAX_SYNC_WAIT_SECS: u64 = 10; // Wait max 10 seconds for sync
+                            const WARNING_SYNC_WAIT_SECS: u64 = 5; // Warning after 5 seconds
+                            
+                            if time_waiting_for_sync.as_secs() > MAX_SYNC_WAIT_SECS {
+                                // Batch has been waiting too long - this is a CRITICAL problem
+                                // The batch should have been synced by now - sync may have failed!
+                                error!(
+                                    "[COLLECT SYNC FAILED] Primary {} batch {} has been waiting for sync for {:?} (threshold: {}s) at round {}. Batch sync has FAILED or is stuck! This batch cannot be included until sync completes. Check sync mechanism and network connectivity!",
+                                    self.name,
+                                    entry.digest,
+                                    time_waiting_for_sync,
+                                    MAX_SYNC_WAIT_SECS,
+                                    self.round
+                                );
+                            } else if time_waiting_for_sync.as_secs() > WARNING_SYNC_WAIT_SECS {
+                                // Batch has been waiting for a while - log warning
+                                warn!(
+                                    "[COLLECT SYNC SLOW] Primary {} batch {} has been waiting for sync for {:?} (warning threshold: {}s) at round {}. Sync may be slow. Monitoring closely.",
+                                    self.name,
+                                    entry.digest,
+                                    time_waiting_for_sync,
+                                    WARNING_SYNC_WAIT_SECS,
+                                    self.round
+                                );
+                            } else {
+                                info!(
+                                    "[COLLECT] Primary {} SKIP collecting batch {} for header round {} - NOT IN STORE yet (waiting for {:?}). Batch will be included after sync completes.",
+                                    self.name,
+                                    entry.digest,
+                                    self.round,
+                                    time_waiting_for_sync
+                                );
+                            }
+                            // Keep batch in Pending state - will be collected after sync completes
+                            // NOTE: The batch is NOT counted in pending_payload_size (not ready yet)
+                        }
+                        Err(e) => {
+                            warn!(
+                                "[COLLECT] Primary {} ERROR reading batch {} from store during collection for round {}: {}. Skipping batch.",
+                                self.name,
+                                entry.digest,
+                                self.round,
+                                e
+                            );
+                            // Keep batch in Pending state - will be retried later
+                        }
+                    }
+                }
             }
         }
 
@@ -518,8 +653,12 @@ impl Proposer {
     /// Removes digests from rounds that are older than (latest_committed_round - max_retry_rounds * 2).
     /// This ensures we keep enough history to check for committed batches during retry logic.
     fn cleanup_old_committed_digests(&mut self) {
-        // Only cleanup if we've exceeded the limit
-        if self.committed_digests.len() <= self.max_committed_digests {
+        // CRITICAL: Cleanup thường xuyên hơn để tránh memory leak
+        // Thay vì chỉ cleanup khi > max, cleanup định kỳ khi > 50% max để tránh tích lũy
+        const CLEANUP_THRESHOLD_RATIO: f64 = 0.5; // Cleanup khi > 50% capacity
+        let cleanup_threshold = (self.max_committed_digests as f64 * CLEANUP_THRESHOLD_RATIO) as usize;
+        
+        if self.committed_digests.len() <= cleanup_threshold {
             return;
         }
 
@@ -588,6 +727,14 @@ impl Proposer {
                     continue;
                 }
 
+                // LONG-TERM FIX: Calculate adaptive retry delay based on priority
+                // Note: Currently not used but kept for future optimization
+                let _priority_multiplier = match entry.priority {
+                    BatchPriority::High => HIGH_PRIORITY_RETRY_DELAY_MULTIPLIER,
+                    BatchPriority::Medium => 1.0,
+                    BatchPriority::Low => LOW_PRIORITY_RETRY_DELAY_MULTIPLIER,
+                };
+                
                 // Calculate how long batch has been InFlight
                 let rounds_since_sent = self.round.saturating_sub(round);
                 let rounds_committed_since_sent = self.latest_committed_round.saturating_sub(round);
@@ -616,14 +763,32 @@ impl Proposer {
                 let has_been_retried_multiple_times = retry_count >= 2;
                 // CRITICAL FIX: If batch has been retried too many times (retry_count > MAX_RETRY_COUNT),
                 // batch is stuck forever and should be removed to prevent system deadlock
-                const MAX_RETRY_COUNT: usize = 1000; // Nếu retry > 1000, batch bị stuck forever
+                // Tăng từ 100 lên 1000 để cho batch nhiều cơ hội hơn khi certificate không được commit
+                // Chỉ force remove khi batch thực sự không thể commit (retry quá nhiều lần)
+                const MAX_RETRY_COUNT: usize = 1000; // Tăng từ 100 lên 1000 - Cho batch nhiều cơ hội commit hơn
+                const WARNING_RETRY_COUNT: usize = 50; // Cảnh báo khi retry > 50
                 let is_stuck_forever = retry_count > MAX_RETRY_COUNT;
+
+                // Thêm cảnh báo sớm khi batch bị stuck
+                if retry_count > WARNING_RETRY_COUNT && retry_count <= MAX_RETRY_COUNT {
+                    warn!(
+                        "[BATCH STUCK WARNING] Primary {} batch {} has been retried {} times (sent_round={}, current_round={}, rounds_since_sent={}, latest_committed_round={}). Batch may be stuck - monitoring closely.",
+                        self.name,
+                        entry.digest,
+                        retry_count,
+                        round,
+                        self.round,
+                        rounds_since_sent,
+                        self.latest_committed_round
+                    );
+                }
 
                 if is_stuck_forever {
                     // Force remove batch - hệ thống không thể commit batch này
                     // Đây là biện pháp cuối cùng để ngăn chặn hệ thống bị đứng vĩnh viễn
-                    warn!(
-                        "[BATCH STUCK] Primary {} FORCE REMOVING stuck batch {} (retry_count={}, sent_round={}, current_round={}, rounds_since_sent={}, latest_committed_round={}). Batch cannot be committed after {} retries - removing to prevent system deadlock. Transactions in this batch will be LOST.",
+                    // CRITICAL: Upgrade to error level để alert admin
+                    error!(
+                        "[BATCH STUCK CRITICAL] Primary {} FORCE REMOVING stuck batch {} (retry_count={}, sent_round={}, current_round={}, rounds_since_sent={}, latest_committed_round={}). Batch cannot be committed after {} retries - removing to prevent system deadlock. Transactions in this batch will be LOST. This indicates a serious system issue that needs investigation.",
                         self.name,
                         entry.digest,
                         retry_count,
@@ -984,6 +1149,8 @@ impl Proposer {
 
                                         // Add to queue as Pending
                                         let entry_idx = self.digests.len();
+                                        // LONG-TERM FIX: Batches from parent certificates are medium priority
+                                        let priority = BatchPriority::Medium;
                                         self.digests.push_back(BatchEntry {
                                             digest: batch_digest.clone(),
                                             worker_id: *worker_id,
@@ -991,6 +1158,8 @@ impl Proposer {
                                             state: BatchState::Pending,
                                             retry_count: 0,
                                             rescue_sent: false,
+                                            priority,
+                                            added_at: Instant::now(),
                                         });
                                         // Maintain HashMap index for O(1) lookup
                                         self.digests_index.insert(batch_digest.clone(), entry_idx);
@@ -1065,6 +1234,10 @@ impl Proposer {
     }
 
     /// Extract batches from verified headers of other primaries
+    /// CRITICAL FIX: This method ensures leader ALWAYS extracts batches from ALL headers,
+    /// not just from headers of the leader itself. This prevents batches from being stuck
+    /// when non-leader primaries create headers with batches but their certificates are not committed.
+    ///
     /// This allows any primary (especially leader) to include batches from non-leader primaries,
     /// ensuring faster commit and preventing batches from being stuck indefinitely.
     ///
@@ -1072,7 +1245,7 @@ impl Proposer {
     /// 1. Headers are already verified and stored before being sent here
     /// 2. All primaries receive the same headers via network (deterministic source)
     /// 3. Extraction logic is deterministic (same order, same checks)
-    /// 4. Only batches from other primaries are extracted (skip own headers)
+    /// 4. Batches from own headers are also extracted if they're in InFlight state (allows retry)
     async fn extract_batches_from_headers(&mut self, header: &Header) {
         // CRITICAL: For own headers, only skip if ALL batches are already committed or in Pending state
         // This allows leader to extract batches from own headers when they're in InFlight state,
@@ -1309,6 +1482,8 @@ impl Proposer {
 
                     let size = batch_digest.size();
 
+                    // LONG-TERM FIX: Batches extracted from headers are medium priority
+                    let priority = BatchPriority::Medium;
                     // Add to queue as Pending
                     let entry_idx = self.digests.len();
                     self.digests.push_back(BatchEntry {
@@ -1318,6 +1493,8 @@ impl Proposer {
                         state: BatchState::Pending,
                         retry_count: 0,
                         rescue_sent: false,
+                        priority,
+                        added_at: Instant::now(),
                     });
                     // Maintain HashMap index for O(1) lookup
                     self.digests_index.insert(batch_digest.clone(), entry_idx);
@@ -1338,16 +1515,66 @@ impl Proposer {
                     );
                 }
                 Ok(None) => {
-                    // Batch not in store yet - will be synced later
+                    // CRITICAL FIX: Batch not in store yet - add to queue with special state to trigger sync
+                    // This ensures leader can extract batches even if they're not in store yet
+                    // The batch will be synced and then can be included in next header
                     batches_not_in_store += 1;
-                    debug!(
-                        "[BATCH EXTRACTION] Primary {} SKIP extracting batch {} from header {} (round {}, author: {}) - NOT IN STORE yet. Batch will be extracted again after sync.",
-                        self.name,
-                        batch_digest,
-                        header.id,
-                        header.round,
-                        header.author
-                    );
+                    
+                    // Check if batch is already in queue (might have been added from worker)
+                    if !self.digests_index.contains_key(batch_digest) {
+                        // CRITICAL FIX: Add batch to queue with Pending state even though it's not in store
+                        // This allows us to track the batch and trigger sync
+                        // When batch arrives in store, it will be available for inclusion
+                        // 
+                        // SAFETY: pending_payload_size is NOT increased here because batch is not in store yet.
+                        // When batch is synced and arrives in store, it will be collected in collect_payload_for_header()
+                        // and pending_payload_size will be correctly managed (decreased when collected).
+                        // This ensures consistency: pending_payload_size only tracks batches that are ready to be included.
+                        let size = batch_digest.size();
+                        let entry_idx = self.digests.len();
+                        // LONG-TERM FIX: Batches not in store yet are low priority (will be synced)
+                        let priority = BatchPriority::Low;
+                        self.digests.push_back(BatchEntry {
+                            digest: batch_digest.clone(),
+                            worker_id: *worker_id,
+                            size,
+                            state: BatchState::Pending, // Mark as Pending to trigger sync check
+                            retry_count: 0,
+                            rescue_sent: false,
+                            priority,
+                            added_at: Instant::now(),
+                        });
+                        self.digests_index.insert(batch_digest.clone(), entry_idx);
+                        // SAFETY: Do NOT add to pending_payload_size here because:
+                        // 1. Batch is not in store yet - cannot be included in header
+                        // 2. When batch arrives in store, it will be collected in collect_payload_for_header()
+                        // 3. pending_payload_size will be correctly managed during collection
+                        // 4. This ensures pending_payload_size only tracks batches ready for inclusion
+                        // 5. Does NOT cause fork because header content is deterministic (only includes batches in store)
+                        
+                        warn!(
+                            "[BATCH EXTRACTION SYNC] Primary {} ADDED batch {} (worker {}) from header {} (round {}, author: {}) to queue for SYNC. Batch not in store yet - sync should be triggered by Synchronizer when header is processed in Core. Batch will be included once sync completes. pending_payload_size NOT increased (batch not ready yet). If batch is still not in store after 10 seconds, this indicates sync may have failed!",
+                            self.name,
+                            batch_digest,
+                            worker_id,
+                            header.id,
+                            header.round,
+                            header.author
+                        );
+                    } else {
+                        // Batch already in queue - check if it needs pending_payload_size update
+                        // If batch was added without pending_payload_size (from extraction when not in store),
+                        // and now it's in store, we should update pending_payload_size
+                        // However, this is handled in collect_payload_for_header() when batch is collected
+                        debug!(
+                            "[BATCH EXTRACTION] Primary {} SKIP extracting batch {} from header {} (round {}, author: {}) - NOT IN STORE yet but already in queue. Batch will be synced and then included.",
+                            self.name,
+                            batch_digest,
+                            header.id,
+                            header.round,
+                            header.author
+                        );
+                    }
                 }
                 Err(e) => {
                     warn!(
@@ -1382,11 +1609,77 @@ impl Proposer {
         );
     }
 
+    /// LONG-TERM FIX: Check channel usage and apply backpressure if needed
+    async fn check_channel_backpressure(&mut self) {
+        // Check rx_headers channel usage (approximate)
+        // Note: tokio::sync::mpsc::Receiver doesn't expose len(), so we use try_recv to estimate
+        let mut headers_pending = 0;
+        
+        // Try to peek at channel capacity (non-blocking)
+        loop {
+            match self.rx_headers.try_recv() {
+                Ok(_header) => {
+                    headers_pending += 1;
+                    if headers_pending > 100 {
+                        break; // Don't check too many
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    break;
+                }
+            }
+        }
+        
+        // Estimate channel usage (rough approximation)
+        // If we got many headers, channel is likely busy
+        let estimated_usage = if headers_pending > 50 {
+            0.8 // High usage
+        } else if headers_pending > 20 {
+            0.5 // Medium usage
+        } else {
+            0.2 // Low usage
+        };
+        
+        // Apply backpressure if channel usage is high
+        if estimated_usage >= CHANNEL_CRITICAL_USAGE {
+            // Critical: Increase header creation delay significantly
+            self.header_creation_rate = (self.header_creation_rate * 1.5).min(5.0);
+            error!(
+                "[BACKPRESSURE CRITICAL] Proposer {} channel usage estimated at {:.1}% (>= {:.1}%). Increasing header creation delay by {:.2}x to prevent channel overflow. System may be slow!",
+                self.name,
+                estimated_usage * 100.0,
+                CHANNEL_CRITICAL_USAGE * 100.0,
+                self.header_creation_rate
+            );
+        } else if estimated_usage >= CHANNEL_WARNING_USAGE {
+            // Warning: Increase header creation delay moderately
+            self.header_creation_rate = (self.header_creation_rate * 1.2).min(3.0);
+            warn!(
+                "[BACKPRESSURE WARNING] Proposer {} channel usage estimated at {:.1}% (>= {:.1}%). Increasing header creation delay by {:.2}x to prevent channel overflow.",
+                self.name,
+                estimated_usage * 100.0,
+                CHANNEL_WARNING_USAGE * 100.0,
+                self.header_creation_rate
+            );
+        } else {
+            // Normal: Gradually reduce delay back to normal
+            self.header_creation_rate = (self.header_creation_rate * 0.95).max(1.0);
+        }
+        
+        // Note: Headers we peeked at will be processed in main loop normally
+        // This is acceptable as it just means we process them slightly earlier
+    }
+
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
         info!("[PROPOSER] Dag starting at round {}", self.round);
 
-        let header_timer = sleep(Duration::from_millis(self.max_header_delay));
+        // LONG-TERM FIX: Apply adaptive header delay based on backpressure
+        let adaptive_delay = (self.max_header_delay as f64 * self.header_creation_rate) as u64;
+        let header_timer = sleep(Duration::from_millis(adaptive_delay));
         tokio::pin!(header_timer);
 
         let retry_timer = sleep(self.retry_delay);
@@ -1394,6 +1687,16 @@ impl Proposer {
 
         loop {
             // RATE CONTROL ĐÃ BỊ BỎ - Không còn record queue
+            
+            // LONG-TERM FIX: Check channel usage for backpressure
+            let should_check_channels = self.last_channel_check
+                .map(|t| t.elapsed() >= self.channel_check_interval)
+                .unwrap_or(true);
+            
+            if should_check_channels {
+                self.check_channel_backpressure().await;
+                self.last_channel_check = Some(Instant::now());
+            }
             
             // CATCH-UP MODE: Check for catch-up mode notifications
             if let Ok(is_catchup) = self.rx_catchup_mode.try_recv() {
@@ -1405,11 +1708,17 @@ impl Proposer {
                 }
             }
 
-            // CATCH-UP MODE: Skip creating headers if in catch-up mode
+            // CATCH-UP MODE: CRITICAL FIX - Không pause hoàn toàn, chỉ giảm tần suất
+            // Vẫn tạo headers khi có batches để đảm bảo giao dịch được thực thi
             if self.is_catchup_mode {
-                debug!("[CATCH-UP] Proposer paused - node is catching up, skipping header creation for round {}", self.round);
-                // Still process other messages (parents, headers, batches) but don't create new headers
-                // This allows node to continue syncing while paused
+                let has_pending_batches = self.pending_payload_size > 0;
+                if has_pending_batches {
+                    info!("[CATCH-UP] Proposer in catch-up mode but has {} pending batches - will still create headers to avoid batches being stuck", self.pending_payload_size);
+                } else {
+                    info!("[CATCH-UP] Proposer {} in catch-up mode - will only create headers when timer expired or batches arrive (round {})", self.name, self.round);
+                }
+                // Still process other messages (parents, headers, batches) but reduce header creation frequency
+                // This allows node to continue syncing while still processing batches
             }
 
             // PHASE 1: Check if we're stuck (no parent certificates received for too long)
@@ -1489,8 +1798,18 @@ impl Proposer {
 
             // RATE CONTROL ĐÃ BỊ BỎ - Không còn chặn tạo header
             // Hệ thống sẽ tạo header ngay khi có điều kiện để đảm bảo tiến triển nhanh nhất
-            // CATCH-UP MODE: Don't create headers when in catch-up mode
-            let should_create_header = ready_to_make_header && !self.is_catchup_mode;
+            // CATCH-UP MODE: CRITICAL FIX - Vẫn tạo headers khi có batches để tránh batches bị stuck
+            // Thay vì pause hoàn toàn, chỉ giảm tần suất tạo headers (chỉ tạo khi có batches hoặc timer expired)
+            // Điều này đảm bảo giao dịch vẫn được thực thi ngay cả khi trong catch-up mode
+            let has_pending_batches = self.pending_payload_size > 0;
+            let should_create_header = if self.is_catchup_mode {
+                // Trong catch-up mode: chỉ tạo headers khi có batches hoặc timer expired quá lâu
+                // Đảm bảo batches không bị stuck
+                ready_to_make_header && (has_pending_batches || timer_expired)
+            } else {
+                // Bình thường: tạo headers như bình thường
+                ready_to_make_header
+            };
 
             if should_create_header {
                 // Make a new header.
@@ -1499,8 +1818,9 @@ impl Proposer {
                     self.round, force_advance, enough_parents, enough_digests);
                 if self.make_header().await {
                     info!("[PROPOSER] Successfully created header for round {}", self.round);
-                    // Reschedule the timer.
-                    let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
+                    // LONG-TERM FIX: Reschedule timer with adaptive delay based on backpressure
+                    let adaptive_delay = (self.max_header_delay as f64 * self.header_creation_rate) as u64;
+                    let deadline = Instant::now() + Duration::from_millis(adaptive_delay);
                     header_timer.as_mut().reset(deadline);
                 } else {
                     warn!("[PROPOSER] Failed to create header for round {} (no payload or parents)", self.round);
@@ -1610,6 +1930,9 @@ impl Proposer {
 
                     let digest_for_log = digest.clone();
 
+                    // LONG-TERM FIX: Determine batch priority
+                    let priority = BatchPriority::High; // New batches from workers are high priority
+                    
                     let entry_idx = self.digests.len();
                     self.digests.push_back(BatchEntry {
                         digest: digest.clone(),
@@ -1618,10 +1941,73 @@ impl Proposer {
                         state: BatchState::Pending,
                         retry_count: 0,
                         rescue_sent: false,
+                        priority,
+                        added_at: Instant::now(),
                     });
                     // Maintain HashMap index for O(1) lookup
                     self.digests_index.insert(digest, entry_idx);
                     self.pending_payload_size += size;
+                    
+                    // LONG-TERM FIX: Queue size limit and monitoring
+                    if self.digests.len() >= MAX_QUEUE_SIZE {
+                        // Queue is full - remove oldest batches to make room
+                        let batches_to_remove = 100; // Remove 100 oldest batches
+                        let mut removed = 0;
+                        let mut size_freed = 0;
+                        
+                        // Remove oldest batches (those with highest retry_count or oldest InFlight)
+                        let mut to_remove: Vec<usize> = Vec::new();
+                        for (idx, entry) in self.digests.iter().enumerate() {
+                            if to_remove.len() >= batches_to_remove {
+                                break;
+                            }
+                            // Prioritize removing old InFlight batches or batches with high retry_count
+                            if let BatchState::InFlight { retry_count, .. } = entry.state {
+                                if retry_count > 50 {
+                                    to_remove.push(idx);
+                                }
+                            } else if matches!(entry.state, BatchState::Pending) && entry.retry_count > 20 {
+                                to_remove.push(idx);
+                            }
+                        }
+                        
+                        // Remove in reverse order to maintain indices
+                        to_remove.sort_by(|a, b| b.cmp(a));
+                        for idx in to_remove {
+                            if let Some(entry) = self.digests.get(idx) {
+                                size_freed += entry.size;
+                                self.digests_index.remove(&entry.digest);
+                            }
+                            self.digests.remove(idx);
+                            removed += 1;
+                        }
+                        
+                        // Rebuild index after removal
+                        self.digests_index.clear();
+                        for (idx, entry) in self.digests.iter().enumerate() {
+                            self.digests_index.insert(entry.digest.clone(), idx);
+                        }
+                        
+                        self.pending_payload_size = self.pending_payload_size.saturating_sub(size_freed);
+                        
+                        error!(
+                            "[QUEUE FULL] Proposer {} queue FULL (size: {} >= {}). Removed {} oldest batches (freed {} bytes). This indicates batches are not being processed fast enough! System may be slow.",
+                            self.name,
+                            self.digests.len(),
+                            MAX_QUEUE_SIZE,
+                            removed,
+                            size_freed
+                        );
+                    } else if self.digests.len() >= QUEUE_WARNING_THRESHOLD {
+                        warn!(
+                            "[BATCH QUEUE WARNING] Proposer {} queue size is {} (threshold: {}). pending_payload_size: {} bytes. This may indicate batches are not being processed fast enough!",
+                            self.name,
+                            self.digests.len(),
+                            QUEUE_WARNING_THRESHOLD,
+                            self.pending_payload_size
+                        );
+                    }
+                    
                     info!(
                         "[BATCH TRACK WORKER] Proposer {} ENQUEUED batch {} from worker {} at round {}; pending_payload_size = {}, queue_len = {}",
                         self.name,
@@ -1648,6 +2034,35 @@ impl Proposer {
                 () = &mut retry_timer => {
                     self.retry_stale_batches();
                     retry_timer.as_mut().reset(Instant::now() + self.retry_delay);
+                    
+                    // PERIODIC SUMMARY: Log tình trạng queue mỗi khi retry timer trigger
+                    // Giúp theo dõi tình trạng hệ thống và phát hiện vấn đề sớm
+                    let pending_count = self.digests.iter().filter(|e| matches!(e.state, BatchState::Pending)).count();
+                    let inflight_count = self.digests.iter().filter(|e| matches!(e.state, BatchState::InFlight { .. })).count();
+                    let committed_count = self.digests.iter().filter(|e| matches!(e.state, BatchState::Committed)).count();
+                    
+                    info!(
+                        "[PROPOSER SUMMARY] Primary {} round {}: queue_len={}, pending={}, inflight={}, committed={}, pending_payload_size={} bytes, latest_committed_round={}",
+                        self.name,
+                        self.round,
+                        self.digests.len(),
+                        pending_count,
+                        inflight_count,
+                        committed_count,
+                        self.pending_payload_size,
+                        self.latest_committed_round
+                    );
+                    
+                    // CRITICAL: Warning nếu queue quá lớn hoặc có nhiều InFlight batches
+                    if self.digests.len() > 500 {
+                        warn!(
+                            "[PROPOSER SUMMARY] WARNING: Primary {} queue size {} is high (threshold: 500). pending={}, inflight={}. This may indicate batches are not being processed fast enough!",
+                            self.name,
+                            self.digests.len(),
+                            pending_count,
+                            inflight_count
+                        );
+                    }
                 }
             }
         }

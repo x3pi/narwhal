@@ -4,7 +4,7 @@ use crate::messages::{Certificate, Header, Vote};
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature};
-use log::debug;
+use log::{debug, info};
 use std::collections::HashSet;
 
 /// Aggregates votes for a particular header into a certificate.
@@ -61,14 +61,16 @@ impl VotesAggregator {
                 .cloned()
                 .collect();
             missing.sort();
-            debug!(
-                "VotesAggregator: header {} (round {}) has stake {}/{} (missing {}). Waiting for authorities: {:?}",
+            // MONITORING: Upgrade to info level để dễ kiểm tra tại sao không đủ votes
+            log::info!(
+                "[VOTE AGGREGATION] Header {} (round {}) has stake {}/{} (missing {}). Waiting for authorities: {:?}. Current voters: {:?}",
                 header.id,
                 header.round,
                 current_weight,
                 threshold,
                 missing_stake,
-                missing
+                missing,
+                self.used.iter().collect::<Vec<_>>()
             );
         }
         Ok(None)

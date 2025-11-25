@@ -15,7 +15,7 @@ use bytes::Bytes;
 use config::{Committee, KeyPair, Parameters, WorkerId};
 use crypto::{Digest, PublicKey, SignatureService};
 use dashmap::DashMap;
-use log::info;
+use log::{error, info};
 use network::{
     quic::QuicTransport, // <--- THAY ĐỔI
     transport::Transport,
@@ -34,9 +34,9 @@ pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 // CHANNEL_CAPACITY: Buffer size của tokio mpsc channel
 // - Channel tự động dọn dẹp khi receiver nhận messages
 // - Nếu receiver (proposer) xử lý chậm hơn sender (core), channel sẽ tích lũy
-// - Capacity lớn chỉ là workaround tạm thời, giải pháp tốt nhất là đảm bảo proposer xử lý nhanh
-// - 10_000 là đủ cho burst headers, không quá lớn để tránh memory leak
-pub const CHANNEL_CAPACITY: usize = 10_000;
+// - Giảm capacity xuống 5_000 để phát hiện lỗi sớm hơn (thay vì chờ 2 tiếng)
+// - Nếu channel đầy, lỗi sẽ xuất hiện nhanh hơn → dễ debug hơn
+pub const CHANNEL_CAPACITY: usize = 5_000;
 pub type Round = u64;
 
 #[derive(Debug, Clone)]
@@ -152,6 +152,7 @@ impl Primary {
         NetworkReceiver::spawn(
             worker_listener,
             WorkerReceiverHandler {
+                name: name.clone(),
                 tx_our_digests,
                 tx_others_digests,
             },
@@ -286,6 +287,7 @@ impl MessageHandler for PrimaryReceiverHandler {
 
 #[derive(Clone)]
 struct WorkerReceiverHandler {
+    name: PublicKey,
     tx_our_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
     tx_others_digests: Sender<(Digest, WorkerId, Vec<u8>)>,
 }
@@ -298,16 +300,52 @@ impl MessageHandler for WorkerReceiverHandler {
         serialized: Bytes,
     ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
-            WorkerPrimaryMessage::OurBatch(digest, worker_id, batch) => self
-                .tx_our_digests
-                .send((digest, worker_id, batch))
-                .await
-                .expect("Failed to send workers' digests"),
-            WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch) => self
-                .tx_others_digests
-                .send((digest, worker_id, batch))
-                .await
-                .expect("Failed to send workers' digests"),
+            WorkerPrimaryMessage::OurBatch(digest, worker_id, batch) => {
+                let batch_size = batch.len();
+                info!(
+                    "[PRIMARY RX WORKER] Primary {} received OurBatch {} from worker {} ({} bytes)",
+                    self.name, digest, worker_id, batch_size
+                );
+                match self.tx_our_digests.send((digest.clone(), worker_id, batch)).await {
+                    Ok(()) => {
+                        info!(
+                            "[PRIMARY RX WORKER] Primary {} successfully sent batch {} from worker {} to proposer channel",
+                            self.name, digest, worker_id
+                        );
+                    }
+                    Err(e) => {
+                        // CRITICAL ERROR: Channel đầy hoặc đóng - batches không được gửi tới proposer
+                        // Đây là nguyên nhân chính khiến worker 0 bị đứng
+                        error!(
+                            "[PRIMARY RX WORKER] CRITICAL: Primary {} FAILED to send batch {} from worker {} to proposer channel: {}. Channel may be full! This will cause batches to be stuck and worker to stop processing!",
+                            self.name, digest, worker_id, e
+                        );
+                        // Không panic, chỉ log error để hệ thống tiếp tục chạy
+                    }
+                }
+            }
+            WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch) => {
+                let batch_size = batch.len();
+                info!(
+                    "[PRIMARY RX WORKER] Primary {} received OthersBatch {} from worker {} ({} bytes)",
+                    self.name, digest, worker_id, batch_size
+                );
+                match self.tx_others_digests.send((digest.clone(), worker_id, batch)).await {
+                    Ok(()) => {
+                        info!(
+                            "[PRIMARY RX WORKER] Primary {} successfully sent batch {} from worker {} to payload receiver channel",
+                            self.name, digest, worker_id
+                        );
+                    }
+                    Err(e) => {
+                        // CRITICAL ERROR: Channel đầy hoặc đóng
+                        error!(
+                            "[PRIMARY RX WORKER] CRITICAL: Primary {} FAILED to send batch {} from worker {} to payload receiver channel: {}. Channel may be full!",
+                            self.name, digest, worker_id, e
+                        );
+                    }
+                }
+            }
         }
         Ok(())
     }

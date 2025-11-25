@@ -769,6 +769,15 @@ impl Consensus {
                         let cert_digest = certificate.digest();
                         let cert_round = certificate.round();
                         let batch_count = certificate.header.payload.len();
+                        
+                        // CRITICAL: Warning khi certificate empty
+                        if batch_count == 0 {
+                            warn!(
+                                "[CONSENSUS OUTPUT] WARNING: Certificate {} (round {}) has EMPTY payload (0 batches). This may indicate batches are not being included in headers!",
+                                cert_digest, cert_round
+                            );
+                        }
+                        
                         match self.tx_output.send(certificate).await {
                             Ok(()) => {
                                 info!(

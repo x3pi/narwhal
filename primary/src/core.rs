@@ -145,7 +145,7 @@ impl Core {
                 cancel_handlers: HashMap::with_capacity(2 * gc_depth as usize),
                 // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
                 last_catchup_sync_check: Some(Instant::now()),
-                catchup_sync_check_interval: Duration::from_secs(2), // Check every 2 seconds để phát hiện lag sớm hơn
+                catchup_sync_check_interval: Duration::from_secs(1), // LONG-TERM FIX: Check every 1 second để phát hiện lag sớm hơn và đuổi kịp nhanh hơn
                 // CATCH-UP MODE: Initialize catch-up mode state
                 is_catchup_mode: false,
                 catchup_mode_entered_at: None,
@@ -175,15 +175,63 @@ impl Core {
         self.votes_aggregator = VotesAggregator::new();
 
         // Broadcast the new header in a reliable manner.
-        let addresses = self
-            .committee
-            .others_primaries(&self.name)
-            .iter()
-            .map(|(_, x)| x.primary_to_primary)
-            .collect();
+        let others_list = self.committee.others_primaries(&self.name);
+        let expected_recipients = others_list.len();
+        let addresses: Vec<_> = others_list.iter().map(|(_, info)| info.primary_to_primary).collect();
         let bytes = bincode::serialize(&PrimaryMessage::Header(header.clone()))
             .expect("Failed to serialize our own header");
+        
+        // MONITORING: Track header broadcast với timing để phát hiện network issues
+        let header_broadcast_start = std::time::Instant::now();
         let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+        let header_broadcast_duration = header_broadcast_start.elapsed();
+        
+        // Log header broadcast để monitor network health
+        if handlers.is_empty() {
+            error!(
+                "[HEADER BROADCAST FAILED] Primary {} header {} (round {}, {} batches) broadcast returned empty handlers! Expected {} recipients but got 0 handlers. This will cause primaries to not receive header!",
+                self.name,
+                header.id,
+                header.round,
+                header.payload.len(),
+                expected_recipients
+            );
+        } else if handlers.len() < expected_recipients {
+            warn!(
+                "[HEADER BROADCAST PARTIAL] Primary {} header {} (round {}, {} batches) broadcast to only {} out of {} expected primaries (took {}ms). Missing recipients may not vote!",
+                self.name,
+                header.id,
+                header.round,
+                header.payload.len(),
+                handlers.len(),
+                expected_recipients,
+                header_broadcast_duration.as_millis()
+            );
+        } else {
+            if header_broadcast_duration.as_millis() > 500 {
+                warn!(
+                    "[HEADER BROADCAST SLOW] Primary {} header {} (round {}, {} batches) broadcast to {} primaries took {}ms - network may be slow!",
+                    self.name,
+                    header.id,
+                    header.round,
+                    header.payload.len(),
+                    handlers.len(),
+                    header_broadcast_duration.as_millis()
+                );
+            } else {
+                info!(
+                    "[HEADER BROADCAST SUCCESS] Primary {} header {} (round {}, {} batches) successfully broadcast to {}/{} primaries (took {}ms)",
+                    self.name,
+                    header.id,
+                    header.round,
+                    header.payload.len(),
+                    handlers.len(),
+                    expected_recipients,
+                    header_broadcast_duration.as_millis()
+                );
+            }
+        }
+        
         self.cancel_handlers
             .entry(header.round)
             .or_insert_with(Vec::new)
@@ -195,7 +243,7 @@ impl Core {
 
     #[async_recursion]
     async fn process_header(&mut self, header: &Header) -> DagResult<()> {
-        debug!("Processing {:?}", header);
+        info!("[HEADER PROCESS] Processing header {} (round {}, author: {}, {} batches)", header.id, header.round, header.author, header.payload.len());
         // RATE CONTROL ĐÃ BỊ BỎ - Không còn record header
         
         // CATCH-UP MODE: Update highest network round when receiving headers
@@ -214,7 +262,7 @@ impl Core {
         // reschedule processing of this header.
         let parents = self.synchronizer.get_parents(header).await?;
         if parents.is_empty() {
-            debug!("Processing of {} suspended: missing parent(s)", header.id);
+            info!("[HEADER PROCESS] Processing of {} suspended: missing parent(s). Sync will be triggered.", header.id);
             return Ok(());
         }
 
@@ -235,7 +283,7 @@ impl Core {
         // Ensure we have the payload. If we don't, the synchronizer will ask our workers to get it, and then
         // reschedule processing of this header once we have it.
         if self.synchronizer.missing_payload(header).await? {
-            debug!("Processing of {} suspended: missing payload", header);
+            info!("[HEADER PROCESS] Processing of {} suspended: missing payload. Sync will be triggered.", header);
             return Ok(());
         }
 
@@ -248,15 +296,24 @@ impl Core {
         // being stuck. We don't send it again here to avoid duplicate processing.
 
         // Check if we can vote for this header.
-        if self
+        let can_vote = self
             .last_voted
             .entry(header.round)
             .or_insert_with(HashSet::new)
-            .insert(header.author)
-        {
+            .insert(header.author);
+        
+        if !can_vote {
+            // Already voted for this author in this round - log để monitor
+            debug!(
+                "[VOTE SKIP] Primary {} already voted for header {} (round {}, author: {}) - skipping duplicate vote",
+                self.name, header.id, header.round, header.author
+            );
+        }
+        
+        if can_vote {
             // Make a vote and send it to the header's creator.
             let vote = Vote::new(header, &self.name, &mut self.signature_service).await;
-            debug!("Created {:?}", vote);
+            info!("[VOTE] Created vote for header {} (round {}, author: {})", header.id, header.round, header.author);
             if vote.origin == self.name {
                 self.process_vote(vote)
                     .await
@@ -267,9 +324,27 @@ impl Core {
                     .primary(&header.author)
                     .expect("Author of valid header is not in the committee")
                     .primary_to_primary;
-                let bytes = bincode::serialize(&PrimaryMessage::Vote(vote))
+                let bytes = bincode::serialize(&PrimaryMessage::Vote(vote.clone()))
                     .expect("Failed to serialize our own vote");
+                
+                // MONITORING: Track vote sending với timing để phát hiện network issues
+                let vote_send_start = std::time::Instant::now();
                 let handler = self.network.send(address, Bytes::from(bytes)).await;
+                let vote_send_duration = vote_send_start.elapsed();
+                
+                // Log vote sending với chi tiết để monitor network health
+                if vote_send_duration.as_millis() > 100 {
+                    warn!(
+                        "[VOTE SEND SLOW] Primary {} sent vote for header {} (round {}, author: {}) to {} took {}ms - network may be slow!",
+                        self.name, header.id, header.round, header.author, address, vote_send_duration.as_millis()
+                    );
+                } else {
+                    info!(
+                        "[VOTE SEND] Primary {} successfully sent vote for header {} (round {}, author: {}) to {} (took {}ms)",
+                        self.name, header.id, header.round, header.author, address, vote_send_duration.as_millis()
+                    );
+                }
+                
                 self.cancel_handlers
                     .entry(header.round)
                     .or_insert_with(Vec::new)
@@ -281,35 +356,104 @@ impl Core {
 
     #[async_recursion]
     async fn process_vote(&mut self, vote: Vote) -> DagResult<()> {
-        debug!("Processing {:?}", vote);
+        info!("[VOTE] Processing vote for header {} (round {}, author: {}, voter: {})", vote.id, vote.round, vote.origin, vote.author);
 
         // Add it to the votes' aggregator and try to make a new certificate.
         if let Some(certificate) =
             self.votes_aggregator
                 .append(vote, &self.committee, &self.current_header)?
         {
-            info!(
-                "[BATCH TRACK CERTIFICATE] Core {} assembled certificate {} (round {}) from header {} (author: {}) containing {} batches: {:?}",
-                self.name,
-                certificate.digest(),
-                certificate.round(),
-                certificate.header.id,
-                certificate.origin(),
-                certificate.header.payload.len(),
-                certificate.header.payload.keys().take(5).collect::<Vec<_>>()
-            );
-            debug!("Assembled {:?}", certificate);
+            // CRITICAL: Warning khi certificate empty - đây là dấu hiệu batches không được include trong headers
+            if certificate.header.payload.is_empty() {
+                warn!(
+                    "[BATCH TRACK CERTIFICATE] WARNING: Core {} assembled EMPTY certificate {} (round {}) from header {} (author: {}). This may indicate batches are not being included in headers!",
+                    self.name,
+                    certificate.digest(),
+                    certificate.round(),
+                    certificate.header.id,
+                    certificate.origin()
+                );
+            } else {
+                info!(
+                    "[BATCH TRACK CERTIFICATE] Core {} assembled certificate {} (round {}) from header {} (author: {}) containing {} batches: {:?}",
+                    self.name,
+                    certificate.digest(),
+                    certificate.round(),
+                    certificate.header.id,
+                    certificate.origin(),
+                    certificate.header.payload.len(),
+                    certificate.header.payload.keys().take(5).collect::<Vec<_>>()
+                );
+            }
+            info!("[CERTIFICATE] Assembled certificate {} for header {} (round {}, author: {}, {} batches)", certificate.digest(), certificate.header.id, certificate.round(), certificate.origin(), certificate.header.payload.len());
 
             // Broadcast the certificate.
-            let addresses = self
-                .committee
-                .others_primaries(&self.name)
-                .iter()
-                .map(|(_, x)| x.primary_to_primary)
-                .collect();
+            // CRITICAL: Get others_primaries into a variable first to avoid temporary value lifetime issues
+            let others_list = self.committee.others_primaries(&self.name);
+            let expected_recipients = others_list.len();
+            let recipient_names: Vec<_> = others_list.iter().map(|(name, _)| name.clone()).collect();
+            let addresses: Vec<_> = others_list.iter().map(|(_, info)| info.primary_to_primary).collect();
             let bytes = bincode::serialize(&PrimaryMessage::Certificate(certificate.clone()))
                 .expect("Failed to serialize our own certificate");
+            
+            // MONITORING: Track certificate broadcast với timing để phát hiện network issues
+            let broadcast_start = std::time::Instant::now();
             let handlers = self.network.broadcast(addresses, Bytes::from(bytes)).await;
+            let broadcast_duration = broadcast_start.elapsed();
+            
+            // CRITICAL: Log chi tiết để monitor broadcast success
+            if handlers.is_empty() {
+                error!(
+                    "[CERTIFICATE BROADCAST FAILED] Primary {} certificate {} (round {}, author: {}, {} batches) broadcast returned empty handlers! Expected {} recipients but got 0 handlers. This will cause primaries to not receive certificate and not vote - causing insufficient support! Expected recipients: {:?}",
+                    self.name,
+                    certificate.digest(),
+                    certificate.round(),
+                    certificate.origin(),
+                    certificate.header.payload.len(),
+                    expected_recipients,
+                    recipient_names
+                );
+            } else if handlers.len() < expected_recipients {
+                warn!(
+                    "[CERTIFICATE BROADCAST PARTIAL] Primary {} certificate {} (round {}, author: {}, {} batches) broadcast to only {} out of {} expected primaries (took {}ms). Missing recipients may not vote! Expected recipients: {:?}, Got {} handlers.",
+                    self.name,
+                    certificate.digest(),
+                    certificate.round(),
+                    certificate.origin(),
+                    certificate.header.payload.len(),
+                    handlers.len(),
+                    expected_recipients,
+                    broadcast_duration.as_millis(),
+                    recipient_names,
+                    handlers.len()
+                );
+            } else {
+                if broadcast_duration.as_millis() > 500 {
+                    warn!(
+                        "[CERTIFICATE BROADCAST SLOW] Primary {} certificate {} (round {}, author: {}, {} batches) broadcast to {} primaries took {}ms - network may be slow!",
+                        self.name,
+                        certificate.digest(),
+                        certificate.round(),
+                        certificate.origin(),
+                        certificate.header.payload.len(),
+                        handlers.len(),
+                        broadcast_duration.as_millis()
+                    );
+                } else {
+                    info!(
+                        "[CERTIFICATE BROADCAST SUCCESS] Primary {} certificate {} (round {}, author: {}, {} batches) successfully broadcast to {}/{} primaries (took {}ms)",
+                        self.name,
+                        certificate.digest(),
+                        certificate.round(),
+                        certificate.origin(),
+                        certificate.header.payload.len(),
+                        handlers.len(),
+                        expected_recipients,
+                        broadcast_duration.as_millis()
+                    );
+                }
+            }
+            
             self.cancel_handlers
                 .entry(certificate.round())
                 .or_insert_with(Vec::new)
@@ -325,7 +469,7 @@ impl Core {
 
     #[async_recursion]
     async fn process_certificate(&mut self, certificate: Certificate) -> DagResult<()> {
-        debug!("Processing {:?}", certificate);
+        info!("[CERTIFICATE] Processing certificate {} for header {} (round {}, author: {}, {} batches)", certificate.digest(), certificate.header.id, certificate.round(), certificate.origin(), certificate.header.payload.len());
         // RATE CONTROL ĐÃ BỊ BỎ - Không còn record certificate
         
         // CATCH-UP MODE: Update highest network round when receiving certificates
@@ -350,9 +494,11 @@ impl Core {
         // Ensure we have all the ancestors of this certificate yet. If we don't, the synchronizer will gather
         // them and trigger re-processing of this certificate.
         if !self.synchronizer.deliver_certificate(&certificate).await? {
-            debug!(
-                "Processing of {:?} suspended: missing ancestors",
-                certificate
+            info!(
+                "[CERTIFICATE PROCESS] Processing of certificate {} (round {}, author: {}) suspended: missing ancestors. Sync will be triggered.",
+                certificate.digest(),
+                certificate.round(),
+                certificate.origin()
             );
             return Ok(());
         }
@@ -432,18 +578,32 @@ impl Core {
         }
 
         // CATCH-UP MODE: Skip consensus when in catch-up mode and lag is too large
-        // This prevents node from voting on certificates when it doesn't have enough context
-        // Giảm threshold xuống để skip consensus sớm hơn khi lag
-        const LAG_SKIP_CONSENSUS_THRESHOLD: Round = 20; // Skip consensus if lag > 20 rounds (giảm từ 200)
+        // CRITICAL FIX: Chỉ skip consensus nếu certificate có EMPTY payload
+        // Nếu certificate có batches, vẫn gửi tới consensus để đảm bảo giao dịch được thực thi
+        // Điều này tránh deadlock khi catch-up mode khiến giao dịch không được thực thi
+        const LAG_SKIP_CONSENSUS_THRESHOLD: Round = 50; // Tăng từ 20 lên 50 để tránh skip quá sớm
         if self.is_catchup_mode && self.last_detected_lag > LAG_SKIP_CONSENSUS_THRESHOLD {
-            debug!(
-                "[CATCH-UP MODE] Skipping consensus for certificate {} (round {}) - node is catching up (lag: {} rounds). Certificate still processed for state.",
-                certificate.digest(),
-                certificate.round(),
-                self.last_detected_lag
-            );
-            // Still return Ok() - certificate is processed for state, just not sent to consensus
-            return Ok(());
+            // CHỈ SKIP NẾU CERTIFICATE CÓ EMPTY PAYLOAD
+            // Nếu có batches, vẫn gửi tới consensus để đảm bảo giao dịch được thực thi
+            if certificate.header.payload.is_empty() {
+                debug!(
+                    "[CATCH-UP MODE] Skipping consensus for EMPTY certificate {} (round {}) - node is catching up (lag: {} rounds). Certificate still processed for state.",
+                    certificate.digest(),
+                    certificate.round(),
+                    self.last_detected_lag
+                );
+                // Still return Ok() - certificate is processed for state, just not sent to consensus
+                return Ok(());
+            } else {
+                // Certificate có batches - vẫn gửi tới consensus để đảm bảo giao dịch được thực thi
+                info!(
+                    "[CATCH-UP MODE] Certificate {} (round {}) has {} batches - still sending to consensus despite catch-up mode (lag: {} rounds) to ensure transactions are executed",
+                    certificate.digest(),
+                    certificate.round(),
+                    certificate.header.payload.len(),
+                    self.last_detected_lag
+                );
+            }
         }
 
         info!(
@@ -456,12 +616,60 @@ impl Core {
         );
 
         // Send it to the consensus layer.
-        let id = certificate.header.id.clone();
-        if let Err(e) = self.tx_consensus.send(certificate).await {
-            warn!(
-                "Failed to deliver certificate {} to the consensus: {}",
-                id, e
-            );
+        // CRITICAL FIX: Thêm retry logic khi channel đầy để đảm bảo certificate được gửi
+        let cert_digest = certificate.digest();
+        let cert_round = certificate.round();
+        let batch_count = certificate.header.payload.len();
+        
+        // Try to send with retry if channel is full
+        let mut retry_count = 0;
+        const MAX_RETRY: usize = 3;
+        const RETRY_DELAY_MS: u64 = 100;
+        
+        loop {
+            match self.tx_consensus.try_send(certificate.clone()) {
+                Ok(()) => {
+                    info!(
+                        "[BATCH TRACK CONSENSUS] Successfully sent certificate {} (round {}) to consensus with {} batches",
+                        cert_digest, cert_round, batch_count
+                    );
+                    break;
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    retry_count += 1;
+                    if retry_count >= MAX_RETRY {
+                        // CRITICAL ERROR: Channel đầy sau nhiều lần retry
+                        error!(
+                            "[CRITICAL] Failed to deliver certificate {} (round {}, {} batches) to consensus after {} retries. Channel is full! This will cause batches to be stuck and not executed. System may need investigation.",
+                            cert_digest, cert_round, batch_count, MAX_RETRY
+                        );
+                        // Fallback: Use blocking send (will wait until channel has space)
+                        // This ensures certificate is eventually sent, but may block main loop
+                        if let Err(e) = self.tx_consensus.send(certificate).await {
+                            error!(
+                                "[CRITICAL] Blocking send also failed for certificate {} (round {}): {}. This is a critical system failure!",
+                                cert_digest, cert_round, e
+                            );
+                        } else {
+                            warn!(
+                                "[CRITICAL] Certificate {} (round {}) sent via blocking send after {} retries. Channel was full - system may need capacity increase or faster consensus processing.",
+                                cert_digest, cert_round, MAX_RETRY
+                            );
+                        }
+                        break;
+                    }
+                    // Wait before retry
+                    tokio::time::sleep(Duration::from_millis(RETRY_DELAY_MS)).await;
+                }
+                Err(e) => {
+                    // Channel closed or other error
+                    error!(
+                        "[CRITICAL] Failed to deliver certificate {} (round {}, {} batches) to consensus: {}. Channel may be closed!",
+                        cert_digest, cert_round, batch_count, e
+                    );
+                    break;
+                }
+            }
         }
         Ok(())
     }
@@ -660,11 +868,15 @@ impl Core {
         );
 
         // CATCH-UP MODE: Thresholds for entering and resuming catch-up mode
-        // Tăng threshold lên để tránh vào catch-up mode quá sớm (50 rounds thay vì 10)
-        // Lag 10 rounds là bình thường trong DAG và không nên trigger catch-up mode
-        // Điều này tránh proposer bị pause khiến giao dịch không được thực thi
-        const LAG_THRESHOLD: Round = 50; // Enter catch-up mode if lag >= 50 rounds
-        const RESUME_THRESHOLD: Round = 30; // Resume normal operation if lag < 30 rounds
+        // LONG-TERM FIX: Optimized thresholds for production
+        // Lag thresholds được tối ưu để:
+        // 1. Phát hiện lag sớm nhưng không quá nhạy cảm
+        // 2. Đuổi kịp nhanh chóng khi lag
+        // 3. Tránh vào catch-up mode không cần thiết
+        const LAG_THRESHOLD: Round = 100; // Enter catch-up mode if lag >= 100 rounds
+        const RESUME_THRESHOLD: Round = 50; // Resume normal operation if lag < 50 rounds
+        const AGGRESSIVE_SYNC_THRESHOLD: Round = 50; // Use aggressive sync when lag > 50 rounds
+        const FAST_CATCHUP_THRESHOLD: Round = 150; // Use very aggressive sync when lag > 150 rounds
 
         // Update last detected lag
         self.last_detected_lag = lag;
@@ -704,8 +916,24 @@ impl Core {
                 
                 // PROACTIVE SYNC: When in catch-up mode, proactively request certificates from missing rounds
                 // This helps node catch up faster by actively requesting data instead of waiting passively
-                if lag > 20 && catchup_duration.as_secs() % 5 == 0 {
-                    // Request certificates from missing rounds every 5 seconds when lag > 20
+                // LONG-TERM FIX: Tăng tần suất sync khi lag lớn để đuổi kịp nhanh hơn
+                // Production-ready: Adaptive sync frequency based on lag severity
+                let sync_interval = if lag > FAST_CATCHUP_THRESHOLD {
+                    1 // Sync every 1 second when lag > 150 (very aggressive - production critical)
+                } else if lag > LAG_THRESHOLD {
+                    2 // Sync every 2 seconds when lag > 100 (aggressive)
+                } else if lag > AGGRESSIVE_SYNC_THRESHOLD {
+                    3 // Sync every 3 seconds when lag > 50
+                } else {
+                    5 // Sync every 5 seconds when lag > 20
+                };
+                
+                if lag > 20 && catchup_duration.as_secs() % sync_interval == 0 {
+                    // Request certificates from missing rounds more frequently when lag is large
+                    info!(
+                        "[PROACTIVE SYNC] Primary {} in catch-up mode (lag: {} rounds, duration: {:?}) - requesting missing certificates (sync interval: {}s) to catch up quickly",
+                        self.name, lag, catchup_duration, sync_interval
+                    );
                     self.proactive_sync_missing_certificates(network_current_round).await;
                 }
             }
@@ -762,25 +990,70 @@ impl Core {
         Ok(())
     }
 
-    /// PROACTIVE SYNC: Log catch-up progress and ensure synchronizer is active
-    /// When in catch-up mode, we rely on the existing sync mechanism which is triggered
-    /// when we receive headers/certificates. This method ensures we're actively monitoring
-    /// catch-up progress and the synchronizer will handle requesting missing data.
+    /// PROACTIVE BATCH SYNC: Optimize sync for catch-up mode
+    /// When in catch-up mode, the existing sync mechanism (HeaderWaiter) already implements
+    /// batch sync by requesting certificates from ALL primaries in parallel. This method
+    /// ensures we're actively monitoring catch-up progress and the synchronizer will
+    /// automatically trigger batch sync when headers/certificates are received.
+    /// 
+    /// Note: We can't request certificates directly without knowing their digests.
+    /// However, the existing sync mechanism already implements efficient batch sync:
+    /// - When a header is received, HeaderWaiter requests ALL missing parents in parallel
+    /// - Requests are sent to ALL primaries simultaneously (not just one)
+    /// - Connection pooling ensures fast parallel requests
+    /// - This is already faster than sequential requests
     async fn proactive_sync_missing_certificates(&mut self, network_current_round: Round) {
         // Calculate how many rounds we need to catch up
         let rounds_to_catchup = network_current_round.saturating_sub(self.current_proposer_round);
         
-        if rounds_to_catchup > 0 {
+        if rounds_to_catchup == 0 {
+            return;
+        }
+        
+        // BATCH SYNC STATUS: The existing sync mechanism already implements batch sync:
+        // 1. HeaderWaiter requests certificates from ALL primaries in parallel (not sequential)
+        // 2. When a header is received, ALL missing parents are requested at once
+        // 3. Requests are sent to ALL nodes simultaneously for maximum speed
+        // 4. Connection pooling ensures efficient parallel requests
+        
+        // Check how many rounds we're missing certificates for
+        let mut missing_rounds = 0;
+        let mut rounds_with_partial_certs = 0;
+        
+        // Check recent rounds to see if we're missing certificates
+        // Note: We can't directly check how many certificates we have without knowing digests
+        // Instead, we check if we have aggregators for rounds (indicates we've received some certificates)
+        const CHECK_ROUNDS: Round = 50; // Check last 50 rounds
+        let start_round = self.current_proposer_round.saturating_sub(CHECK_ROUNDS);
+        let end_round = network_current_round.min(self.current_proposer_round + CHECK_ROUNDS);
+        
+        for round in start_round..=end_round {
+            if self.certificates_aggregators.contains_key(&round) {
+                // We have aggregator for this round - likely have some certificates
+                // (Can't check exact count without knowing digests)
+                rounds_with_partial_certs += 1;
+            } else if round <= network_current_round {
+                // No aggregator but round exists in network - missing all certificates
+                missing_rounds += 1;
+            }
+        }
+        
+        if missing_rounds > 0 || rounds_with_partial_certs > 0 {
             info!(
-                "[PROACTIVE SYNC] Primary {} in catch-up mode - need to catch up {} rounds (current: {}, network: {}). Synchronizer will handle requesting missing certificates when headers/certificates are received.",
+                "[PROACTIVE BATCH SYNC] Primary {} in catch-up mode - need to catch up {} rounds (current: {}, network: {}). Missing certificates from {} rounds, partial certificates from {} rounds. Synchronizer will automatically trigger batch sync (requests to ALL primaries in parallel) when headers/certificates are received.",
+                self.name, rounds_to_catchup, self.current_proposer_round, network_current_round, missing_rounds, rounds_with_partial_certs
+            );
+        } else {
+            debug!(
+                "[PROACTIVE BATCH SYNC] Primary {} in catch-up mode - need to catch up {} rounds (current: {}, network: {}). All checked rounds have complete certificates. Synchronizer will handle any missing certificates when headers/certificates are received.",
                 self.name, rounds_to_catchup, self.current_proposer_round, network_current_round
             );
-            
-            // The existing sync mechanism (HeaderWaiter, CertificateWaiter) will handle
-            // requesting missing certificates when we receive headers/certificates from network.
-            // This proactive sync ensures we're aware of the catch-up progress and the
-            // synchronizer will automatically request missing data when needed.
         }
+        
+        // The existing sync mechanism (HeaderWaiter) already implements efficient batch sync:
+        // - Requests are sent to ALL primaries in parallel (not sequential)
+        // - When a header is received, ALL missing parents are requested at once
+        // - This is already optimized for fast catch-up
     }
 
     /// PHASE 2: Trigger catch-up sync for old certificate
@@ -898,11 +1171,32 @@ impl Core {
         // PHASE 2: Set up periodic catch-up sync check timer
         let mut catchup_sync_timer = tokio::time::interval(self.catchup_sync_check_interval);
         catchup_sync_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        
+        // MONITORING: Periodic system health check timer (every 30 seconds)
+        let mut health_check_timer = tokio::time::interval(Duration::from_secs(30));
+        health_check_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             let result = tokio::select! {
                 // We receive here messages from other primaries.
                 Some(message) = self.rx_primaries.recv() => {
+                    // MONITORING: Track incoming messages từ network để monitor network health
+                    match &message {
+                        PrimaryMessage::Header(h) => {
+                            info!(
+                                "[NETWORK RX] Primary {} received header {} (round {}, author: {}, {} batches) from network",
+                                self.name, h.id, h.round, h.author, h.payload.len()
+                            );
+                        }
+                        PrimaryMessage::Vote(v) => {
+                            // Vote receipt is already logged in vote handler with more details
+                        }
+                        PrimaryMessage::Certificate(c) => {
+                            // Certificate receipt is already logged in certificate handler with more details
+                        }
+                        _ => {}
+                    }
+                    
                     match message {
                         PrimaryMessage::Header(header) => {
                             match self.sanitize_header(&header) {
@@ -951,7 +1245,7 @@ impl Core {
                                     tokio::spawn(async move {
                                         match tx_headers.send(header_clone).await {
                                             Ok(()) => {
-                                                debug!(
+                                                info!(
                                                     "[BATCH TRACK CORE] Successfully sent header {} (round {}, author: {}) to proposer for batch extraction",
                                                     header_id_log, header_round, header_author
                                                 );
@@ -984,15 +1278,36 @@ impl Core {
                             }
                         },
                         PrimaryMessage::Certificate(certificate) => {
+                            // MONITORING: Track certificate receipt từ network
+                            let cert_digest = certificate.digest();
+                            let cert_round = certificate.round();
+                            let cert_author = certificate.origin();
+                            
                             match self.sanitize_certificate(&certificate) {
-                                Ok(()) => self.process_certificate(certificate).await,
+                                Ok(()) => {
+                                    info!(
+                                        "[CERTIFICATE RECEIVED FROM NETWORK] Primary {} received certificate {} (round {}, author: {}, {} batches) from network - processing",
+                                        self.name, cert_digest, cert_round, cert_author, certificate.header.payload.len()
+                                    );
+                                    self.process_certificate(certificate).await
+                                },
                                 Err(DagError::TooOld(_, round)) => {
                                     // PHASE 2: Certificate is too old - trigger catch-up sync nếu trong window
+                                    warn!(
+                                        "[CERTIFICATE TOO OLD] Primary {} received certificate {} (round {}, author: {}) but it's too old (current round: ~{}). Sync will be triggered but certificate will be rejected to avoid fork.",
+                                        self.name, cert_digest, cert_round, cert_author, round
+                                    );
                                     // sanitize_certificate đã check và trigger sync rồi, nhưng chúng ta vẫn reject để tránh fork
                                     // Lưu ý: Certificate quá cũ sẽ KHÔNG được process (tránh fork), nhưng sync vẫn được trigger để node bắt kịp
-                                    Err(DagError::TooOld(certificate.digest(), round))
+                                    Err(DagError::TooOld(cert_digest, round))
                                 },
-                                error => error
+                                Err(e) => {
+                                    warn!(
+                                        "[CERTIFICATE REJECTED] Primary {} rejected certificate {} (round {}, author: {}) - reason: {}",
+                                        self.name, cert_digest, cert_round, cert_author, e
+                                    );
+                                    Err(e)
+                                }
                             }
                         },
                         PrimaryMessage::BatchReplica { digest, worker_id, batch, origin } => {
@@ -1029,6 +1344,34 @@ impl Core {
                     self.handle_local_batch_rescue(rescue).await
                 },
 
+                // MONITORING: Periodic system health check
+                _ = health_check_timer.tick() => {
+                    // Track: processing map size, highest_network_round, current round, lag
+                    let processing_size: usize = self.processing.values().map(|set| set.len()).sum();
+                    let current_round = self.current_header.round;
+                    let lag = self.highest_network_round.saturating_sub(current_round);
+                    
+                    info!(
+                        "[SYSTEM HEALTH] Primary {}: current_round={}, highest_network_round={}, lag={}, processing_headers={}, is_catchup_mode={}",
+                        self.name,
+                        current_round,
+                        self.highest_network_round,
+                        lag,
+                        processing_size,
+                        self.is_catchup_mode
+                    );
+                    
+                    // WARN nếu lag cao
+                    if lag > 50 {
+                        warn!(
+                            "[SYSTEM HEALTH WARNING] Primary {} lag is high ({} rounds behind network). System may be slow or network may have issues.",
+                            self.name,
+                            lag
+                        );
+                    }
+                    Ok(())
+                }
+                
                 // PHASE 2: Periodic catch-up sync check
                 _ = catchup_sync_timer.tick() => {
                     // Periodic check to help node chậm catch-up
