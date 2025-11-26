@@ -8,6 +8,7 @@ use crypto::Hash as _;
 use crypto::{Digest, PublicKey};
 use log::{info, warn};
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use store::Store;
 use tokio::sync::mpsc::Sender;
 /// The `Synchronizer` checks if we have all batches and parents referenced by a header. If we don't, it sends
@@ -25,6 +26,10 @@ pub struct Synchronizer {
     genesis: Vec<(Digest, Certificate)>,
 
     cache: PayloadCache, // <--- THÊM TRƯỜNG CACHE
+    /// Track last time we requested a given batch digest to avoid spamming.
+    batch_sync_tracker: HashMap<Digest, Instant>,
+    batch_resync_interval: Duration,
+    batch_sync_alert_interval: Duration,
 }
 
 impl Synchronizer {
@@ -46,6 +51,9 @@ impl Synchronizer {
                 .into_iter()
                 .map(|x| (x.digest(), x))
                 .collect(),
+            batch_sync_tracker: HashMap::new(),
+            batch_resync_interval: Duration::from_secs(2),
+            batch_sync_alert_interval: Duration::from_secs(10),
         }
     }
 
@@ -60,11 +68,12 @@ impl Synchronizer {
         let mut missing = HashMap::new();
         let mut found_in_cache = 0usize;
         let mut found_in_store = 0usize;
-        
+
         for (digest, worker_id) in header.payload.iter() {
             // KIỂM TRA CACHE TRƯỚC
             if self.cache.contains_key(digest) {
                 found_in_cache += 1;
+                self.batch_sync_tracker.remove(digest);
                 continue; // Tìm thấy trong RAM, không cần làm gì thêm
             }
 
@@ -72,6 +81,7 @@ impl Synchronizer {
             match self.store.read(digest.to_vec()).await? {
                 Some(_) => {
                     found_in_store += 1;
+                    self.batch_sync_tracker.remove(digest);
                     // Batch có trong store - OK
                 }
                 None => {
@@ -99,7 +109,7 @@ impl Synchronizer {
             found_in_store,
             missing_count
         );
-        
+
         if missing_count > 0 {
             info!(
                 "[SYNC TRIGGER DETAIL] Primary {} missing batches (sample): {:?} from header {} (round {}, author: {}). Sync request will be sent to HeaderWaiter.",
@@ -111,10 +121,57 @@ impl Synchronizer {
             );
         }
 
+        let now = Instant::now();
+        let mut throttled = Vec::new();
+        let mut ready_missing = HashMap::new();
+        for (digest, worker_id) in missing.into_iter() {
+            match self.batch_sync_tracker.get(&digest) {
+                Some(last) if now.duration_since(*last) < self.batch_resync_interval => {
+                    throttled.push(digest);
+                }
+                _ => {
+                    ready_missing.insert(digest.clone(), worker_id);
+                    self.batch_sync_tracker.insert(digest, now);
+                }
+            }
+        }
+
+        if ready_missing.is_empty() {
+            if !throttled.is_empty() {
+                info!(
+                    "[SYNC THROTTLE] Primary {} already requested batches {:?} recently (interval {:?}). Will wait before re-requesting.",
+                    self.name,
+                    throttled.iter().take(5).collect::<Vec<_>>(),
+                    self.batch_resync_interval
+                );
+            }
+            return Ok(true);
+        }
+
         self.tx_header_waiter
-            .send(WaiterMessage::SyncBatches(missing, header.clone()))
+            .send(WaiterMessage::SyncBatches(
+                ready_missing.clone(),
+                header.clone(),
+            ))
             .await
             .expect("Failed to send sync batch request");
+
+        // Alert if certain digests keep being re-requested for too long.
+        for (digest, _) in ready_missing.into_iter() {
+            if let Some(first) = self.batch_sync_tracker.get(&digest) {
+                if now.duration_since(*first) >= self.batch_sync_alert_interval {
+                    warn!(
+                        "[SYNC SLOW ALERT] Primary {} still missing batch {} from header {} (round {}, author: {}) for {:?}. Consider investigating worker/primary connectivity.",
+                        self.name,
+                        digest,
+                        header.id,
+                        header.round,
+                        header.author,
+                        now.duration_since(*first)
+                    );
+                }
+            }
+        }
         Ok(true)
     }
     /// Returns the parents of a header if we have them all. If at least one parent is missing,

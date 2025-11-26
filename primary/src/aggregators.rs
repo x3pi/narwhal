@@ -4,7 +4,7 @@ use crate::messages::{Certificate, Header, Vote};
 use config::{Committee, Stake};
 use crypto::Hash as _;
 use crypto::{Digest, PublicKey, Signature};
-use log::{debug, info};
+use log::debug;
 use std::collections::HashSet;
 
 /// Aggregates votes for a particular header into a certificate.

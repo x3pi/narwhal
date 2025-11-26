@@ -3,21 +3,11 @@ use super::*;
 use crate::common::{
     certificate, committee, committee_with_base_port, header, headers, keys, listener, votes,
 };
-use crate::rate_control::{
-    AdaptiveRateController, AdaptiveRateControllerHandle, RateControlConfig,
-};
-use config::{Committee, Parameters};
 use dashmap::DashMap; // Thêm import cho DashMap
 use futures::future::try_join_all;
 use std::fs;
 use std::sync::Arc; // Thêm import cho Arc
 use tokio::sync::mpsc::channel;
-
-fn test_rate_controller(committee: &Committee) -> AdaptiveRateControllerHandle {
-    let mut cfg = RateControlConfig::from_parameters(&Parameters::default());
-    cfg.enabled = false; // Tắt điều tốc trong unit test để đơn giản hóa.
-    AdaptiveRateController::new(cfg, committee)
-}
 
 #[tokio::test]
 async fn process_header() {
@@ -27,7 +17,6 @@ async fn process_header() {
     let mut signature_service = SignatureService::new(consensus_secret);
 
     let committee = committee_with_base_port(13_000);
-    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
@@ -38,6 +27,7 @@ async fn process_header() {
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
     let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
+    let (tx_catchup_mode, _rx_catchup_mode) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header";
@@ -83,7 +73,7 @@ async fn process_header() {
         tx_headers_to_proposer,
         rx_batch_rescue,
         payload_cache.clone(),
-        rate_controller,
+        tx_catchup_mode,
     );
 
     // Send a header to the core.
@@ -113,7 +103,6 @@ async fn process_header_missing_parent() {
     let (name, _, __, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
     let committee = committee();
-    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
@@ -124,6 +113,7 @@ async fn process_header_missing_parent() {
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
     let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
+    let (tx_catchup_mode, _rx_catchup_mode) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header_missing_parent";
@@ -159,7 +149,7 @@ async fn process_header_missing_parent() {
         tx_headers_to_proposer,
         rx_batch_rescue,
         payload_cache.clone(),
-        rate_controller,
+        tx_catchup_mode,
     );
 
     // Send a header to the core.
@@ -182,7 +172,6 @@ async fn process_header_missing_payload() {
     let (name, _, __, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
     let committee = committee();
-    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
@@ -193,6 +182,7 @@ async fn process_header_missing_payload() {
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
     let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
+    let (tx_catchup_mode, _rx_catchup_mode) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_header_missing_payload";
@@ -228,7 +218,7 @@ async fn process_header_missing_payload() {
         tx_headers_to_proposer,
         rx_batch_rescue,
         payload_cache.clone(),
-        rate_controller,
+        tx_catchup_mode,
     );
 
     // Send a header to the core.
@@ -252,7 +242,6 @@ async fn process_votes() {
     let signature_service = SignatureService::new(consensus_secret);
 
     let committee = committee_with_base_port(13_100);
-    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
@@ -263,6 +252,7 @@ async fn process_votes() {
     let (tx_consensus, _rx_consensus) = channel(1);
     let (tx_parents, _rx_parents) = channel(1);
     let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
+    let (tx_catchup_mode, _rx_catchup_mode) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_vote";
@@ -298,7 +288,7 @@ async fn process_votes() {
         tx_headers_to_proposer,
         rx_batch_rescue,
         payload_cache.clone(),
-        rate_controller,
+        tx_catchup_mode,
     );
 
     // Make the certificate we expect to receive.
@@ -333,7 +323,6 @@ async fn process_certificates() {
     let (name, _, __, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
     let committee = committee();
-    let rate_controller = test_rate_controller(&committee);
 
     let (tx_sync_headers, _rx_sync_headers) = channel(1);
     let (tx_sync_certificates, _rx_sync_certificates) = channel(1);
@@ -344,6 +333,7 @@ async fn process_certificates() {
     let (tx_consensus, mut rx_consensus) = channel(3);
     let (tx_parents, mut rx_parents) = channel(1);
     let (_tx_batch_rescue, rx_batch_rescue) = channel(1);
+    let (tx_catchup_mode, _rx_catchup_mode) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_process_certificates";
@@ -379,7 +369,7 @@ async fn process_certificates() {
         tx_headers_to_proposer,
         rx_batch_rescue,
         payload_cache.clone(),
-        rate_controller,
+        tx_catchup_mode,
     );
 
     // Send enough certificates to the core.

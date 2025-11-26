@@ -237,7 +237,7 @@ fn parse_single_transaction(data: &[u8], worker_id: u32) -> Result<TransactionLo
     // Parse Transaction từ payload
     let tx =
         Transaction::decode(data).map_err(|e| format!("Failed to decode Transaction: {}", e))?;
-    
+
     // Tính hash từ TransactionHashData (protobuf encoded) - thống nhất với Go
     let transaction_hash = calculate_transaction_hash(&tx);
 

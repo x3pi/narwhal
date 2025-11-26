@@ -57,6 +57,14 @@ pub enum PrimaryMessage {
         batch: Vec<u8>,
         origin: PublicKey,
     },
+    BatchSyncRecovery {
+        digest: Digest,
+        worker_id: WorkerId,
+        author: PublicKey,
+        requester: PublicKey,
+        round: Round,
+        attempts: u32,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,7 +183,7 @@ impl Primary {
 
         // CATCH-UP MODE: Create channel to notify proposer about catch-up mode
         let (tx_proposer_catchup, rx_proposer_catchup) = channel(10);
-        
+
         Core::spawn(
             name,
             committee.clone(),
@@ -306,7 +314,11 @@ impl MessageHandler for WorkerReceiverHandler {
                     "[PRIMARY RX WORKER] Primary {} received OurBatch {} from worker {} ({} bytes)",
                     self.name, digest, worker_id, batch_size
                 );
-                match self.tx_our_digests.send((digest.clone(), worker_id, batch)).await {
+                match self
+                    .tx_our_digests
+                    .send((digest.clone(), worker_id, batch))
+                    .await
+                {
                     Ok(()) => {
                         info!(
                             "[PRIMARY RX WORKER] Primary {} successfully sent batch {} from worker {} to proposer channel",
@@ -330,7 +342,11 @@ impl MessageHandler for WorkerReceiverHandler {
                     "[PRIMARY RX WORKER] Primary {} received OthersBatch {} from worker {} ({} bytes)",
                     self.name, digest, worker_id, batch_size
                 );
-                match self.tx_others_digests.send((digest.clone(), worker_id, batch)).await {
+                match self
+                    .tx_others_digests
+                    .send((digest.clone(), worker_id, batch))
+                    .await
+                {
                     Ok(()) => {
                         info!(
                             "[PRIMARY RX WORKER] Primary {} successfully sent batch {} from worker {} to payload receiver channel",

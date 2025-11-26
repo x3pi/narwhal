@@ -8,9 +8,9 @@ use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error, info, warn};
+use log::{debug, error, info};
 use network::SimpleSender;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,6 +22,18 @@ use tokio::time::{sleep, Duration, Instant};
 /// new sync requests if we didn't.
 const TIMER_RESOLUTION: u64 = 100; // Giảm xuống 100ms để check và retry nhanh hơn
 const BROADCAST_RETRY_THRESHOLD: u32 = 1; // Broadcast ngay từ lần retry đầu tiên
+const BATCH_RECOVERY_RETRY_THRESHOLD: u32 = 3;
+const BATCH_RECOVERY_COOLDOWN_MS: u128 = 5_000;
+
+#[derive(Clone, Debug)]
+struct BatchRequestInfo {
+    round: Round,
+    worker_id: WorkerId,
+    author: PublicKey,
+    last_request_ms: u128,
+    attempts: u32,
+    last_recovery_ms: Option<u128>,
+}
 
 /// The commands that can be sent to the `Waiter`.
 #[derive(Debug)]
@@ -59,7 +71,7 @@ pub struct HeaderWaiter {
     parent_requests: HashMap<Digest, (Round, u128, u32)>,
     /// Keeps the digests of the all tx batches for which we sent a sync request,
     /// similarly to `header_requests`.
-    batch_requests: HashMap<Digest, Round>,
+    batch_requests: HashMap<Digest, BatchRequestInfo>,
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
     pending: HashMap<Digest, (Round, Sender<()>)>,
@@ -135,7 +147,7 @@ impl HeaderWaiter {
                             let author = header.author;
                             let missing_count = missing.len();
                             let missing_digests_sample: Vec<_> = missing.keys().take(5).cloned().collect();
-                            
+
                             info!(
                                 "[SYNC BATCHES REQUEST] HeaderWaiter {} received sync request for {} missing batches from header {} (round {}, author: {}). Sample batches: {:?}. Will request from ALL workers in parallel.",
                                 self.name,
@@ -165,17 +177,31 @@ impl HeaderWaiter {
 
                             // Ensure we didn't already send a sync request for these parents.
                             let mut requires_sync = HashMap::new();
+                            let now = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .expect("Failed to measure time")
+                                .as_millis();
                             for (digest, worker_id) in missing.into_iter() {
-                                self.batch_requests.entry(digest.clone()).or_insert_with(|| {
-                                    requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest);
-                                    round
-                                });
+                                match self.batch_requests.entry(digest.clone()) {
+                                    Entry::Occupied(_) => continue,
+                                    Entry::Vacant(entry) => {
+                                        requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest.clone());
+                                        entry.insert(BatchRequestInfo {
+                                            round,
+                                            worker_id,
+                                            author: author.clone(),
+                                            last_request_ms: now,
+                                            attempts: 1,
+                                            last_recovery_ms: None,
+                                        });
+                                    }
+                                }
                             }
                             // ĐỒNG BỘ SIÊU NHANH: Gửi đến nhiều workers song song để tăng tốc độ
                             for (worker_id, digests) in requires_sync {
                                 let batch_count = digests.len();
                                 let digests_sample: Vec<_> = digests.iter().take(3).cloned().collect();
-                                
+
                                 info!(
                                     "[SYNC BATCHES SEND] HeaderWaiter {} sending sync request for {} batches (worker {}, author: {}). Sample: {:?}. Sending to ALL workers in parallel for maximum speed.",
                                     self.name,
@@ -184,7 +210,7 @@ impl HeaderWaiter {
                                     author,
                                     digests_sample
                                 );
-                                
+
                                 let author_address = self.committee
                                     .worker(&author, &worker_id)
                                     .expect("Author of valid header is not in the committee")
@@ -217,7 +243,7 @@ impl HeaderWaiter {
                                         self.name, other_workers_count, batch_count, worker_id
                                     );
                                 }
-                                
+
                                 // Gửi tuần tự đến tất cả workers khác (SimpleSender đã có connection pooling)
                                 for worker_addr in other_workers {
                                     let message_other = PrimaryWorkerMessage::Synchronize(digests.clone(), author);
@@ -276,7 +302,7 @@ impl HeaderWaiter {
                                         *attempts = attempts.saturating_add(1);
                                     }
                                 }
-                                
+
                                 let author_address = self.committee
                                     .primary(&author)
                                     .expect("Author of valid header not in the committee")
@@ -369,7 +395,7 @@ impl HeaderWaiter {
                         );
                         let bytes =
                             Bytes::from(bincode::serialize(&message).expect("Failed to serialize cert request"));
-                        
+
                         // Gửi đến TẤT CẢ nodes khi retry để tăng tốc độ sync tối đa
                         self.network.broadcast(addresses, bytes).await;
                     }
@@ -386,6 +412,108 @@ impl HeaderWaiter {
                         let bytes =
                             Bytes::from(bincode::serialize(&message).expect("Failed to serialize cert request"));
                         self.network.broadcast(addresses, bytes).await;
+                    }
+
+                    // Batch sync retry & recovery
+                    let mut retry_batches: HashMap<(PublicKey, WorkerId), Vec<Digest>> = HashMap::new();
+                    let mut recovery_requests: Vec<(Digest, PublicKey, WorkerId, Round, u32)> = Vec::new();
+                    for (digest, info) in self.batch_requests.iter_mut() {
+                        if now.saturating_sub(info.last_request_ms)
+                            >= u128::from(self.sync_retry_delay)
+                        {
+                            info.last_request_ms = now;
+                            info.attempts = info.attempts.saturating_add(1);
+                            retry_batches
+                                .entry((info.author.clone(), info.worker_id))
+                                .or_insert_with(Vec::new)
+                                .push(digest.clone());
+                        }
+
+                        if info.attempts >= BATCH_RECOVERY_RETRY_THRESHOLD {
+                            let should_send_recovery = match info.last_recovery_ms {
+                                Some(last) => now.saturating_sub(last) >= BATCH_RECOVERY_COOLDOWN_MS,
+                                None => true,
+                            };
+                            if should_send_recovery {
+                                info.last_recovery_ms = Some(now);
+                                recovery_requests.push((
+                                    digest.clone(),
+                                    info.author.clone(),
+                                    info.worker_id,
+                                    info.round,
+                                    info.attempts,
+                                ));
+                            }
+                        }
+                    }
+
+                    for ((author, worker_id), digests) in retry_batches {
+                        let batch_count = digests.len();
+                        let digests_sample: Vec<_> = digests.iter().take(3).cloned().collect();
+                        info!(
+                            "[SYNC BATCHES RETRY] HeaderWaiter {} retrying sync for {} batches (worker {}, author: {}) after {} ms. Sample: {:?}",
+                            self.name,
+                            batch_count,
+                            worker_id,
+                            author,
+                            self.sync_retry_delay,
+                            digests_sample
+                        );
+
+                        let author_address = self
+                            .committee
+                            .worker(&author, &worker_id)
+                            .expect("Author of valid header is not in the committee")
+                            .primary_to_worker;
+                        let message =
+                            PrimaryWorkerMessage::Synchronize(digests.clone(), author.clone());
+                        let bytes =
+                            bincode::serialize(&message).expect("Failed to serialize batch sync request");
+
+                        self.network.send(author_address, Bytes::from(bytes.clone())).await;
+
+                        let other_workers: Vec<_> = self
+                            .committee
+                            .others_primaries(&self.name)
+                            .iter()
+                            .filter_map(|(other_author, _)| {
+                                self.committee.worker(other_author, &worker_id).ok().map(|addr| addr.primary_to_worker)
+                            })
+                            .collect();
+
+                        for worker_addr in other_workers {
+                            self.network
+                                .send(worker_addr, Bytes::from(bytes.clone()))
+                                .await;
+                        }
+                    }
+
+                    for (digest, author, worker_id, round, attempts) in recovery_requests {
+                        let author_address = self
+                            .committee
+                            .primary(&author)
+                            .expect("Author of valid header not in the committee")
+                            .primary_to_primary;
+                        let recovery_message = PrimaryMessage::BatchSyncRecovery {
+                            digest: digest.clone(),
+                            worker_id,
+                            author: author.clone(),
+                            requester: self.name,
+                            round,
+                            attempts,
+                        };
+                        let bytes = bincode::serialize(&recovery_message)
+                            .expect("Failed to serialize batch recovery request");
+                        self.network.send(author_address, Bytes::from(bytes)).await;
+                        info!(
+                            "[BATCH RECOVERY REQUEST] HeaderWaiter {} requested author {} to re-broadcast batch {} (worker {}, round {}, attempts={})",
+                            self.name,
+                            author,
+                            digest,
+                            worker_id,
+                            round,
+                            attempts
+                        );
                     }
 
                     if !(retry_targeted.is_empty() && retry_broadcast.is_empty()) {
@@ -416,7 +544,7 @@ impl HeaderWaiter {
                     }
                 }
                 self.pending.retain(|_, (r, _)| r > &mut gc_round);
-                self.batch_requests.retain(|_, r| r > &mut gc_round);
+                self.batch_requests.retain(|_, info| info.round > gc_round);
                 self.parent_requests
                     .retain(|_, (r, _, _)| r > &mut gc_round);
             }

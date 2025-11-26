@@ -38,6 +38,7 @@ impl SimpleSender {
     }
 
     pub async fn send(&mut self, address: SocketAddr, data: Bytes) {
+        let payload_len = data.len();
         let spawn_new_manager = |transport: &QuicTransport, addr: SocketAddr| {
             let (tx, rx) = channel(1_000);
             ConnectionManager::spawn(transport.clone(), addr, rx);
@@ -45,15 +46,33 @@ impl SimpleSender {
         };
 
         let transport_clone = self.transport.clone();
-        let tx = self
-            .connections
-            .entry(address)
-            .or_insert_with(|| spawn_new_manager(&transport_clone, address));
+        let tx = self.connections.entry(address).or_insert_with(|| {
+            info!(
+                "[NETWORK CONNECT] Creating new QUIC connection manager to {}",
+                address
+            );
+            spawn_new_manager(&transport_clone, address)
+        });
 
         if tx.send(data.clone()).await.is_err() {
+            warn!(
+                "[NETWORK SEND] Channel to {} closed while sending {} bytes. Respawning connection manager.",
+                address,
+                payload_len
+            );
             let new_tx = spawn_new_manager(&self.transport, address);
-            if new_tx.send(data).await.is_ok() {
+            if new_tx.send(data.clone()).await.is_ok() {
+                info!(
+                    "[NETWORK CONNECT] Replaced connection manager to {} after channel failure",
+                    address
+                );
                 self.connections.insert(address, new_tx);
+            } else {
+                warn!(
+                    "[NETWORK SEND] Failed to deliver {} bytes to {} even after respawning connection manager",
+                    payload_len,
+                    address
+                );
             }
         }
     }
@@ -105,14 +124,27 @@ impl ConnectionManager {
                     retry_delay = Duration::from_millis(200);
 
                     while let Some(data) = self.receiver.recv().await {
+                        let data_len = data.len();
                         if let Err(e) = connection.send(data).await {
                             warn!(
                                 "{}",
-                                NetworkError::FailedToSendMessage(self.address, e.to_string())
+                                NetworkError::FailedToSendMessage(
+                                    self.address,
+                                    format!("{} (payload={} bytes)", e, data_len)
+                                )
                             );
                             break;
+                        } else {
+                            info!(
+                                "[NETWORK SEND] Sent {} bytes to {} successfully",
+                                data_len, self.address
+                            );
                         }
                     }
+                    info!(
+                        "[NETWORK SEND] Sender channel to {} closed, waiting for new data/connection",
+                        self.address
+                    );
                 }
                 Err(e) => {
                     warn!(

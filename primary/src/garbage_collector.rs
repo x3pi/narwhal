@@ -75,7 +75,7 @@ impl GarbageCollector {
             // This ensures proposer knows about batches committed in certificates from other primaries
             // as well as its own certificate
             let digests: Vec<_> = certificate.header.payload.keys().cloned().collect();
-            
+
             // BATCH TRACKING: Log when sending committed batches to proposer
             info!(
                 "[BATCH TRACK GC] GarbageCollector sending {} committed batches to proposer at round {} from certificate {} (author: {}): {:?}",
@@ -85,7 +85,7 @@ impl GarbageCollector {
                 certificate.origin(),
                 digests.iter().take(10).collect::<Vec<_>>()
             );
-            
+
             if let Err(e) = self
                 .tx_committed
                 .send(CommittedBatches {

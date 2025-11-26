@@ -1,19 +1,9 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::{committee, keys};
-use crate::rate_control::{
-    AdaptiveRateController, AdaptiveRateControllerHandle, RateControlConfig,
-};
-use config::{Committee, Parameters};
 use std::fs;
 use store::Store;
 use tokio::sync::mpsc::channel;
-
-fn test_rate_controller(committee: &Committee) -> AdaptiveRateControllerHandle {
-    let mut cfg = RateControlConfig::from_parameters(&Parameters::default());
-    cfg.enabled = false;
-    AdaptiveRateController::new(cfg, committee)
-}
 
 #[tokio::test]
 async fn propose_empty() {
@@ -21,7 +11,6 @@ async fn propose_empty() {
     let (name, _, _, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
     let committee = committee();
-    let rate_controller = test_rate_controller(&committee);
 
     let (_tx_parents, rx_parents) = channel(1);
     let (_tx_headers_from_core, rx_headers_from_core) = channel(1);
@@ -29,6 +18,7 @@ async fn propose_empty() {
     let (_tx_committed, rx_committed) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
     let (tx_batch_rescue, _rx_batch_rescue) = channel(1);
+    let (_tx_catchup_mode, rx_catchup_mode) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_propose_empty";
@@ -50,7 +40,7 @@ async fn propose_empty() {
         /* rx_committed */ rx_committed,
         /* tx_core */ tx_headers,
         tx_batch_rescue,
-        rate_controller,
+        rx_catchup_mode,
     );
 
     // Ensure the proposer makes a correct empty header.
@@ -66,7 +56,6 @@ async fn propose_payload() {
     let (name, _, _, consensus_secret) = keys().pop().unwrap();
     let signature_service = SignatureService::new(consensus_secret);
     let committee = committee();
-    let rate_controller = test_rate_controller(&committee);
 
     let (_tx_parents, rx_parents) = channel(1);
     let (_tx_headers_from_core, rx_headers_from_core) = channel(1);
@@ -74,6 +63,7 @@ async fn propose_payload() {
     let (_tx_committed, rx_committed) = channel(1);
     let (tx_headers, mut rx_headers) = channel(1);
     let (tx_batch_rescue, _rx_batch_rescue) = channel(1);
+    let (_tx_catchup_mode, rx_catchup_mode) = channel(1);
 
     // Create a new test store.
     let path = ".db_test_propose_payload";
@@ -95,7 +85,7 @@ async fn propose_payload() {
         /* rx_committed */ rx_committed,
         /* tx_core */ tx_headers,
         tx_batch_rescue,
-        rate_controller,
+        rx_catchup_mode,
     );
 
     // Send enough digests for the header payload.

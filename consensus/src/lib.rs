@@ -360,8 +360,11 @@ impl ConsensusAlgorithm for Tusk {
         }
 
         info!(
-            "Committing leader at round {} with stake {}/{}",
-            leader_round, stake, required_stake
+            "[LEADER COMMIT SUCCESS] Committing leader {:?} at round {} with stake {}/{} (Tusk consensus). This leader's transactions will be committed.",
+            leader.origin(),
+            leader_round,
+            stake,
+            required_stake
         );
 
         // Order and commit
@@ -454,7 +457,13 @@ impl ConsensusAlgorithm for Bullshark {
         // Bullshark commits leaders every 2 rounds (vs Tusk's 4)
         let r = round - 1;
         if r % 2 != 0 || r < 2 {
-            debug!("[CONSENSUS] Round {} not eligible for commit (r={}, r%2={}, r<2={})", round, r, r % 2, r < 2);
+            debug!(
+                "[CONSENSUS] Round {} not eligible for commit (r={}, r%2={}, r<2={})",
+                round,
+                r,
+                r % 2,
+                r < 2
+            );
             return Ok((Vec::new(), false));
         }
 
@@ -463,20 +472,73 @@ impl ConsensusAlgorithm for Bullshark {
             return Ok((Vec::new(), false));
         }
 
-        info!("[CONSENSUS] Checking for leader at round {} (current round: {})", leader_round, round);
+        info!(
+            "[CONSENSUS] Checking for leader at round {} (current round: {})",
+            leader_round, round
+        );
         let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
             Some(x) => {
-                info!("[CONSENSUS] Found leader {:?} at round {}", x.1.origin(), leader_round);
+                info!(
+                    "[CONSENSUS] Found leader {:?} at round {}",
+                    x.1.origin(),
+                    leader_round
+                );
                 x.clone()
             }
             None => {
                 metrics.failed_leader_elections += 1;
-                info!(
-                    "[CONSENSUS] Bullshark: no leader certificate available at round {}, cannot commit (current round {}). DAG has rounds: {:?}",
-                    leader_round,
-                    round,
-                    state.dag.keys().collect::<Vec<_>>()
-                );
+
+                // CRITICAL: Detect khi leader không tạo được certificate
+                let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
+                keys.sort();
+                let leader_pk = &keys[leader_round as usize % self.committee.size()];
+
+                // Check xem có certificates nào từ leader không (có thể có nhưng không đủ votes để tạo certificate)
+                let leader_has_certificate = state
+                    .dag
+                    .get(&leader_round)
+                    .and_then(|round_certs| round_certs.get(leader_pk))
+                    .is_some();
+
+                if !leader_has_certificate {
+                    // CRITICAL: Leader không tạo được certificate - đây là vấn đề nghiêm trọng
+                    let available_primaries: Vec<_> = state
+                        .dag
+                        .get(&leader_round)
+                        .map(|certs| certs.keys().cloned().collect::<Vec<_>>())
+                        .unwrap_or_default();
+
+                    error!(
+                        "[LEADER NO CERTIFICATE] Leader {:?} at round {} did NOT create a certificate. Cannot commit. Current round: {}. Available primaries at round {}: {:?} ({} out of {}). This indicates the leader may be lagging, network issues, or the leader is not receiving votes. Transactions from this leader will NOT be committed.",
+                        leader_pk,
+                        leader_round,
+                        round,
+                        leader_round,
+                        available_primaries,
+                        available_primaries.len(),
+                        self.committee.size(),
+                    );
+
+                    // CRITICAL: Nếu là primary0, log error đặc biệt
+                    if let Some(first_primary) = keys.first() {
+                        if leader_pk == first_primary {
+                            error!(
+                                "[PRIMARY0 LEADER NO CERTIFICATE] Primary0 (first primary) as leader at round {} did NOT create a certificate. This will cause ALL transactions from primary0 to be stuck. Available primaries: {:?}",
+                                leader_round,
+                                available_primaries
+                            );
+                        }
+                    }
+                } else {
+                    warn!(
+                        "[CONSENSUS] Bullshark: no leader certificate available at round {} (leader {:?}), cannot commit (current round {}). DAG has rounds: {:?}",
+                        leader_round,
+                        leader_pk,
+                        round,
+                        state.dag.keys().collect::<Vec<_>>()
+                    );
+                }
+
                 return Ok((Vec::new(), false));
             }
         };
@@ -512,21 +574,57 @@ impl ConsensusAlgorithm for Bullshark {
         let required_stake = self.committee.validity_threshold();
 
         if stake < required_stake {
-            info!(
-                "Bullshark: leader {:?} at round {} has insufficient support ({}/{}). supporters={:?}, missing={:?}",
+            // CRITICAL: Log insufficient support với chi tiết để debug primary bị "bỏ rơi"
+            let missing_stake: Stake = missing_info
+                .iter()
+                .map(|info| {
+                    // Parse stake from "PublicKey@stake" format
+                    if let Some(stake_str) = info.split('@').nth(1) {
+                        stake_str.parse::<Stake>().unwrap_or(0)
+                    } else {
+                        0
+                    }
+                })
+                .sum();
+
+            warn!(
+                "[LEADER INSUFFICIENT SUPPORT] Leader {:?} at round {} has insufficient support ({}/{} required). Missing stake: {}. Supporters ({}): {:?}. Missing primaries ({}): {:?}. This may indicate network issues, primary lag, or primary exclusion. If this persists, the leader's transactions will not be committed.",
                 leader.origin(),
                 leader_round,
                 stake,
                 required_stake,
+                missing_stake,
+                supporters_set.len(),
                 supporters_info,
+                missing_info.len(),
                 missing_info
             );
+
+            // CRITICAL: Nếu leader là primary đầu tiên (primary0) và thiếu support, log error để alert
+            let mut keys: Vec<_> = self.committee.authorities.keys().cloned().collect();
+            keys.sort();
+            if let Some(first_primary) = keys.first() {
+                if leader.origin() == *first_primary {
+                    error!(
+                        "[PRIMARY0 LEADER INSUFFICIENT SUPPORT] Primary0 (first primary) as leader at round {} has insufficient support ({}/{}). This may cause transactions from primary0 to be stuck. Missing primaries: {:?}",
+                        leader_round,
+                        stake,
+                        required_stake,
+                        missing_info
+                    );
+                }
+            }
+
             return Ok((Vec::new(), false));
         }
 
         info!(
-            "Committing leader at round {} with stake {}/{}",
-            leader_round, stake, required_stake
+            "[LEADER COMMIT SUCCESS] Committing leader {:?} at round {} with stake {}/{} (supporters: {} primaries). This leader's transactions will be committed.",
+            leader.origin(),
+            leader_round,
+            stake,
+            required_stake,
+            supporters_set.len()
         );
 
         // Order and commit
@@ -722,7 +820,11 @@ impl Consensus {
 
         // Main processing loop
         while let Some(certificate) = self.rx_primary.recv().await {
-            info!("[CONSENSUS] Received certificate from round {} (origin: {:?})", certificate.round(), certificate.origin());
+            info!(
+                "[CONSENSUS] Received certificate from round {} (origin: {:?})",
+                certificate.round(),
+                certificate.origin()
+            );
 
             let mut metrics = self.metrics.write().await;
 
@@ -769,7 +871,7 @@ impl Consensus {
                         let cert_digest = certificate.digest();
                         let cert_round = certificate.round();
                         let batch_count = certificate.header.payload.len();
-                        
+
                         // CRITICAL: Warning khi certificate empty
                         if batch_count == 0 {
                             warn!(
@@ -777,7 +879,7 @@ impl Consensus {
                                 cert_digest, cert_round
                             );
                         }
-                        
+
                         match self.tx_output.send(certificate).await {
                             Ok(()) => {
                                 info!(

@@ -2,7 +2,7 @@
 use bytes::Bytes;
 use config::{Committee, WorkerId};
 use crypto::{Digest, PublicKey};
-use log::{error, warn};
+use log::{error, info, warn};
 use network::SimpleSender;
 use store::Store;
 use tokio::sync::mpsc::Receiver;
@@ -59,10 +59,28 @@ impl Helper {
             };
 
             // Reply to the request (the best we can).
+            info!(
+                "[WORKER HELPER] Worker {} replying to {} batch digests requested by {}",
+                self.id,
+                digests.len(),
+                origin
+            );
             for digest in digests {
                 match self.store.read(digest.to_vec()).await {
-                    Ok(Some(data)) => self.network.send(address, Bytes::from(data)).await,
-                    Ok(None) => (),
+                    Ok(Some(data)) => {
+                        info!(
+                            "[WORKER HELPER] Worker {} sending batch {} ({} bytes) to requester {}",
+                            self.id,
+                            digest,
+                            data.len(),
+                            origin
+                        );
+                        self.network.send(address, Bytes::from(data)).await
+                    }
+                    Ok(None) => info!(
+                        "[WORKER HELPER] Worker {} missing batch {} requested by {}",
+                        self.id, digest, origin
+                    ),
                     Err(e) => error!("{}", e),
                 }
             }

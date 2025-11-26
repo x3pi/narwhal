@@ -500,7 +500,7 @@ mod tx_logger {
                 // Tính hash từ TransactionHashData (protobuf encoded) - thống nhất với Go
                 let transaction_hash = calculate_transaction_hash(&tx);
                 let hash_hex = hex::encode(&transaction_hash);
-                
+
                 let from_hex = hex::encode(&tx.from_address);
                 let to_hex = hex::encode(&tx.to_address);
                 let amount_hex = hex::encode(&tx.amount);
@@ -527,7 +527,7 @@ mod tx_logger {
                 use sha3::{Digest as Sha3Digest, Keccak256};
                 let transaction_hash = Keccak256::digest(payload).to_vec();
                 let hash_hex = hex::encode(&transaction_hash);
-                
+
                 let payload_hex = if payload.len() <= 64 {
                     hex::encode(payload)
                 } else {
