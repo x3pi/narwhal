@@ -27,9 +27,9 @@ NODE_BINARY="./target/release/node"
 EXECUTOR_BINARY="./go/bin/exetps"
 
 LOG_DIR="$BENCHMARK_DIR/logs"
-COMMITTEE_FILE="$BENCHMARK_DIR/.committee.json"
+COMMITTEE_FILE="$BENCHMARK_DIR/committlee.json"
 PARAMETERS_FILE="$BENCHMARK_DIR/.parameters.json"
-KEY_FILE="$BENCHMARK_DIR/.node-$NODE_ID.json"
+KEY_FILE="$BENCHMARK_DIR/node-$NODE_ID.json"
 
 # --- Kiểm tra các file cần thiết ---
 for f in "$NODE_BINARY" "$EXECUTOR_BINARY" "$KEY_FILE" "$COMMITTEE_FILE" "$PARAMETERS_FILE"; do
@@ -57,14 +57,14 @@ echo ""
 
 
 # --- SỬA LỖI: Khởi chạy Executor TRƯỚC ---
-executor_log="$LOG_DIR/executor-$NODE_ID.log"
-executor_cmd="$EXECUTOR_BINARY --id $NODE_ID"
+# executor_log="$LOG_DIR/executor-$NODE_ID.log"
+# executor_cmd="$EXECUTOR_BINARY --id $NODE_ID"
 
-echo "🚀 Khởi động Executor-$NODE_ID..."
-tmux new -d -s "executor-$NODE_ID" "sh -c '$executor_cmd > \"$executor_log\" 2>&1 || echo \"[FATAL] Executor exited\" >> \"$executor_log\"'"
+# echo "🚀 Khởi động Executor-$NODE_ID..."
+# tmux new -d -s "executor-$NODE_ID" "sh -c '$executor_cmd > \"$executor_log\" 2>&1 || echo \"[FATAL] Executor exited\" >> \"$executor_log\"'"
 
-# --- SỬA LỖI: Thêm một khoảng nghỉ ngắn để executor tạo socket ---
-sleep 0.2
+# # --- SỬA LỖI: Thêm một khoảng nghỉ ngắn để executor tạo socket ---
+# sleep 0.2
 
 
 # --- Khởi chạy Primary ---

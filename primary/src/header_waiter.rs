@@ -8,7 +8,7 @@ use crypto::{Digest, PublicKey};
 use futures::future::try_join_all;
 use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use network::SimpleSender;
 use std::collections::{hash_map::Entry, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,7 +38,11 @@ struct BatchRequestInfo {
 /// The commands that can be sent to the `Waiter`.
 #[derive(Debug)]
 pub enum WaiterMessage {
-    SyncBatches(HashMap<Digest, WorkerId>, Header),
+    SyncBatches {
+        missing: HashMap<Digest, WorkerId>,
+        header: Header,
+        committed: bool,
+    },
     SyncParents(Vec<Digest>, Header),
 }
 
@@ -75,6 +79,12 @@ pub struct HeaderWaiter {
     /// List of digests (either certificates, headers or tx batch) that are waiting
     /// to be processed. Their processing will resume when we get all their dependencies.
     pending: HashMap<Digest, (Round, Sender<()>)>,
+    /// Last cleanup time for tracking maps
+    last_cleanup: Option<u128>,
+    /// Cleanup interval (every 60 seconds)
+    cleanup_interval_ms: u128,
+    /// Maximum age for entries (5 minutes)
+    max_entry_age_ms: u128,
 }
 
 impl HeaderWaiter {
@@ -105,10 +115,85 @@ impl HeaderWaiter {
                 parent_requests: HashMap::new(),
                 batch_requests: HashMap::new(),
                 pending: HashMap::new(),
+                last_cleanup: None,
+                cleanup_interval_ms: 60_000, // 60 seconds
+                max_entry_age_ms: 300_000, // 5 minutes
             }
             .run()
             .await;
         });
+    }
+
+    /// Cleanup old entries from tracking maps to prevent memory leak
+    /// SAFETY: Only removes entries that are:
+    /// 1. From rounds older than gc_depth (already committed or will never commit)
+    /// 2. Older than max_age AND from rounds that are far behind consensus
+    /// This ensures no batches are lost and system remains deterministic
+    fn cleanup_old_entries(&mut self, now: u128) {
+        let cutoff_time = now.saturating_sub(self.max_entry_age_ms);
+        let consensus_round = self.consensus_round.load(Ordering::Relaxed);
+        let gc_watermark = consensus_round.saturating_sub(self.gc_depth);
+        
+        // SAFETY: Only cleanup entries from rounds that are:
+        // 1. Older than gc_depth (already committed or garbage collected)
+        // 2. OR very old (> 10 minutes) and from rounds far behind consensus
+        // This prevents removing entries for batches that are still being synced
+        
+        // Cleanup parent_requests - only remove from rounds that are garbage collected
+        let before_parents = self.parent_requests.len();
+        self.parent_requests.retain(|_, (round, timestamp, _)| {
+            // Keep if round is recent (not garbage collected)
+            if *round > gc_watermark {
+                return true;
+            }
+            // For old rounds, only remove if also old by timestamp
+            // This ensures we don't remove recent requests for old rounds
+            *timestamp > cutoff_time
+        });
+        let after_parents = self.parent_requests.len();
+        let removed_parents = before_parents.saturating_sub(after_parents);
+        
+        // Cleanup batch_requests - SAFETY: Only remove entries from rounds that are:
+        // 1. Older than gc_depth (already committed or garbage collected)
+        // 2. AND older than max_age by timestamp
+        // This ensures we don't remove entries for batches still being synced
+        let before_batches = self.batch_requests.len();
+        let very_old_cutoff = now.saturating_sub(600_000); // 10 minutes
+        self.batch_requests.retain(|_, info| {
+            // Keep if round is recent (not garbage collected)
+            if info.round > gc_watermark {
+                return true;
+            }
+            // For old rounds (garbage collected), only remove if also very old by timestamp
+            // This ensures we don't remove recent retry attempts for old rounds
+            // Batches from garbage collected rounds should have been synced by now
+            // If not, they will be retried through normal sync mechanisms
+            let very_old = info.last_request_ms < very_old_cutoff;
+            if very_old {
+                false // Remove - round is GC'd and entry is very old
+            } else {
+                true // Keep - might still be syncing
+            }
+        });
+        let after_batches = self.batch_requests.len();
+        let removed_batches = before_batches.saturating_sub(after_batches);
+        
+        // Cleanup pending - only remove from rounds that are garbage collected
+        let before_pending = self.pending.len();
+        self.pending.retain(|_, (round, _)| {
+            *round > gc_watermark
+        });
+        let after_pending = self.pending.len();
+        let removed_pending = before_pending.saturating_sub(after_pending);
+        
+        if removed_parents > 0 || removed_batches > 0 || removed_pending > 0 {
+            debug!(
+                "[HEADER WAITER CLEANUP] Cleaned up old entries: {} parent_requests ({} -> {}), {} batch_requests ({} -> {}), {} pending ({} -> {}). Only removed entries from garbage collected rounds or very old entries.",
+                removed_parents, before_parents, after_parents,
+                removed_batches, before_batches, after_batches,
+                removed_pending, before_pending, after_pending
+            );
+        }
     }
 
     /// Helper function. It waits for particular data to become available in the storage
@@ -130,7 +215,7 @@ impl HeaderWaiter {
         }
     }
 
-    /// Main loop listening to the `Synchronizer` messages.
+    // Main loop listening to the `Synchronizer` messages.
     async fn run(&mut self) {
         let mut waiting = FuturesUnordered::new();
 
@@ -141,49 +226,61 @@ impl HeaderWaiter {
             tokio::select! {
                 Some(message) = self.rx_synchronizer.recv() => {
                     match message {
-                        WaiterMessage::SyncBatches(missing, header) => {
+                        WaiterMessage::SyncBatches { missing, header, committed } => {
                             let header_id = header.id.clone();
                             let round = header.round;
-                            let author = header.author;
+                            let author = header.author.clone();
                             let missing_count = missing.len();
-                            let missing_digests_sample: Vec<_> = missing.keys().take(5).cloned().collect();
+                            let _missing_digests_sample: Vec<_> = missing.keys().take(5).cloned().collect();
+                            let priority = if committed { "COMMITTED" } else { "PENDING" };
 
-                            info!(
-                                "[SYNC BATCHES REQUEST] HeaderWaiter {} received sync request for {} missing batches from header {} (round {}, author: {}). Sample batches: {:?}. Will request from ALL workers in parallel.",
-                                self.name,
-                                missing_count,
-                                header_id,
-                                round,
-                                author,
-                                missing_digests_sample
+                            tracing::info!(
+                                target: "narwhal_audit",
+                                priority = priority,
+                                missing_count = missing_count,
+                                header_id = %header_id,
+                                round = round,
+                                author = %author,
+                                "[SYNC BATCHES REQUEST] HeaderWaiter received sync request"
                             );
 
-                            // Ensure we sync only once per header.
-                            if self.pending.contains_key(&header_id) {
-                                continue;
+                            let already_pending = self.pending.contains_key(&header_id);
+
+                            // Add the header to the waiter pool only once.
+                            if !already_pending {
+                                let wait_for = missing
+                                    .keys()
+                                    .map(|digest| (digest.to_vec(), self.store.clone()))
+                                    .collect();
+
+                                let (tx_cancel, rx_cancel) = channel(1);
+                                self.pending.insert(header_id.clone(), (round, tx_cancel));
+                                let fut = Self::waiter(wait_for, header.clone(), rx_cancel);
+                                waiting.push(fut);
+                            } else {
+                                info!(
+                                    "[SYNC BATCHES REQUEST][{}] Header {} already pending, re-using existing waiter",
+                                    priority, header_id
+                                );
                             }
 
-                            // Add the header to the waiter pool. The waiter will return it to when all
-                            // its parents are in the store.
-                            let wait_for = missing
-                                .keys() // Chỉ cần lấy digest từ HashMap
-                                .map(|digest| (digest.to_vec(), self.store.clone()))
-                                .collect();
-
-                            let (tx_cancel, rx_cancel) = channel(1);
-                            self.pending.insert(header_id, (round, tx_cancel));
-                            let fut = Self::waiter(wait_for, header, rx_cancel);
-                            waiting.push(fut);
-
-                            // Ensure we didn't already send a sync request for these parents.
-                            let mut requires_sync = HashMap::new();
+                            // Determine which digests still require network sync.
+                            let mut requires_sync: HashMap<WorkerId, Vec<Digest>> = HashMap::new();
                             let now = SystemTime::now()
                                 .duration_since(UNIX_EPOCH)
                                 .expect("Failed to measure time")
                                 .as_millis();
+
                             for (digest, worker_id) in missing.into_iter() {
                                 match self.batch_requests.entry(digest.clone()) {
-                                    Entry::Occupied(_) => continue,
+                                    Entry::Occupied(mut entry) => {
+                                        if committed {
+                                            let info = entry.get_mut();
+                                            info.last_request_ms = now;
+                                            info.attempts = info.attempts.saturating_add(1);
+                                            requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest.clone());
+                                        }
+                                    }
                                     Entry::Vacant(entry) => {
                                         requires_sync.entry(worker_id).or_insert_with(Vec::new).push(digest.clone());
                                         entry.insert(BatchRequestInfo {
@@ -197,18 +294,41 @@ impl HeaderWaiter {
                                     }
                                 }
                             }
+
+                            if committed && requires_sync.is_empty() {
+                                debug!(
+                                    "[SYNC BATCHES REQUEST][COMMITTED] Header {} already has outstanding sync requests. Forcing immediate retry.",
+                                    header_id
+                                );
+                                // Force another round of sync by refreshing timestamps.
+                                for (digest, info) in self.batch_requests.iter_mut() {
+                                    if info.round == round && info.author == author {
+                                        info.last_request_ms = now;
+                                        info.attempts = info.attempts.saturating_add(1);
+                                        requires_sync
+                                            .entry(info.worker_id)
+                                            .or_insert_with(Vec::new)
+                                            .push(digest.clone());
+                                    }
+                                }
+                            }
                             // ĐỒNG BỘ SIÊU NHANH: Gửi đến nhiều workers song song để tăng tốc độ
                             for (worker_id, digests) in requires_sync {
                                 let batch_count = digests.len();
-                                let digests_sample: Vec<_> = digests.iter().take(3).cloned().collect();
 
-                                info!(
-                                    "[SYNC BATCHES SEND] HeaderWaiter {} sending sync request for {} batches (worker {}, author: {}). Sample: {:?}. Sending to ALL workers in parallel for maximum speed.",
-                                    self.name,
-                                    batch_count,
-                                    worker_id,
-                                    author,
-                                    digests_sample
+                                let batch_list: Vec<String> = digests.iter().take(10).map(|d| format!("{}", d)).collect();
+                                
+                                // CRITICAL: Log chi tiết trước khi gửi sync request
+                                tracing::info!(
+                                    target: "narwhal_audit",
+                                    priority = priority,
+                                    worker_id = worker_id,
+                                    author = %author,
+                                    batch_count = batch_count,
+                                    header_id = %header_id,
+                                    round = round,
+                                    "[SYNC BATCHES SEND] HeaderWaiter {} sending sync request for {} batches from worker {} (author: {}) for header {} (round {}). Batches: {:?}",
+                                    self.name, batch_count, worker_id, author, header_id, round, batch_list
                                 );
 
                                 let author_address = self.committee
@@ -219,12 +339,33 @@ impl HeaderWaiter {
                                 let bytes = bincode::serialize(&message)
                                     .expect("Failed to serialize batch sync request");
 
+                                // CRITICAL: Track thời gian gửi sync request
+                                let sync_send_start = std::time::Instant::now();
+                                
                                 // ĐỒNG BỘ SIÊU NHANH: Gửi đến TẤT CẢ workers ngay lập tức để tăng tốc độ sync tối đa
                                 // Gửi đến worker của author trước
-                                self.network.send(author_address, Bytes::from(bytes.clone())).await;
                                 info!(
-                                    "[SYNC BATCHES SEND] HeaderWaiter {} sent sync request to author worker {} ({}) for {} batches",
-                                    self.name, author, author_address, batch_count
+                                    "[SYNC BATCHES SEND][{}] Dispatching request to author worker {} ({}) for {} batch(es)",
+                                    priority,
+                                    worker_id,
+                                    author_address,
+                                    batch_count
+                                );
+                                self.network
+                                    .send(author_address, Bytes::from(bytes.clone()))
+                                    .await;
+                                
+                                // CRITICAL: Log sau khi gửi sync request thành công
+                                let sync_send_duration = sync_send_start.elapsed();
+                                tracing::info!(
+                                    target: "narwhal_audit",
+                                    priority = priority,
+                                    worker_id = worker_id,
+                                    author = %author,
+                                    batch_count = batch_count,
+                                    duration_ms = sync_send_duration.as_millis(),
+                                    "[SYNC BATCHES SENT] HeaderWaiter {} successfully sent sync request for {} batches to worker {} (author: {}) in {}ms. Waiting for worker response.",
+                                    self.name, batch_count, worker_id, author, sync_send_duration.as_millis()
                                 );
 
                                 // Gửi đến TẤT CẢ workers của các node khác để tăng tốc độ sync tối đa
@@ -239,8 +380,12 @@ impl HeaderWaiter {
                                 let other_workers_count = other_workers.len();
                                 if other_workers_count > 0 {
                                     info!(
-                                        "[SYNC BATCHES SEND] HeaderWaiter {} sending sync request to {} other workers in parallel for {} batches (worker {})",
-                                        self.name, other_workers_count, batch_count, worker_id
+                                        "[SYNC BATCHES FANOUT][{}] {} sending sync request to {} peer workers for {} batch(es) (worker {})",
+                                        priority,
+                                        self.name,
+                                        other_workers_count,
+                                        batch_count,
+                                        worker_id
                                     );
                                 }
 
@@ -249,7 +394,17 @@ impl HeaderWaiter {
                                     let message_other = PrimaryWorkerMessage::Synchronize(digests.clone(), author);
                                     let bytes_other = bincode::serialize(&message_other)
                                         .expect("Failed to serialize batch sync request");
-                                    self.network.send(worker_addr, Bytes::from(bytes_other)).await;
+                                    tracing::info!(
+                                        target: "narwhal_audit",
+                                        priority = priority,
+                                        worker_address = %worker_addr,
+                                        batch_count = batch_count,
+                                        author = %author,
+                                        "[SYNC BATCHES FANOUT SEND] Sending batch sync request to peer worker"
+                                    );
+                                    self.network
+                                        .send(worker_addr, Bytes::from(bytes_other))
+                                        .await;
                                 }
                             }
                         }
@@ -354,13 +509,24 @@ impl HeaderWaiter {
                 },
 
                 () = &mut timer => {
-                    // We optimistically sent sync requests to a single node. If this timer triggers,
-                    // it means we were wrong to trust it. We are done waiting for a reply and we now
-                    // broadcast the request to all nodes.
+                    // CRITICAL: Cleanup old entries periodically to prevent memory leak
+                    // This prevents system degradation over time
                     let now = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .expect("Failed to measure time")
                         .as_millis();
+                    
+                    // Cleanup old entries if enough time has passed
+                    if self.last_cleanup.map_or(true, |last| {
+                        now.saturating_sub(last) >= self.cleanup_interval_ms
+                    }) {
+                        self.cleanup_old_entries(now);
+                        self.last_cleanup = Some(now);
+                    }
+
+                    // We optimistically sent sync requests to a single node. If this timer triggers,
+                    // it means we were wrong to trust it. We are done waiting for a reply and we now
+                    // broadcast the request to all nodes.
 
                     let mut retry_targeted = Vec::new();
                     let mut retry_broadcast = Vec::new();
@@ -443,6 +609,13 @@ impl HeaderWaiter {
                                     info.round,
                                     info.attempts,
                                 ));
+                                
+                                // Structured log: Batch sync retry nhiều lần
+                                // Note: HeaderWaiter không có structured_logger, sẽ log qua batch log file
+                                warn!(
+                                    "[SYNC BATCH RETRY HIGH] HeaderWaiter {} batch {} sync retry #{} (worker {}, author: {}, round: {}). Batch may be stuck!",
+                                    self.name, digest, info.attempts, info.worker_id, info.author, info.round
+                                );
                             }
                         }
                     }

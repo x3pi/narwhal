@@ -28,3 +28,4 @@ benchmark/db_*
 go/bin/exetps
 benchmark/db-*
 go/bin/exetps
+benchmark/logs/*

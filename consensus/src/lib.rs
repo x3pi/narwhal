@@ -469,12 +469,16 @@ impl ConsensusAlgorithm for Bullshark {
 
         let leader_round = r;
         if leader_round <= state.last_committed_round {
+            debug!(
+                "[CONSENSUS] Skipping commit for leader_round {} because it's <= last_committed_round {} (current round: {})",
+                leader_round, state.last_committed_round, round
+            );
             return Ok((Vec::new(), false));
         }
 
         info!(
-            "[CONSENSUS] Checking for leader at round {} (current round: {})",
-            leader_round, round
+            "[CONSENSUS] Checking for leader at round {} (current round: {}, last_committed_round: {})",
+            leader_round, round, state.last_committed_round
         );
         let (leader_digest, leader) = match self.leader(leader_round, &state.dag) {
             Some(x) => {
@@ -820,11 +824,19 @@ impl Consensus {
 
         // Main processing loop
         while let Some(certificate) = self.rx_primary.recv().await {
-            info!(
-                "[CONSENSUS] Received certificate from round {} (origin: {:?})",
-                certificate.round(),
-                certificate.origin()
-            );
+            // CRITICAL: Chỉ log khi cần debug để giảm log noise
+            // Log chi tiết sẽ làm chậm consensus processing
+            let cert_round = certificate.round();
+            let cert_origin = certificate.origin();
+            let batch_count = certificate.header.payload.len();
+            
+            // Chỉ log mỗi 100 certificates hoặc khi có batches
+            if cert_round % 100 == 0 || batch_count > 0 {
+                info!(
+                    "[CONSENSUS] Received certificate from round {} (origin: {:?}, {} batches)",
+                    cert_round, cert_origin, batch_count
+                );
+            }
 
             let mut metrics = self.metrics.write().await;
 
@@ -851,6 +863,17 @@ impl Consensus {
 
                     // Output committed certificates
                     for certificate in sequence {
+                        let cert_digest = certificate.digest();
+                        let cert_round = certificate.round();
+                        let batch_count = certificate.header.payload.len();
+                        
+                        // CRITICAL: Log khi certificate được commit
+                        tracing::info!(
+                            target: "narwhal_audit",
+                            "[CONSENSUS COMMIT] Consensus committed certificate {} (round {}, author: {}, {} batches). Certificate will be sent to primary and UDS.",
+                            cert_digest, cert_round, certificate.origin(), batch_count
+                        );
+                        
                         #[cfg(not(feature = "benchmark"))]
                         info!("Committed {}", certificate.header);
 
@@ -860,10 +883,22 @@ impl Consensus {
                             info!("Committed {} -> {:?}", certificate.header, digest);
                         }
 
+                        // Bỏ log này - không cần thiết, tạo quá nhiều log (18k+ dòng)
+                        // Chỉ log khi có vấn đề hoặc cần debug
+
                         // Send to primary
+                        // CRITICAL: Log when sending certificate to primary (GarbageCollector)
+                        let cert_digest_for_primary = certificate.digest();
+                        let cert_round_for_primary = certificate.round();
+                        let batch_count_for_primary = certificate.header.payload.len();
                         if let Err(e) = self.tx_primary.send(certificate.clone()).await {
-                            error!("Failed to send certificate to primary: {}", e);
+                            error!(
+                                target: "narwhal_audit",
+                                "[CONSENSUS TO PRIMARY FAILED] Consensus failed to send certificate {} (round {}, {} batches) to primary (GarbageCollector): {}. This will prevent latest_committed_round from being updated!",
+                                cert_digest_for_primary, cert_round_for_primary, batch_count_for_primary, e
+                            );
                         }
+                        // Bỏ log success - chỉ log khi có lỗi
 
                         // Send to output
                         // CRITICAL: Log chi tiết khi gửi certificate tới rx_output
@@ -880,11 +915,19 @@ impl Consensus {
                             );
                         }
 
+                        // CRITICAL: Log khi gửi certificate đến output (UDS)
+                        let cert_digest_output = certificate.digest();
+                        let cert_round_output = certificate.round();
+                        let cert_origin_output = certificate.origin();
+                        let batch_count_output = certificate.header.payload.len();
+                        
                         match self.tx_output.send(certificate).await {
                             Ok(()) => {
-                                info!(
-                                    "[CONSENSUS OUTPUT] Successfully sent certificate {} (round {}, {} batches) to rx_output channel",
-                                    cert_digest, cert_round, batch_count
+                                // CRITICAL: Log khi certificate được gửi thành công đến output (UDS)
+                                tracing::info!(
+                                    target: "narwhal_audit",
+                                    "[CONSENSUS TO OUTPUT] Consensus sent certificate {} (round {}, author: {}, {} batches) to output channel (UDS). Certificate will be processed and sent to UDS.",
+                                    cert_digest_output, cert_round_output, cert_origin_output, batch_count_output
                                 );
                             }
                             Err(e) => {

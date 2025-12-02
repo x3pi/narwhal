@@ -25,6 +25,8 @@ store = { path = "../store" }
 config = { path = "../config" }
 network = { path = "../network" }
 dashmap = "6.1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 
 [dev-dependencies]
 rand = { version = "0.8", features = ["std"] }

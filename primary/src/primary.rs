@@ -4,7 +4,8 @@ use crate::core::Core;
 use crate::error::DagError;
 use crate::garbage_collector::GarbageCollector;
 use crate::header_waiter::HeaderWaiter;
-use crate::helper::Helper;
+use crate::certificate_cache::new_certificate_cache;
+use crate::helper::{Helper, HelperRequest};
 use crate::messages::{Certificate, Header, Vote};
 use crate::payload_receiver::PayloadReceiver;
 use crate::proposer::Proposer;
@@ -37,6 +38,7 @@ pub type PayloadCache = Arc<DashMap<Digest, Vec<u8>>>;
 // - Giảm capacity xuống 5_000 để phát hiện lỗi sớm hơn (thay vì chờ 2 tiếng)
 // - Nếu channel đầy, lỗi sẽ xuất hiện nhanh hơn → dễ debug hơn
 pub const CHANNEL_CAPACITY: usize = 5_000;
+pub const CERTIFICATE_CACHE_LIMIT: usize = 512;
 pub type Round = u64;
 
 #[derive(Debug, Clone)]
@@ -51,6 +53,11 @@ pub enum PrimaryMessage {
     Vote(Vote),
     Certificate(Certificate),
     CertificatesRequest(Vec<Digest>, PublicKey),
+    StateSyncRequest {
+        requester: PublicKey,
+        since_round: Round,
+        max_rounds: Round,
+    },
     BatchReplica {
         digest: Digest,
         worker_id: WorkerId,
@@ -110,15 +117,24 @@ impl Primary {
         let (tx_headers_loopback, rx_headers_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_certificates_loopback, rx_certificates_loopback) = channel(CHANNEL_CAPACITY);
         let (tx_primary_messages, rx_primary_messages) = channel(CHANNEL_CAPACITY);
-        let (tx_cert_requests, rx_cert_requests) = channel(CHANNEL_CAPACITY);
+        let (tx_helper_requests, rx_helper_requests) = channel(CHANNEL_CAPACITY);
         let (tx_committed_batches, rx_committed_batches) = channel(CHANNEL_CAPACITY);
         let (tx_batch_rescue, rx_batch_rescue) = channel(CHANNEL_CAPACITY);
         let payload_cache = Arc::new(DashMap::new());
+        let certificate_cache = new_certificate_cache(CERTIFICATE_CACHE_LIMIT);
         // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
 
         parameters.log();
         let name = keypair.name;
         let consensus_secret = keypair.consensus_secret;
+
+        // Tính node ID từ vị trí trong committee
+        let mut primary_keys: Vec<_> = committee.authorities.keys().cloned().collect();
+        primary_keys.sort();
+        let _node_id = primary_keys
+            .iter()
+            .position(|pk| pk == &name)
+            .unwrap_or(0) as u32;
 
         let consensus_round = Arc::new(AtomicU64::new(0));
 
@@ -139,7 +155,7 @@ impl Primary {
             primary_listener,
             PrimaryReceiverHandler {
                 tx_primary_messages,
-                tx_cert_requests,
+                tx_helper_requests,
             },
         );
         info!(
@@ -177,12 +193,15 @@ impl Primary {
             payload_cache.clone(),
             tx_sync_headers,
             tx_sync_certificates,
+            consensus_round.clone(),
         );
 
         let signature_service = SignatureService::new(consensus_secret);
 
         // CATCH-UP MODE: Create channel to notify proposer about catch-up mode
         let (tx_proposer_catchup, rx_proposer_catchup) = channel(10);
+        // ROUND SYNC: Create channel to send minimum network round to proposer
+        let (tx_proposer_min_round, rx_proposer_min_round) = channel(10);
 
         Core::spawn(
             name,
@@ -201,8 +220,10 @@ impl Primary {
             tx_headers_to_proposer.clone(),
             rx_batch_rescue,
             payload_cache.clone(),
+            certificate_cache.clone(),
             // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
             tx_proposer_catchup, // CATCH-UP MODE: Pass sender to Core
+            tx_proposer_min_round.clone(), // ROUND SYNC: Pass sender to Core
         );
 
         GarbageCollector::spawn(
@@ -213,7 +234,7 @@ impl Primary {
             tx_committed_batches.clone(),
         );
 
-        PayloadReceiver::spawn(store.clone(), payload_cache.clone(), rx_others_digests);
+        PayloadReceiver::spawn(store.clone(), payload_cache.clone(), rx_others_digests, tx_batch_rescue.clone(), name.clone());
 
         HeaderWaiter::spawn(
             name,
@@ -249,9 +270,15 @@ impl Primary {
             tx_batch_rescue,
             // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
             rx_proposer_catchup, // CATCH-UP MODE: Pass receiver to Proposer
+            rx_proposer_min_round, // ROUND SYNC: Pass receiver to Proposer
         );
 
-        Helper::spawn(committee.clone(), store, rx_cert_requests);
+        Helper::spawn(
+            committee.clone(),
+            store,
+            rx_helper_requests,
+            certificate_cache.clone(),
+        );
 
         info!(
             "Primary {} successfully booted on {}",
@@ -270,7 +297,7 @@ impl Primary {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_primary_messages: Sender<PrimaryMessage>,
-    tx_cert_requests: Sender<(Vec<Digest>, PublicKey)>,
+    tx_helper_requests: Sender<HelperRequest>,
 }
 
 #[async_trait]
@@ -279,10 +306,26 @@ impl MessageHandler for PrimaryReceiverHandler {
         let _ = writer.send(Bytes::from("Ack")).await;
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
             PrimaryMessage::CertificatesRequest(missing, requestor) => self
-                .tx_cert_requests
-                .send((missing, requestor))
+                .tx_helper_requests
+                .send(HelperRequest::Certificates {
+                    digests: missing,
+                    requester: requestor,
+                })
                 .await
-                .expect("Failed to send primary message"),
+                .expect("Failed to send helper request"),
+            PrimaryMessage::StateSyncRequest {
+                requester,
+                since_round,
+                max_rounds,
+            } => self
+                .tx_helper_requests
+                .send(HelperRequest::StateSync {
+                    requester,
+                    since_round,
+                    max_rounds,
+                })
+                .await
+                .expect("Failed to send state sync request"),
             request => self
                 .tx_primary_messages
                 .send(request)
@@ -309,49 +352,31 @@ impl MessageHandler for WorkerReceiverHandler {
     ) -> Result<(), Box<dyn Error>> {
         match bincode::deserialize(&serialized).map_err(DagError::SerializationError)? {
             WorkerPrimaryMessage::OurBatch(digest, worker_id, batch) => {
-                let batch_size = batch.len();
-                info!(
-                    "[PRIMARY RX WORKER] Primary {} received OurBatch {} from worker {} ({} bytes)",
-                    self.name, digest, worker_id, batch_size
-                );
                 match self
                     .tx_our_digests
                     .send((digest.clone(), worker_id, batch))
                     .await
                 {
                     Ok(()) => {
-                        info!(
-                            "[PRIMARY RX WORKER] Primary {} successfully sent batch {} from worker {} to proposer channel",
-                            self.name, digest, worker_id
-                        );
+                        // Chỉ log khi có lỗi - bỏ log success để giảm noise
                     }
                     Err(e) => {
                         // CRITICAL ERROR: Channel đầy hoặc đóng - batches không được gửi tới proposer
-                        // Đây là nguyên nhân chính khiến worker 0 bị đứng
                         error!(
-                            "[PRIMARY RX WORKER] CRITICAL: Primary {} FAILED to send batch {} from worker {} to proposer channel: {}. Channel may be full! This will cause batches to be stuck and worker to stop processing!",
+                            "[PRIMARY RX WORKER] CRITICAL: Primary {} FAILED to send batch {} from worker {} to proposer channel: {}. Channel may be full!",
                             self.name, digest, worker_id, e
                         );
-                        // Không panic, chỉ log error để hệ thống tiếp tục chạy
                     }
                 }
             }
             WorkerPrimaryMessage::OthersBatch(digest, worker_id, batch) => {
-                let batch_size = batch.len();
-                info!(
-                    "[PRIMARY RX WORKER] Primary {} received OthersBatch {} from worker {} ({} bytes)",
-                    self.name, digest, worker_id, batch_size
-                );
                 match self
                     .tx_others_digests
                     .send((digest.clone(), worker_id, batch))
                     .await
                 {
                     Ok(()) => {
-                        info!(
-                            "[PRIMARY RX WORKER] Primary {} successfully sent batch {} from worker {} to payload receiver channel",
-                            self.name, digest, worker_id
-                        );
+                        // Chỉ log khi có lỗi - bỏ log success để giảm noise
                     }
                     Err(e) => {
                         // CRITICAL ERROR: Channel đầy hoặc đóng

@@ -3,6 +3,7 @@
 mod error;
 mod aggregators;
 mod certificate_waiter;
+mod certificate_cache;
 mod core;
 mod garbage_collector;
 mod header_waiter;

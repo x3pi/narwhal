@@ -10,6 +10,8 @@ use bytes::Bytes;
 use config::{Committee, Parameters, WorkerId};
 use crypto::{Digest, PublicKey};
 use log::{error, info, warn};
+use prost::Message;
+use tracing;
 use network::{
     quic::QuicTransport,
     transport::Transport,
@@ -63,14 +65,36 @@ impl Worker {
 
         let transport = QuicTransport::new();
 
-        // SỬA ĐỔI: Không cần channel đi đến PrimaryConnector nữa.
-        // let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
+        // Tính node_id từ vị trí trong committee (tương tự primary)
+        let mut primary_keys: Vec<_> = worker.committee.authorities.keys().cloned().collect();
+        primary_keys.sort();
+        let _node_id = primary_keys
+            .iter()
+            .position(|pk| pk == &worker.name)
+            .unwrap_or(0) as u32;
 
-        worker.handle_primary_messages(&transport).await;
-        // worker.handle_clients_transactions(&transport, tx_primary.clone()).await;
-        // worker.handle_workers_messages(&transport, tx_primary).await;
+        // CRITICAL FIX: Tạo tx_processor ở level cao để pass vào cả handle_primary_messages và handle_workers_messages
+        // Điều này cho phép Synchronizer gửi batch lên primary sau khi nhận từ sync
+        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
+        
+        // Spawn Processor trước để nó sẵn sàng nhận batches
+        let primary_address = worker
+            .committee
+            .primary(&worker.name)
+            .expect("Our public key is not in the committee")
+            .worker_to_primary;
+        Processor::spawn(
+            worker.id,
+            worker.store.clone(),
+            rx_processor,
+            SimpleSender::new(),
+            primary_address,
+            false,
+        );
+
+        worker.handle_primary_messages(&transport, tx_processor.clone()).await;
         worker.handle_clients_transactions(&transport).await;
-        worker.handle_workers_messages(&transport).await;
+        worker.handle_workers_messages(&transport, tx_processor).await;
 
         // SỬA ĐỔI: Xóa bỏ PrimaryConnector.
         // PrimaryConnector::spawn(
@@ -94,7 +118,7 @@ impl Worker {
         );
     }
 
-    async fn handle_primary_messages(&self, transport: &QuicTransport) {
+    async fn handle_primary_messages(&self, transport: &QuicTransport, tx_processor: Sender<SerializedBatchMessage>) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
 
         let mut address = self
@@ -120,6 +144,7 @@ impl Worker {
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
             rx_synchronizer,
+            tx_processor,
         );
 
         info!(
@@ -204,10 +229,9 @@ impl Worker {
     async fn handle_workers_messages(
         &self,
         transport: &QuicTransport,
-        // tx_primary: Sender<SerializedBatchDigestMessage>, // <--- XÓA PARAMETER NÀY
+        tx_processor: Sender<SerializedBatchMessage>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
         let mut address = self
             .committee
@@ -235,20 +259,7 @@ impl Worker {
             rx_helper,
         );
 
-        // SỬA ĐỔI: Khởi tạo Processor với SimpleSender.
-        let primary_address = self
-            .committee
-            .primary(&self.name)
-            .expect("Our public key is not in the committee")
-            .worker_to_primary;
-        Processor::spawn(
-            self.id,
-            self.store.clone(),
-            rx_processor,
-            SimpleSender::new(),
-            primary_address,
-            false,
-        );
+        // NOTE: Processor đã được spawn trong handle_primary_messages để nhận batches từ sync
 
         info!(
             "Worker {} listening to worker messages on {}",
@@ -269,18 +280,21 @@ struct TxReceiverHandler {
 impl MessageHandler for TxReceiverHandler {
     async fn dispatch(&self, _writer: &mut Writer, message: Bytes) -> Result<(), Box<dyn Error>> {
         // Thử parse như Transactions (nhiều giao dịch)
-        use crate::transaction_logger::parse_and_log_transactions_simple;
+        use crate::transaction_logger::parse_and_log_transactions_simple_with_logger;
 
         // Parse và log transactions nếu có thể
-        parse_and_log_transactions_simple(&message, self.worker_id);
+        // Cập nhật để không dùng structured logger nữa (chỉ log ra stdout/json nếu cần hoặc bỏ qua)
+        parse_and_log_transactions_simple_with_logger(&message, self.worker_id);
 
-        // Log hex của transaction khi nhận được (backward compatible)
-        let tx_hex = hex::encode(&message);
-        log::info!(
-            "[WORKER RX] Received transaction: {} bytes, hex: {}",
-            message.len(),
-            tx_hex
-        );
+        // Tính hash của transaction để log (nếu có thể parse)
+        // Chỉ log khi cần thiết để trace giao dịch, không log hex đầy đủ
+        if let Ok(txs) = crate::transaction_logger::transaction::Transactions::decode(&message[..]) {
+            if let Some(tx) = txs.transactions.first() {
+                let tx_hash = crate::transaction_logger::calculate_transaction_hash(tx);
+                let tx_hash_hex = hex::encode(&tx_hash);
+                log_tx_nhan_tu_client!(&tx_hash_hex, self.worker_id, message.len());
+            }
+        }
 
         self.tx_batch_maker
             .send(message.to_vec())
@@ -301,11 +315,28 @@ impl MessageHandler for WorkerReceiverHandler {
     async fn dispatch(&self, writer: &mut Writer, serialized: Bytes) -> Result<(), Box<dyn Error>> {
         let _ = writer.send(Bytes::from("Ack")).await;
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self
+            Ok(WorkerMessage::Batch(_batch_data)) => {
+                // CRITICAL: Calculate digest để log
+                use sha3::Digest as Sha3Digest;
+                use sha3::Sha3_512 as Sha512;
+                let hash = Sha512::digest(&serialized);
+                let mut bytes = [0u8; 32];
+                bytes.copy_from_slice(&hash[..32]);
+                let batch_digest = crypto::Digest(bytes);
+                
+                // CRITICAL: Log khi worker nhận batch từ worker khác (có thể từ sync)
+                tracing::info!(
+                    target: "narwhal_audit",
+                    "[WORKER BATCH RECEIVED] Worker received batch {} ({} bytes) from another worker (possibly from sync). Batch will be processed and sent to primary.",
+                    batch_digest, serialized.len()
+                );
+                
+                self
                 .tx_processor
                 .send(serialized.to_vec())
                 .await
-                .expect("Failed to send batch"),
+                .expect("Failed to send batch")
+            },
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper
                 .send((missing, requestor))

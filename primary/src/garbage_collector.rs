@@ -3,8 +3,8 @@ use crate::messages::Certificate;
 use crate::primary::{CommittedBatches, PrimaryWorkerMessage};
 use bytes::Bytes;
 use config::Committee;
-use crypto::PublicKey;
-use log::{info, warn};
+use crypto::{Hash, PublicKey};
+use log::{error, info, warn};
 use network::SimpleSender;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -55,8 +55,20 @@ impl GarbageCollector {
 
     async fn run(&mut self) {
         let mut last_committed_round = 0;
+        info!(
+            target: "narwhal_audit",
+            "[GARBAGE COLLECTOR] GarbageCollector started and waiting for certificates from consensus"
+        );
         while let Some(certificate) = self.rx_consensus.recv().await {
             let round = certificate.round();
+            info!(
+                target: "narwhal_audit",
+                "[GARBAGE COLLECTOR] GarbageCollector received certificate {} (round {}, author: {}, {} batches) from consensus",
+                certificate.digest(),
+                round,
+                certificate.origin(),
+                certificate.header.payload.len()
+            );
 
             // Update consensus round if this is a new round
             if round > last_committed_round {
@@ -78,6 +90,7 @@ impl GarbageCollector {
 
             // BATCH TRACKING: Log when sending committed batches to proposer
             info!(
+                target: "narwhal_audit",
                 "[BATCH TRACK GC] GarbageCollector sending {} committed batches to proposer at round {} from certificate {} (author: {}): {:?}",
                 digests.len(),
                 round,
@@ -86,26 +99,59 @@ impl GarbageCollector {
                 digests.iter().take(10).collect::<Vec<_>>()
             );
 
-            if let Err(e) = self
-                .tx_committed
-                .send(CommittedBatches {
-                    round,
-                    digests: digests.clone(),
-                })
-                .await
-            {
-                warn!(
-                    "[BATCH TRACK GC] GarbageCollector: failed to notify proposer about committed round {} ({} batches): {}",
-                    round, digests.len(), e
-                );
-            } else {
-                info!(
-                    "[BATCH TRACK GC] GarbageCollector: successfully informed proposer about committed round {} ({} batches) from certificate {} (author: {})",
-                    round,
-                    digests.len(),
-                    certificate.header.id,
-                    certificate.origin()
-                );
+            // CRITICAL: Use try_send first to avoid blocking, then fallback to blocking send
+            // This ensures proposer always gets notified about committed rounds
+            match self.tx_committed.try_send(CommittedBatches {
+                round,
+                digests: digests.clone(),
+            }) {
+                Ok(()) => {
+                    info!(
+                        target: "narwhal_audit",
+                        "[COMMITTED BATCHES SENT] GarbageCollector successfully sent committed round {} ({} batches) to proposer from certificate {} (author: {})",
+                        round,
+                        digests.len(),
+                        certificate.header.id,
+                        certificate.origin()
+                    );
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    // Channel is full - use blocking send to ensure message is delivered
+                    warn!(
+                        target: "narwhal_audit",
+                        "[COMMITTED BATCHES CHANNEL FULL] GarbageCollector channel is full! Using blocking send for committed round {} ({} batches). This may indicate proposer is slow or channel capacity is too small.",
+                        round,
+                        digests.len()
+                    );
+                    if let Err(e) = self
+                        .tx_committed
+                        .send(CommittedBatches {
+                            round,
+                            digests: digests.clone(),
+                        })
+                        .await
+                    {
+                        error!(
+                            target: "narwhal_audit",
+                            "[COMMITTED BATCHES SEND FAILED] GarbageCollector CRITICAL: failed to notify proposer about committed round {} ({} batches): {}. Channel may be closed! This will cause latest_committed_round to not be updated and ROUND GUARD will block header creation!",
+                            round, digests.len(), e
+                        );
+                    } else {
+                        warn!(
+                            target: "narwhal_audit",
+                            "[COMMITTED BATCHES SENT BLOCKING] GarbageCollector sent committed round {} ({} batches) via blocking send. Channel was full - consider increasing channel capacity.",
+                            round,
+                            digests.len()
+                        );
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    error!(
+                        target: "narwhal_audit",
+                        "[COMMITTED BATCHES CHANNEL CLOSED] GarbageCollector CRITICAL: channel to proposer is CLOSED! Cannot notify about committed round {} ({} batches). This will cause latest_committed_round to not be updated and system will be stuck!",
+                        round, digests.len()
+                    );
+                }
             }
         }
     }

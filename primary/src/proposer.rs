@@ -37,6 +37,15 @@ enum BatchPriority {
     High = 2,   // Batches mới, từ leader, quan trọng
 }
 
+const MAX_ROUND_LEAD: Round = 50; // Không cho phép proposer vượt quá round đã commit + 2
+const BOOTSTRAP_ROUND_BUDGET: Round = 50; // Cho phép tiến trước thêm trong giai đoạn chưa có commit
+const MAX_ROUND_DRIFT: Round = 4; // Nếu vượt quá số vòng này thì không được force advance
+const MIN_NETWORK_ROUND_TIMEOUT_SECS: u64 = 30; // Nếu minimum_network_round không được cập nhật trong 30s, bỏ qua nó để đảm bảo progress
+const PARITY_STALL_ROUND_GAP: Round = 4; // Chênh lệch tối thiểu (hai round chẵn) để bật parity guard
+const PARITY_STALL_ACTIVATE_MS: u64 = 1_500; // Đợi 1.5s trước khi bật parity guard
+const PARITY_STALL_DELAY_MS: u64 = 600; // Delay thêm giữa các header khi parity guard bật
+const PARITY_SYNC_RESCUE_INTERVAL_MS: u64 = 1_500; // Khoảng thời gian tối thiểu giữa các lần parity sync
+const PARITY_SYNC_BATCH_BURST: usize = 5; // Số batch tối đa ép rescue mỗi lần parity sync
 const RESCUE_RETRY_THRESHOLD: usize = 5;
 const WARNING_SYNC_WAIT_SECS: u64 = 3; // Warning if batch waits this long for sync
 const MAX_SYNC_WAIT_SECS: u64 = 6; // Force re-sync/rescue if batch waits this long
@@ -105,6 +114,10 @@ pub struct Proposer {
     pending_payload_size: usize,
     /// Track the latest committed round to help decide when to retry stale payloads.
     latest_committed_round: Round,
+    /// ROUND SYNC: Track minimum round seen from network (from parent certificates) to prevent round drift
+    minimum_network_round: Round,
+    /// ROUND SYNC: Track when minimum_network_round was last updated (to detect stale values)
+    minimum_network_round_updated_at: Option<Instant>,
     /// Track digests that have been committed to avoid re-proposing them.
     /// Maps digest to the round it was committed in (for cleanup purposes).
     committed_digests: HashMap<Digest, Round>,
@@ -125,6 +138,8 @@ pub struct Proposer {
     rx_catchup_mode: Receiver<bool>,
     /// CATCH-UP MODE: Track if node is in catch-up mode
     is_catchup_mode: bool,
+    /// ROUND SYNC: Receive minimum network round updates from Core
+    rx_min_network_round: Receiver<Round>,
     /// LONG-TERM FIX: Track header creation rate for backpressure
     header_creation_rate: f64, // Multiplier for header creation delay (1.0 = normal, >1.0 = slower)
     /// LONG-TERM FIX: Last time we checked channel usage
@@ -135,9 +150,26 @@ pub struct Proposer {
     pending_zero_since: Option<Instant>,
     /// WATCHDOG: Maximum duration queue is allowed to be stuck before forcing rescue.
     max_pending_zero_duration: Duration,
+    /// PARITY GUARD: Track if even rounds failed to commit and proposer must slow down.
+    parity_guard_active: bool,
+    parity_stall_since: Option<Instant>,
+    parity_guard_backoff_until: Option<Instant>,
+    last_parity_committed_even: Option<Round>,
+    parity_last_sync: Option<Instant>,
 }
 
 impl Proposer {
+    fn max_allowed_round(&self) -> Round {
+        // REVERTED: Removed round sync logic, using only latest_committed_round
+        let committed_cap = self.latest_committed_round.saturating_add(MAX_ROUND_LEAD);
+        
+        if self.latest_committed_round < MAX_ROUND_LEAD {
+            committed_cap.max(BOOTSTRAP_ROUND_BUDGET)
+        } else {
+            committed_cap
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         name: PublicKey,
@@ -155,6 +187,7 @@ impl Proposer {
         tx_batch_rescue: Sender<BatchRescue>,
         // RATE CONTROL ĐÃ BỊ BỎ - Không còn sử dụng
         rx_catchup_mode: Receiver<bool>, // CATCH-UP MODE: Receive catch-up mode notifications
+        rx_min_network_round: Receiver<Round>, // ROUND SYNC: Receive minimum network round updates
     ) {
         let genesis = Certificate::genesis(committee)
             .iter()
@@ -181,6 +214,8 @@ impl Proposer {
                 digests_index: HashMap::new(),
                 pending_payload_size: 0,
                 latest_committed_round: 0,
+                minimum_network_round: 0, // ROUND SYNC: Initialize to 0, will be updated from Core
+                minimum_network_round_updated_at: None, // ROUND SYNC: Track when minimum_network_round was last updated
                 committed_digests: HashMap::new(),
                 max_retry_rounds: 1000, // Don't retry batches that have been InFlight for more than 1000 rounds
                 max_committed_digests: 5000, // Giảm từ 10000 xuống 5000 để cleanup thường xuyên hơn, tránh memory leak
@@ -190,12 +225,19 @@ impl Proposer {
                 // CATCH-UP MODE: Initialize catch-up mode state
                 rx_catchup_mode,
                 is_catchup_mode: false,
+                // ROUND SYNC: Initialize minimum network round receiver
+                rx_min_network_round,
                 // LONG-TERM FIX: Initialize performance tracking
                 header_creation_rate: 1.0, // Start with normal rate
                 last_channel_check: None,
                 channel_check_interval: Duration::from_secs(5), // Check every 5 seconds
                 pending_zero_since: None,
                 max_pending_zero_duration: Duration::from_secs(WATCHDOG_PENDING_ZERO_SECS),
+                parity_guard_active: false,
+                parity_stall_since: None,
+                parity_guard_backoff_until: None,
+                last_parity_committed_even: None,
+                parity_last_sync: None,
             }
             .run()
             .await;
@@ -288,7 +330,7 @@ impl Proposer {
         }
 
         if deduplicated_payload.is_empty() {
-            info!(
+            debug!(
                 "[HEADER CREATE] Primary {} no payload to include in header for round {} (pending_payload_size = {} bytes, queue_len: {})",
                 self.name,
                 self.round,
@@ -299,22 +341,29 @@ impl Proposer {
             // This is needed for empty rounds where no batches are available
             // PHASE 1: Also allow creating empty header with empty parents if force advance is enabled
             // This prevents proposer from being stuck when no parent certificates are received
+            // CRITICAL FIX: Trong catch-up mode, vẫn tạo empty headers để đảm bảo hệ thống tiếp tục
             let force_advance = self
                 .last_parent_received_at
                 .map(|t| t.elapsed() > self.max_parent_wait)
                 .unwrap_or(false);
+            
+            // CRITICAL: Trong catch-up mode, luôn cho phép tạo empty header khi không có parents
+            // Điều này đảm bảo block rỗng vẫn được tạo ngay cả khi không có batches
+            let allow_empty_header = !self.last_parents.is_empty() 
+                || force_advance 
+                || self.is_catchup_mode; // CRITICAL: Catch-up mode luôn cho phép empty header
 
-            if !self.last_parents.is_empty() || force_advance {
+            if allow_empty_header {
                 // PHASE 1: Log warning if creating header with empty parents due to force advance
-                if self.last_parents.is_empty() && force_advance {
+                if self.last_parents.is_empty() && (force_advance || self.is_catchup_mode) {
                     warn!(
-                        "[FORCE ADVANCE HEADER] Creating header for round {} with EMPTY parents due to force advance. This header may not be committed by consensus (requires quorum parents), but allows proposer to continue and avoid being stuck.",
-                        self.round
+                        "[FORCE ADVANCE HEADER] Creating header for round {} with EMPTY parents (force_advance={}, catchup_mode={}). This header may not be committed by consensus (requires quorum parents), but allows proposer to continue and avoid being stuck.",
+                        self.round, force_advance, self.is_catchup_mode
                     );
                 }
 
                 let parents_for_header = if self.last_parents.is_empty() {
-                    BTreeSet::new() // Empty parents when force advance
+                    BTreeSet::new() // Empty parents when force advance or catch-up mode
                 } else {
                     self.last_parents.drain(..).collect()
                 };
@@ -327,7 +376,7 @@ impl Proposer {
                     &mut self.signature_service,
                 )
                 .await;
-                info!("[HEADER CREATED] Primary {} created EMPTY header {} for round {} (pending_payload_size: {} bytes, queue_len: {})", self.name, header.id, self.round, self.pending_payload_size, self.digests.len());
+                debug!("[HEADER CREATED] Primary {} created EMPTY header {} for round {} (pending_payload_size: {} bytes, queue_len: {}, catchup_mode: {})", self.name, header.id, self.round, self.pending_payload_size, self.digests.len(), self.is_catchup_mode);
                 self.tx_core
                     .send(header)
                     .await
@@ -338,7 +387,7 @@ impl Proposer {
         }
 
         // Make a new header.
-        info!(
+        debug!(
             "[HEADER CREATE] Primary {} creating header for round {} with {} payload digests (pending_payload_size before send = {} bytes, queue_len: {})",
             self.name,
             self.round,
@@ -362,15 +411,19 @@ impl Proposer {
                 self.digests.len(),
                 self.pending_payload_size
             );
-        } else {
-            info!(
-                "[BATCH TRACK HEADER] Primary {} creating header for round {} with {} batches: {:?}",
-                self.name,
-                self.round,
-                batch_digests.len(),
-                batch_digests
-            );
+            
+            // Tracing: Empty header warning
+            for entry in self.digests.iter().take(10) {
+                tracing::warn!(
+                    batch_id = %entry.digest,
+                    round = self.round,
+                    queue_len = self.digests.len(),
+                    pending_payload_size = self.pending_payload_size,
+                    "[BATCH NOT INCLUDED] Batch NOT included in header - Queue may be stuck!"
+                );
+            }
         }
+        // Bỏ log chi tiết về batches trong header - chỉ cần log khi empty hoặc warning
 
         let header = Header::new(
             self.name,
@@ -380,7 +433,18 @@ impl Proposer {
             &mut self.signature_service,
         )
         .await;
-        info!("[HEADER CREATED] Primary {} created header {} for round {} with {} batches (pending_payload_size: {} bytes, queue_len: {})", self.name, header.id, self.round, header.payload.len(), self.pending_payload_size, self.digests.len());
+        
+        // CRITICAL: Log khi header được tạo với batches để đề xuất vote
+        let batch_digests_in_header: Vec<String> = header.payload.keys().map(|d| format!("{}", d)).collect();
+        tracing::info!(
+            target: "narwhal_audit",
+            "[HEADER PROPOSED] Primary {} PROPOSED header {} (round {}, {} batches) for voting. Batches in header: {:?}. Header will be broadcast to all primaries for voting.",
+            self.name,
+            header.id,
+            header.round,
+            header.payload.len(),
+            batch_digests_in_header
+        );
 
         #[cfg(feature = "benchmark")]
         for digest in header.payload.keys() {
@@ -471,6 +535,18 @@ impl Proposer {
 
                 // OPTIMIZATION: Skip InFlight batches immediately without logging each one
                 if matches!(entry.state, BatchState::InFlight { .. }) {
+                    // CRITICAL DEBUG: Log tất cả batches InFlight bị skip
+                    if let BatchState::InFlight { round, sent_at, retry_count } = &entry.state {
+                        debug!(
+                            target: "narwhal_audit",
+                            "[BATCH TRACE] Batch {} is InFlight (round: {}, sent_at: {:?} ago, retry_count: {}). Skipped from header collection for round {}. Batch may be waiting for certificate commit.",
+                            entry.digest,
+                            round,
+                            sent_at.elapsed(),
+                            retry_count,
+                            self.round
+                        );
+                    }
                     inflight_skipped += 1;
                     continue;
                 }
@@ -496,7 +572,21 @@ impl Proposer {
                             accumulated_size += entry.size;
                             seen_digests.insert(entry.digest.clone());
                             collected.push((entry.digest.clone(), entry.worker_id));
-                            info!(
+                            
+                            // CRITICAL DEBUG: Log tất cả batches được collect cho header
+                            tracing::info!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch {} COLLECTED for header round {} (size {} bytes, retry_count={}, priority={:?}). Accumulated payload = {} / target {} bytes",
+                                entry.digest,
+                                self.round,
+                                entry.size,
+                                entry.retry_count,
+                                entry.priority,
+                                accumulated_size,
+                                self.header_size
+                            );
+                            
+                            debug!(
                                 "[BATCH TRACK PRIMARY] Primary {} COLLECTING batch {} from worker {} for header round {} (size {} bytes, retry_count={}, priority={:?}). Accumulated payload = {} / target {} bytes",
                                 self.name,
                                 entry.digest,
@@ -520,6 +610,16 @@ impl Proposer {
                         Ok(None) => {
                             // Batch not in store yet - check if it's been waiting too long
                             let time_waiting_for_sync = entry.added_at.elapsed();
+                            
+                            // CRITICAL DEBUG: Log tất cả batches không có trong store khi collect
+                            warn!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch {} NOT IN STORE when collecting for header round {}. Waiting for sync for {:?}. rescue_sent={}. This may prevent batch from being included in header!",
+                                entry.digest,
+                                self.round,
+                                time_waiting_for_sync,
+                                entry.rescue_sent
+                            );
 
                             if time_waiting_for_sync.as_secs() > MAX_SYNC_WAIT_SECS {
                                 // Batch has been waiting too long - trigger forced rescue/sync
@@ -546,7 +646,7 @@ impl Proposer {
                                     self.round
                                 );
                             } else {
-                                info!(
+                                debug!(
                                     "[COLLECT] Primary {} SKIP collecting batch {} for header round {} - NOT IN STORE yet (waiting for {:?}). Batch will be included after sync completes.",
                                     self.name,
                                     entry.digest,
@@ -588,7 +688,7 @@ impl Proposer {
         );
 
         if !forced_rescues.is_empty() {
-            info!(
+            debug!(
                 "[COLLECT FORCED RESCUE] Primary {} dispatching rescue for {} batches that exceeded sync wait (round {}).",
                 self.name,
                 forced_rescues.len(),
@@ -601,19 +701,30 @@ impl Proposer {
     }
 
     fn mark_committed(&mut self, committed: CommittedBatches) {
-        // BATCH TRACKING: Log when batches are marked as committed
-        if !committed.digests.is_empty() {
+        let old_committed_round = self.latest_committed_round;
+        self.latest_committed_round = self.latest_committed_round.max(committed.round);
+        
+        // Chỉ log khi round được cập nhật đáng kể (quan trọng để trace progress)
+        if self.latest_committed_round > old_committed_round && self.latest_committed_round % 10 == 0 {
             info!(
-                "[BATCH COMMIT] Primary {} marking {} batches as committed at round {}: {:?}",
+                target: "narwhal_audit",
+                "[COMMITTED ROUND] Primary {} committed round {} (current={})",
                 self.name,
-                committed.digests.len(),
-                committed.round,
-                committed.digests.iter().take(10).collect::<Vec<_>>()
+                self.latest_committed_round,
+                self.round
             );
         }
 
-        self.latest_committed_round = self.latest_committed_round.max(committed.round);
-
+        // CRITICAL DEBUG: Log tất cả batches được commit
+        for digest in &committed.digests {
+            tracing::info!(
+                target: "narwhal_audit",
+                "[BATCH TRACE] Batch {} COMMITTED at round {}!",
+                digest,
+                committed.round
+            );
+        }
+        
         if committed.digests.is_empty() {
             return;
         }
@@ -630,7 +741,7 @@ impl Proposer {
 
         let committed_set: HashSet<_> = committed.digests.into_iter().collect();
         let mut marked_count = 0;
-        let mut inflight_count = 0;
+        let mut _inflight_count = 0;
 
         for entry in self.digests.iter_mut() {
             if committed_set.contains(&entry.digest) {
@@ -640,19 +751,14 @@ impl Proposer {
                     self.pending_payload_size =
                         self.pending_payload_size.saturating_sub(entry.size);
                 } else if matches!(entry.state, BatchState::InFlight { .. }) {
-                    inflight_count += 1;
+                    _inflight_count += 1;
                 }
                 entry.state = BatchState::Committed;
                 marked_count += 1;
             }
         }
 
-        if marked_count > 0 {
-            info!(
-                "Mark committed notification for round {}: {} batches transitioned ({} were InFlight)",
-                committed.round, marked_count, inflight_count
-            );
-        }
+        // Bỏ log chi tiết về batch commit - chỉ log ở level cao hơn khi cần
 
         // Remove committed batches from queue
         self.digests
@@ -660,10 +766,7 @@ impl Proposer {
 
         // Rebuild index after removing committed batches (indices may have shifted)
         // This is O(n) but only happens when batches are committed, not on every extraction
-        self.digests_index.clear();
-        for (idx, entry) in self.digests.iter().enumerate() {
-            self.digests_index.insert(entry.digest.clone(), idx);
-        }
+        self.rebuild_digests_index();
     }
 
     /// Cleanup old committed digests to prevent unbounded memory growth.
@@ -698,6 +801,39 @@ impl Proposer {
                 removed, watermark, after_count
             );
         }
+    }
+
+    fn rebuild_digests_index(&mut self) {
+        self.digests_index.clear();
+        for (idx, entry) in self.digests.iter().enumerate() {
+            self.digests_index.insert(entry.digest.clone(), idx);
+        }
+    }
+
+    fn get_valid_digest_index(&mut self, digest: &Digest) -> Option<usize> {
+        if let Some(&idx) = self.digests_index.get(digest) {
+            if idx < self.digests.len() {
+                return Some(idx);
+            }
+            warn!(
+                "[DIGEST INDEX] Primary {} phát hiện index {} (queue_len={}) bị lệch cho batch {:?} - rebuild lại index",
+                self.name,
+                idx,
+                self.digests.len(),
+                digest
+            );
+        } else {
+            return None;
+        }
+
+        self.rebuild_digests_index();
+        if let Some(&idx) = self.digests_index.get(digest) {
+            if idx < self.digests.len() {
+                return Some(idx);
+            }
+        }
+        self.digests_index.remove(digest);
+        None
     }
 
     fn retry_stale_batches(&mut self) {
@@ -799,6 +935,17 @@ impl Proposer {
                         rounds_since_sent,
                         self.latest_committed_round
                     );
+                    
+                    // Tracing: Batch stuck warning
+                    tracing::warn!(
+                        batch_id = %entry.digest,
+                        retry_count = retry_count,
+                        sent_round = round,
+                        current_round = self.round,
+                        rounds_since_sent = rounds_since_sent,
+                        latest_committed_round = self.latest_committed_round,
+                        "[BATCH STUCK WARNING] Batch retried many times - May be stuck!"
+                    );
                 }
 
                 if is_stuck_forever {
@@ -816,6 +963,18 @@ impl Proposer {
                         self.latest_committed_round,
                         MAX_RETRY_COUNT
                     );
+                    
+                    // Tracing: Batch stuck critical
+                    tracing::error!(
+                        batch_id = %entry.digest,
+                        retry_count = retry_count,
+                        sent_round = round,
+                        current_round = self.round,
+                        rounds_since_sent = rounds_since_sent,
+                        latest_committed_round = self.latest_committed_round,
+                        "[BATCH STUCK CRITICAL] FORCE REMOVING stuck batch - Transactions LOST!"
+                    );
+                    
                     entry.state = BatchState::Committed; // Mark as committed to remove
                     removed_too_old += 1;
                     continue;
@@ -883,7 +1042,7 @@ impl Proposer {
                         );
                     entry.state = BatchState::Pending;
                     entry.retry_count += 1; // Increment retry count when requeuing
-                    info!(
+                    debug!(
                         "[BATCH RETRY] Primary {} RETRYING batch {} (retry_count={}, sent_round={}, current_round={}, rounds_since_sent={}, latest_committed_round={}, own_cert_not_committed={})",
                         self.name,
                         entry.digest,
@@ -1013,10 +1172,21 @@ impl Proposer {
         let mut store = self.store.clone();
         let tx = self.tx_batch_rescue.clone();
         let origin = self.name.clone();
+        
         tokio::spawn(async move {
             for (digest, worker_id) in pending {
+                // CRITICAL DEBUG: Log nếu đây là batch đang tìm
+                let is_target_batch = format!("{}", digest) == "gFe3xRf/Ba1q1VVU";
+                
                 match store.read(digest.to_vec()).await {
                     Ok(Some(batch)) => {
+                        if is_target_batch {
+                            info!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU FOUND in store during rescue! Sending rescue request.",
+                            );
+                        }
+                        
                         if let Err(e) = tx
                             .send(BatchRescue {
                                 digest: digest.clone(),
@@ -1026,20 +1196,45 @@ impl Proposer {
                             })
                             .await
                         {
+                            if is_target_batch {
+                                error!(
+                                    target: "narwhal_audit",
+                                    "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU rescue FAILED to send: {}",
+                                    e
+                                );
+                            }
                             warn!(
                                 "[BATCH RESCUE] Failed to send rescue request for batch {}: {}",
                                 digest, e
                             );
                             break;
+                        } else if is_target_batch {
+                            info!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU rescue request SENT successfully.",
+                            );
                         }
                     }
                     Ok(None) => {
+                        if is_target_batch {
+                            error!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU NOT IN STORE during rescue! This is the root cause - batch was never synced to store.",
+                            );
+                        }
                         warn!(
-                            "[BATCH RESCUE] Unable to rescue batch {} - payload missing from store",
+                            "[BATCH RESCUE] Unable to rescue batch {} - payload missing from store. Batch will be retried in next watchdog tick if still stuck.",
                             digest
                         );
                     }
                     Err(e) => {
+                        if is_target_batch {
+                            error!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU rescue ERROR reading from store: {}",
+                                e
+                            );
+                        }
                         warn!(
                             "[BATCH RESCUE] Error reading batch {} from store for rescue: {}",
                             digest, e
@@ -1053,13 +1248,48 @@ impl Proposer {
     /// WATCHDOG: Force batch rescue when queue is stuck (pending payload size stays 0).
     fn trigger_watchdog_rescue(&mut self) -> usize {
         let mut targets = Vec::new();
+        const RESCUE_RETRY_TIMEOUT_SECS: u64 = 30; // Reset rescue_sent after 30s to allow retry
+        
         for entry in self.digests.iter_mut() {
             if targets.len() >= WATCHDOG_FORCE_RESCUE_BATCHES {
                 break;
             }
+            
+            // CRITICAL FIX: Reset rescue_sent if batch has been waiting too long after previous rescue attempt
+            // This allows batches that failed to rescue (not in store) to be rescued again
+            if entry.rescue_sent && entry.added_at.elapsed().as_secs() > RESCUE_RETRY_TIMEOUT_SECS {
+                // Check if batch is still not in store (if it was in store, it would have been collected)
+                // Reset rescue_sent to allow retry
+                entry.rescue_sent = false;
+                warn!(
+                    target: "narwhal_audit",
+                    "[WATCHDOG RESCUE RETRY] Resetting rescue_sent for batch {} after {}s. Batch still stuck, will retry rescue.",
+                    entry.digest,
+                    entry.added_at.elapsed().as_secs()
+                );
+            }
+            
             if matches!(entry.state, BatchState::Pending) && !entry.rescue_sent {
+                // CRITICAL DEBUG: Log nếu đây là batch đang tìm
+                if format!("{}", entry.digest) == "gFe3xRf/Ba1q1VVU" {
+                    warn!(
+                        target: "narwhal_audit",
+                        "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU eligible for WATCHDOG RESCUE (waiting for {:?}). Triggering rescue now.",
+                        entry.added_at.elapsed()
+                    );
+                }
+                
                 entry.rescue_sent = true;
                 targets.push((entry.digest.clone(), entry.worker_id));
+            } else if format!("{}", entry.digest) == "gFe3xRf/Ba1q1VVU" {
+                // CRITICAL DEBUG: Log tại sao batch không eligible
+                warn!(
+                    target: "narwhal_audit",
+                    "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU NOT eligible for rescue. State: {:?}, rescue_sent: {}, waiting for {:?}.",
+                    entry.state,
+                    entry.rescue_sent,
+                    entry.added_at.elapsed()
+                );
             }
         }
 
@@ -1085,6 +1315,109 @@ impl Proposer {
         }
 
         0
+    }
+
+    fn update_parity_guard(&mut self) {
+        let commit = self.latest_committed_round;
+        let current = self.round;
+        let commit_is_even = commit % 2 == 0;
+        let stalled_two_even =
+            commit_is_even && current >= commit.saturating_add(PARITY_STALL_ROUND_GAP);
+
+        if stalled_two_even {
+            if self.last_parity_committed_even != Some(commit) {
+                self.last_parity_committed_even = Some(commit);
+                self.parity_stall_since = Some(Instant::now());
+            }
+
+            let stalled_long_enough = self
+                .parity_stall_since
+                .map(|t| t.elapsed() >= Duration::from_millis(PARITY_STALL_ACTIVATE_MS))
+                .unwrap_or(false);
+
+            if stalled_long_enough && !self.parity_guard_active {
+                self.parity_guard_active = true;
+                self.parity_guard_backoff_until =
+                    Some(Instant::now() + Duration::from_millis(PARITY_STALL_DELAY_MS));
+                info!(
+                    "[PARITY GUARD] Activated at commit {} (current round {}). Slowing headers and forcing sync before moving further.",
+                    commit, current
+                );
+            }
+        } else if self.parity_guard_active
+            || self.parity_stall_since.is_some()
+            || self.parity_guard_backoff_until.is_some()
+        {
+            if self.parity_guard_active {
+                info!(
+                    "[PARITY GUARD] Cleared (latest_committed_round={}, current_round={}).",
+                    commit, current
+                );
+            }
+            self.parity_guard_active = false;
+            self.parity_stall_since = None;
+            self.parity_guard_backoff_until = None;
+            self.last_parity_committed_even = if commit_is_even {
+                Some(commit)
+            } else {
+                None
+            };
+        }
+    }
+
+    fn parity_guard_blocking(&self) -> bool {
+        if !self.parity_guard_active {
+            return false;
+        }
+        self.parity_guard_backoff_until
+            .map(|deadline| Instant::now() < deadline)
+            .unwrap_or(false)
+    }
+
+    fn schedule_next_parity_backoff(&mut self) {
+        if self.parity_guard_active {
+            self.parity_guard_backoff_until =
+                Some(Instant::now() + Duration::from_millis(PARITY_STALL_DELAY_MS));
+        }
+    }
+
+    fn maybe_trigger_parity_rescue(&mut self) {
+        if !self.parity_guard_active {
+            return;
+        }
+
+        if self
+            .parity_last_sync
+            .map(|t| t.elapsed() < Duration::from_millis(PARITY_SYNC_RESCUE_INTERVAL_MS))
+            .unwrap_or(false)
+        {
+            return;
+        }
+        self.parity_last_sync = Some(Instant::now());
+
+        let mut targets = Vec::new();
+        for entry in self.digests.iter_mut() {
+            if targets.len() >= PARITY_SYNC_BATCH_BURST {
+                break;
+            }
+            if matches!(entry.state, BatchState::Pending)
+                && !entry.rescue_sent
+                && entry.added_at.elapsed() >= Duration::from_millis(PARITY_STALL_ACTIVATE_MS)
+            {
+                entry.rescue_sent = true;
+                targets.push((entry.digest.clone(), entry.worker_id));
+            }
+        }
+
+        if !targets.is_empty() {
+            info!(
+                "[PARITY GUARD] Triggering batch rescue for {} pending batches while waiting for even rounds to commit (commit={}, round={}).",
+                targets.len(),
+                self.latest_committed_round,
+                self.round
+            );
+            self.dispatch_batch_rescue_requests(targets);
+        }
     }
 
     /// Extract batches from parent certificates and add them to queue if not committed
@@ -1170,7 +1503,7 @@ impl Proposer {
                                             entry.state = BatchState::Pending;
                                             batches_added += 1; // Count as added (converted from InFlight)
                                             converted = true;
-                                            info!(
+                                            debug!(
                                                 "[BATCH TRACK PRIMARY] Primary {} CONVERTED batch {} from parent certificate {} (round {}) from InFlight to Pending to allow immediate inclusion (reduces retry). This batch was sent in a previous header but certificate was not committed. Converting to Pending allows it to be included immediately in next header.",
                                                 self.name,
                                                 batch_digest,
@@ -1221,7 +1554,7 @@ impl Proposer {
                                         self.pending_payload_size += size;
                                         batches_added += 1;
 
-                                        info!(
+                                        debug!(
                                             "[BATCH TRACK PRIMARY] Primary {} EXTRACTED batch {} (worker {}) from parent certificate {} (round {}) into queue for round {} to help leader commit batches from other primaries. Batch size: {} bytes, retry_count: 0",
                                             self.name,
                                             batch_digest,
@@ -1276,7 +1609,7 @@ impl Proposer {
         }
 
         if batches_extracted > 0 {
-            info!(
+            debug!(
                 "[EXTRACT BATCHES] Extracted {} batches from {} parent certificates (round {}): {} added to queue, {} skipped (committed), {} skipped (duplicate)",
                 batches_extracted,
                 parent_digests.len(),
@@ -1316,8 +1649,8 @@ impl Proposer {
                 }
 
                 // Check if batch is in queue using O(1) HashMap lookup
-                if let Some(entry_idx) = self.digests_index.get(batch_digest) {
-                    let entry = &self.digests[*entry_idx];
+                if let Some(entry_idx) = self.get_valid_digest_index(batch_digest) {
+                    let entry = &self.digests[entry_idx];
                     // If batch is in Pending state, it's safe to skip (already available for inclusion)
                     if matches!(entry.state, BatchState::Pending) {
                         return true;
@@ -1335,23 +1668,10 @@ impl Proposer {
 
             if all_batches_safe {
                 // All batches are safe to skip - return early
-                debug!(
-                    "[BATCH EXTRACTION] Primary {} SKIP extracting from own header {} (round {}) - all batches are committed or in Pending state",
-                    self.name,
-                    header.id,
-                    header.round
-                );
                 return;
-            } else {
-                // Some batches are in InFlight state - continue to extract them
-                // This allows leader to convert InFlight batches to Pending for immediate inclusion
-                info!(
-                    "[BATCH EXTRACTION] Primary {} PROCESSING own header {} (round {}) - contains InFlight batches that need to be converted to Pending. This allows leader to include batches even if own certificate wasn't committed.",
-                    self.name,
-                    header.id,
-                    header.round
-                );
             }
+            // Some batches are in InFlight state - continue to extract them
+            // Bỏ log chi tiết - không cần thiết cho trace batch
         }
 
         // PERFORMANCE: Skip headers that are too old (more than max_retry_rounds behind current round)
@@ -1370,30 +1690,10 @@ impl Proposer {
 
             if all_batches_committed {
                 // All batches are committed - safe to skip this old header
-                debug!(
-                    "[BATCH EXTRACTION] Primary {} SKIP extracting from header {} (round {}, author: {}) - TOO OLD and all batches committed (current round: {}). Header is more than {} rounds behind.",
-                    self.name,
-                    header.id,
-                    header.round,
-                    header.author,
-                    self.round,
-                    self.max_retry_rounds
-                );
                 return;
-            } else {
-                // Header is old but contains uncommitted batches - MUST extract them
-                // This prevents batches from being stuck forever
-                info!(
-                    "[BATCH EXTRACTION] Primary {} PROCESSING old header {} (round {}, author: {}) - contains uncommitted batches (current round: {}). Header is more than {} rounds behind but batches are not committed yet.",
-                    self.name,
-                    header.id,
-                    header.round,
-                    header.author,
-                    self.round,
-                    self.max_retry_rounds
-                );
-                // Continue to extract batches from this old header
             }
+            // Header is old but contains uncommitted batches - MUST extract them
+            // Bỏ log chi tiết - không cần thiết cho trace batch
         }
 
         let mut batches_extracted = 0usize;
@@ -1402,17 +1702,7 @@ impl Proposer {
         let mut batches_added = 0usize;
         let mut batches_not_in_store = 0usize;
 
-        // BATCH TRACKING: Log start of extraction
-        info!(
-            "[BATCH EXTRACTION START] Primary {} starting extraction from header {} (round {}, author: {}). Header contains {} batches. Current round: {}, max_retry_rounds: {}",
-            self.name,
-            header.id,
-            header.round,
-            header.author,
-            header.payload.len(),
-            self.round,
-            self.max_retry_rounds
-        );
+        // Bỏ log start - không cần thiết cho trace batch
 
         // Extract batches from header payload
         for (batch_digest, worker_id) in header.payload.iter() {
@@ -1432,87 +1722,43 @@ impl Proposer {
                 continue;
             }
 
-            // CRITICAL: Check if batch is already in queue using O(1) HashMap lookup
-            // OPTIMIZATION: Use HashMap index instead of linear search for 1000x speedup
-            let already_in_queue = self.digests_index.contains_key(batch_digest);
-            if already_in_queue {
-                // Get index from HashMap for O(1) access
-                let entry_idx = *self.digests_index.get(batch_digest).unwrap();
-                let entry = &self.digests[entry_idx];
-                // Check if batch is in Pending state
-                let is_pending = matches!(entry.state, BatchState::Pending);
+            // CRITICAL: Check if batch is already trong queue bằng index hợp lệ
+            if let Some(existing_idx) = self.get_valid_digest_index(batch_digest) {
+                let is_pending = {
+                    let entry = &self.digests[existing_idx];
+                    matches!(entry.state, BatchState::Pending)
+                };
 
                 if is_pending {
-                    // Batch is already in Pending state - skip extraction
                     batches_skipped_duplicate += 1;
-                    debug!(
-                        "[BATCH EXTRACTION] Primary {} SKIP extracting batch {} from header {} (round {}, author: {}) - ALREADY IN QUEUE (Pending state)",
-                        self.name,
-                        batch_digest,
-                        header.id,
-                        header.round,
-                        header.author
-                    );
+                    // Bỏ log verbose - không cần thiết
                     continue;
                 }
 
-                // If batch is in InFlight state, convert it back to Pending state
-                // This allows this primary (possibly leader) to include batch immediately,
-                // reducing the need for retry and making the system smoother
-                // OPTIMIZATION: Use HashMap index for O(1) access instead of iterating
                 let mut converted = false;
-                if let Some(entry_idx) = self.digests_index.get(batch_digest) {
-                    let entry = &mut self.digests[*entry_idx];
+                if let Some(entry_idx) = self.get_valid_digest_index(batch_digest) {
+                    let entry = &mut self.digests[entry_idx];
                     if matches!(entry.state, BatchState::InFlight { .. }) {
-                        // CRITICAL: Double-check batch is still not committed before converting
-                        // This prevents race conditions where batch was committed between first check and now
                         if self.committed_digests.contains_key(batch_digest) {
                             batches_skipped_committed += 1;
-                            debug!(
-                                "[BATCH EXTRACTION] Primary {} SKIP converting batch {} from header {} (round {}, author: {}) - BECAME COMMITTED during conversion check (race condition prevented)",
-                                self.name,
-                                batch_digest,
-                                header.id,
-                                header.round,
-                                header.author
-                            );
-                            // Mark as committed and skip this batch
+                            // Bỏ log verbose - không cần thiết
                             entry.state = BatchState::Committed;
-                            converted = true; // Set to true to skip adding this batch
+                            converted = true;
                         } else {
-                            // Convert InFlight to Pending to allow immediate inclusion
-                            // SAFETY: pending_payload_size was decreased when Pending -> InFlight,
-                            // so increasing it back is correct
                             self.pending_payload_size += entry.size;
                             entry.state = BatchState::Pending;
-                            batches_added += 1; // Count as added (converted from InFlight)
+                            batches_added += 1;
                             converted = true;
-                            info!(
-                                "[BATCH EXTRACTION] Primary {} CONVERTED batch {} from header {} (round {}, author: {}) from InFlight to Pending to allow immediate inclusion. Batch from non-leader primary can now be committed by this primary.",
-                                self.name,
-                                batch_digest,
-                                header.id,
-                                header.round,
-                                header.author
-                            );
+                            // Bỏ log verbose - không cần thiết
                         }
                     }
                 }
                 if converted {
-                    // If converted (either InFlight->Pending or marked as Committed), skip to next batch
                     continue;
                 }
 
-                // Batch is in queue but not in InFlight state - skip
                 batches_skipped_duplicate += 1;
-                debug!(
-                    "[BATCH EXTRACTION] Primary {} SKIP extracting batch {} from header {} (round {}, author: {}) - ALREADY IN QUEUE",
-                    self.name,
-                    batch_digest,
-                    header.id,
-                    header.round,
-                    header.author
-                );
+                // Bỏ log verbose - không cần thiết
                 continue;
             }
 
@@ -1524,14 +1770,7 @@ impl Proposer {
                     // This prevents race conditions where batch was committed between first check and now
                     if self.committed_digests.contains_key(batch_digest) {
                         batches_skipped_committed += 1;
-                        debug!(
-                            "[BATCH EXTRACTION] Primary {} SKIP extracting batch {} from header {} (round {}, author: {}) - BECAME COMMITTED during store read (race condition prevented)",
-                            self.name,
-                            batch_digest,
-                            header.id,
-                            header.round,
-                            header.author
-                        );
+                        // Bỏ log verbose - không cần thiết
                         continue;
                     }
 
@@ -1556,18 +1795,7 @@ impl Proposer {
                     self.pending_payload_size += size;
                     batches_added += 1;
 
-                    info!(
-                        "[BATCH EXTRACTION SUCCESS] Primary {} EXTRACTED batch {} (worker {}) from header {} (round {}, author: {}) into queue. Batch from non-leader primary can now be committed by this primary. Batch size: {} bytes, queue_len: {}, pending_payload_size: {}",
-                        self.name,
-                        batch_digest,
-                        worker_id,
-                        header.id,
-                        header.round,
-                        header.author,
-                        size,
-                        self.digests.len(),
-                        self.pending_payload_size
-                    );
+                    // Bỏ log verbose - không cần thiết cho trace batch
                 }
                 Ok(None) => {
                     // CRITICAL FIX: Batch not in store yet - add to queue with special state to trigger sync
@@ -1607,6 +1835,17 @@ impl Proposer {
                         // 4. This ensures pending_payload_size only tracks batches ready for inclusion
                         // 5. Does NOT cause fork because header content is deterministic (only includes batches in store)
 
+                        // CRITICAL DEBUG: Log nếu đây là batch đang tìm
+                        if format!("{}", batch_digest) == "gFe3xRf/Ba1q1VVU" {
+                            warn!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU ADDED to queue for SYNC (NOT IN STORE). Header: {} (round {}, author: {}). pending_payload_size NOT increased. Batch will be included once sync completes.",
+                                header.id,
+                                header.round,
+                                header.author
+                            );
+                        }
+                        
                         warn!(
                             "[BATCH EXTRACTION SYNC] Primary {} ADDED batch {} (worker {}) from header {} (round {}, author: {}) to queue for SYNC. Batch not in store yet - sync should be triggered by Synchronizer when header is processed in Core. Batch will be included once sync completes. pending_payload_size NOT increased (batch not ready yet). If batch is still not in store after 10 seconds, this indicates sync may have failed!",
                             self.name,
@@ -1621,6 +1860,18 @@ impl Proposer {
                         // If batch was added without pending_payload_size (from extraction when not in store),
                         // and now it's in store, we should update pending_payload_size
                         // However, this is handled in collect_payload_for_header() when batch is collected
+                        
+                        // CRITICAL DEBUG: Log nếu đây là batch đang tìm
+                        if format!("{}", batch_digest) == "gFe3xRf/Ba1q1VVU" {
+                            warn!(
+                                target: "narwhal_audit",
+                                "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU already in queue but NOT IN STORE. Header: {} (round {}, author: {}). Sync should be triggered by process_header. If batch is still not in store after 10 seconds, sync may have failed!",
+                                header.id,
+                                header.round,
+                                header.author
+                            );
+                        }
+                        
                         debug!(
                             "[BATCH EXTRACTION] Primary {} SKIP extracting batch {} from header {} (round {}, author: {}) - NOT IN STORE yet but already in queue. Batch will be synced and then included.",
                             self.name,
@@ -1645,23 +1896,18 @@ impl Proposer {
             }
         }
 
-        // BATCH TRACKING: Always log extraction summary (even if 0 batches extracted)
-        info!(
-            "[BATCH EXTRACTION SUMMARY] Primary {} completed extraction from header {} (round {}, author: {}): {} total batches in header, {} extracted, {} added to queue, {} skipped (committed), {} skipped (duplicate), {} not in store. Current round: {}, queue_len: {}, pending_payload_size: {}",
-            self.name,
-            header.id,
-            header.round,
-            header.author,
-            header.payload.len(),
-            batches_extracted,
-            batches_added,
-            batches_skipped_committed,
-            batches_skipped_duplicate,
-            batches_not_in_store,
-            self.round,
-            self.digests.len(),
-            self.pending_payload_size
-        );
+        // Chỉ log summary khi có nhiều batches được extract hoặc có vấn đề
+        if batches_added > 5 || batches_not_in_store > 0 {
+            debug!(
+                "[BATCH EXTRACTION SUMMARY] Primary {} extracted {} batches from header {} (round {}), {} added, {} not in store",
+                self.name,
+                batches_extracted,
+                header.id,
+                header.round,
+                batches_added,
+                batches_not_in_store
+            );
+        }
     }
 
     /// LONG-TERM FIX: Check channel usage and apply backpressure if needed
@@ -1730,7 +1976,7 @@ impl Proposer {
 
     // Main loop listening to incoming messages.
     pub async fn run(&mut self) {
-        info!("[PROPOSER] Dag starting at round {}", self.round);
+        debug!("[PROPOSER] Dag starting at round {}", self.round);
 
         // LONG-TERM FIX: Apply adaptive header delay based on backpressure
         let adaptive_delay = (self.max_header_delay as f64 * self.header_creation_rate) as u64;
@@ -1758,28 +2004,53 @@ impl Proposer {
             if let Ok(is_catchup) = self.rx_catchup_mode.try_recv() {
                 self.is_catchup_mode = is_catchup;
                 if is_catchup {
-                    info!("[CATCH-UP] Proposer entering catch-up mode - pausing header creation to focus on syncing");
+                    debug!("[CATCH-UP] Proposer entering catch-up mode - pausing header creation to focus on syncing");
                 } else {
-                    info!("[CATCH-UP] Proposer resuming normal operation - node has caught up");
+                    debug!("[CATCH-UP] Proposer resuming normal operation - node has caught up");
                 }
             }
 
             // CATCH-UP MODE: CRITICAL FIX - Không pause hoàn toàn, chỉ giảm tần suất
             // Vẫn tạo headers khi có batches để đảm bảo giao dịch được thực thi
+            // CRITICAL: Vẫn tạo empty headers để đảm bảo hệ thống tiếp tục (block rỗng vẫn được tạo)
             if self.is_catchup_mode {
                 let has_pending_batches = self.pending_payload_size > 0;
                 if has_pending_batches {
-                    info!("[CATCH-UP] Proposer in catch-up mode but has {} pending batches - will still create headers to avoid batches being stuck", self.pending_payload_size);
+                    debug!("[CATCH-UP] Proposer in catch-up mode but has {} pending batches - will still create headers to avoid batches being stuck", self.pending_payload_size);
                 } else {
-                    info!("[CATCH-UP] Proposer {} in catch-up mode - will only create headers when timer expired or batches arrive (round {})", self.name, self.round);
+                    debug!("[CATCH-UP] Proposer {} in catch-up mode - will create headers (including empty) when timer expired to ensure system continues (round {})", self.name, self.round);
                 }
                 // Still process other messages (parents, headers, batches) but reduce header creation frequency
                 // This allows node to continue syncing while still processing batches
+                // CRITICAL: Empty headers are still created to ensure empty blocks are generated
+            }
+
+            self.update_parity_guard();
+            if self.parity_guard_active {
+                info!(
+                    "[PARITY GUARD] Active while consensus stuck at even round {} (current round {}). Backing off header creation and forcing batch sync.",
+                    self.latest_committed_round,
+                    self.round
+                );
+                self.maybe_trigger_parity_rescue();
             }
 
             // PHASE 1: Check if we're stuck (no parent certificates received for too long)
             // Force advance round to prevent proposer from being stuck indefinitely
             let mut just_force_advanced = false;
+            let max_allowed_round = self.max_allowed_round();
+            let round_drift = self.round.saturating_sub(self.latest_committed_round);
+            let drift_too_high = round_drift > MAX_ROUND_DRIFT;
+            if drift_too_high {
+                debug!(
+                        target: "narwhal_audit",
+                        "[ROUND DRIFT] Primary {} đang dẫn {} round (current={}, latest_committed_round={}). Đang chờ consensus/parents mới trước khi force advance.",
+                        self.name,
+                        round_drift,
+                        self.round,
+                        self.latest_committed_round
+                );
+            }
             let effective_max_wait = if self.round <= 5 {
                 Duration::from_secs(3) // Chỉ chờ 3 giây trong giai đoạn khởi động
             } else {
@@ -1787,14 +2058,17 @@ impl Proposer {
             };
 
             if let Some(last_received) = self.last_parent_received_at {
-                if last_received.elapsed() > effective_max_wait {
+                // REVERTED: Removed round sync logic - only check max_allowed_round
+                if last_received.elapsed() > effective_max_wait && self.round < max_allowed_round {
                     // Force advance round with empty parents
                     warn!(
-                        "[FORCE ADVANCE] Primary {} force advancing round {} -> {} due to no parent certificates received for {} seconds. This prevents proposer from being stuck when Core stops sending parent certificates.",
+                        target: "narwhal_audit",
+                        "[FORCE ADVANCE] Primary {} force advancing round {} -> {} due to no parent certificates received for {} seconds (max_allowed_round={}). This prevents proposer from being stuck when Core stops sending parent certificates.",
                         self.name,
                         self.round,
                         self.round + 1,
-                        last_received.elapsed().as_secs()
+                        last_received.elapsed().as_secs(),
+                        max_allowed_round
                     );
                     self.round += 1;
                     self.last_parents = Vec::new(); // Clear old parents
@@ -1804,17 +2078,33 @@ impl Proposer {
                         "[FORCE ADVANCE] Dag force advanced to round {} (last_parents cleared)",
                         self.round
                     );
+                } else if self.round >= max_allowed_round {
+                    debug!(
+                        target: "narwhal_audit",
+                        "[ROUND GUARD] Primary {} chặn force advance vì round {} đã đạt giới hạn tối đa {} (latest_committed_round={})",
+                        self.name,
+                        self.round,
+                        max_allowed_round,
+                        self.latest_committed_round
+                    );
                 }
             } else {
                 // CRITICAL: Nếu last_parent_received_at là None (chưa nhận được parents lần nào)
                 // và timer đã hết, cho phép force advance ngay để tránh hệ thống bị kẹt vĩnh viễn
                 let timer_expired = header_timer.is_elapsed();
-                if timer_expired {
+                if timer_expired && self.round < max_allowed_round {
                     warn!(
                         "[FORCE ADVANCE] Primary {} chưa nhận được parents lần nào, cho phép force advance round {} để tránh kẹt",
                         self.name, self.round
                     );
                     just_force_advanced = true;
+                } else if self.round >= max_allowed_round {
+                    debug!(
+                        "[ROUND GUARD] Primary {} giữ nguyên round {} (giới hạn {}) khi chưa có parents",
+                        self.name,
+                        self.round,
+                        max_allowed_round
+                    );
                 }
             }
 
@@ -1830,7 +2120,7 @@ impl Proposer {
 
             // PHASE 1: Allow force advance (creating header even with empty parents) if timeout exceeded
             // CRITICAL: Đảm bảo force_advance luôn true nếu vừa force advance hoặc timeout quá lâu
-            let force_advance = just_force_advanced
+            let base_force_advance = just_force_advanced
                 || self
                     .last_parent_received_at
                     .map(|t| t.elapsed() > effective_max_wait)
@@ -1839,6 +2129,7 @@ impl Proposer {
                         // KHÔNG giới hạn round để tránh hệ thống bị kẹt vĩnh viễn
                         timer_expired
                     });
+            let force_advance = !drift_too_high && base_force_advance;
 
             let ready_to_make_header =
                 (timer_expired || enough_digests) && (enough_parents || force_advance);
@@ -1855,18 +2146,82 @@ impl Proposer {
 
             // RATE CONTROL ĐÃ BỊ BỎ - Không còn chặn tạo header
             // Hệ thống sẽ tạo header ngay khi có điều kiện để đảm bảo tiến triển nhanh nhất
-            // CATCH-UP MODE: CRITICAL FIX - Vẫn tạo headers khi có batches để tránh batches bị stuck
-            // Thay vì pause hoàn toàn, chỉ giảm tần suất tạo headers (chỉ tạo khi có batches hoặc timer expired)
-            // Điều này đảm bảo giao dịch vẫn được thực thi ngay cả khi trong catch-up mode
+            // CATCH-UP MODE: CRITICAL FIX - Vẫn tạo headers (bao gồm empty headers) để đảm bảo hệ thống tiếp tục
+            // CRITICAL: Trong catch-up mode, vẫn tạo empty headers khi timer expired để đảm bảo block rỗng được tạo
+            // Điều này ngăn hệ thống dừng hoàn toàn khi không có batches
             let has_pending_batches = self.pending_payload_size > 0;
-            let should_create_header = if self.is_catchup_mode {
-                // Trong catch-up mode: chỉ tạo headers khi có batches hoặc timer expired quá lâu
-                // Đảm bảo batches không bị stuck
+            let mut should_create_header = if self.is_catchup_mode {
+                // Trong catch-up mode: tạo headers khi có batches HOẶC timer expired (bao gồm empty headers)
+                // CRITICAL: Timer expired cho phép tạo empty headers để đảm bảo hệ thống tiếp tục
+                // Điều này đảm bảo block rỗng vẫn được tạo ngay cả khi không có batches
                 ready_to_make_header && (has_pending_batches || timer_expired)
             } else {
                 // Bình thường: tạo headers như bình thường
                 ready_to_make_header
             };
+            let round_guard_limit = self.max_allowed_round();
+            // PROGRESS GUARANTEE: Check if minimum_network_round is stale
+            let min_round_is_stale = if let Some(updated_at) = self.minimum_network_round_updated_at {
+                updated_at.elapsed() > Duration::from_secs(MIN_NETWORK_ROUND_TIMEOUT_SECS)
+            } else {
+                self.minimum_network_round == 0 || true // Treat as stale if not initialized
+            };
+            
+            if should_create_header && self.round > round_guard_limit {
+                if min_round_is_stale {
+                    // PROGRESS GUARANTEE: Allow header creation if minimum_network_round is stale
+                    // This ensures system can still progress even if slow nodes are stuck
+                    warn!(
+                        target: "narwhal_audit",
+                        "[PROGRESS GUARANTEE] Primary {} allowing header creation at round {} despite max_allowed_round {} because minimum_network_round {} is stale (last updated {:?} ago). Ensuring system progress.",
+                        self.name,
+                        self.round,
+                        round_guard_limit,
+                        self.minimum_network_round,
+                        self.minimum_network_round_updated_at.map(|t| t.elapsed()).unwrap_or_default()
+                    );
+                    // Don't set should_create_header = false - allow it to proceed
+                } else {
+                    warn!(
+                        target: "narwhal_audit",
+                        "[ROUND GUARD] Primary {} không tạo header round {} vì đã vượt giới hạn (latest_committed_round={}, minimum_network_round={}, max_allowed_round={}, min_round_stale={}). Đợi consensus/network tiến thêm.",
+                        self.name,
+                        self.round,
+                        self.latest_committed_round,
+                        self.minimum_network_round,
+                        round_guard_limit,
+                        min_round_is_stale
+                    );
+                    should_create_header = false;
+                }
+            }
+
+            if drift_too_high && !enough_parents && should_create_header {
+                should_create_header = false;
+                if timer_expired {
+                    debug!(
+                        "[ROUND DRIFT] Primary {} tạm dừng force advance tại round {} (latest_committed_round={}, drift={}). Đợi thêm parent certificate để không vượt quá trạng thái mạng.",
+                        self.name,
+                        self.round,
+                        self.latest_committed_round,
+                        round_drift
+                    );
+                }
+            }
+
+            if should_create_header && self.parity_guard_blocking() {
+                should_create_header = false;
+                let remaining_ms = self
+                    .parity_guard_backoff_until
+                    .map(|deadline| deadline.saturating_duration_since(Instant::now()).as_millis())
+                    .unwrap_or(0);
+                info!(
+                    "[PARITY GUARD] Throttling header for round {} (latest_committed_round={}, wait ~{}ms). Waiting for even rounds to commit before advancing further.",
+                    self.round,
+                    self.latest_committed_round,
+                    remaining_ms
+                );
+            }
 
             // WATCHDOG: If queue has digests but pending_payload_size stays 0, force rescue after timeout.
             let queue_stuck = self.pending_payload_size == 0 && !self.digests.is_empty();
@@ -1885,12 +2240,38 @@ impl Proposer {
                                     self.name,
                                     self.digests.len()
                                 );
+                                
+                                // Tracing: Queue stuck
+                                for entry in self.digests.iter().take(10) {
+                                    // CRITICAL DEBUG: Log chi tiết cho batch đang tìm
+                                    if format!("{}", entry.digest) == "gFe3xRf/Ba1q1VVU" {
+                                        warn!(
+                                            target: "narwhal_audit",
+                                            "[BATCH TRACE] Batch gFe3xRf/Ba1q1VVU STUCK in queue! State: {:?}, rescue_sent: {}, added_at: {:?} ago, round: {}, latest_committed_round: {}. Batch not in store and rescue already sent. This indicates sync failure!",
+                                            entry.state,
+                                            entry.rescue_sent,
+                                            entry.added_at.elapsed(),
+                                            self.round,
+                                            self.latest_committed_round
+                                        );
+                                    }
+                                    
+                                    tracing::warn!(
+                                        batch_id = %entry.digest,
+                                        queue_len = self.digests.len(),
+                                        round = self.round,
+                                        latest_committed_round = self.latest_committed_round,
+                                        state = ?entry.state,
+                                        rescue_sent = entry.rescue_sent,
+                                        "[QUEUE STUCK] Batch in stuck queue - No rescue possible!"
+                                    );
+                                }
                             }
                         }
                     }
                 }
             } else if self.pending_zero_since.take().is_some() {
-                info!(
+                debug!(
                     "[WATCHDOG] Proposer {} queue recovered (queue_len={}, pending_payload_size={} bytes).",
                     self.name,
                     self.digests.len(),
@@ -1898,16 +2279,53 @@ impl Proposer {
                 );
             }
 
-            if should_create_header {
+                // PHASE 3: Backpressure Check (Kiểm tra áp lực ngược)
+                // Trước khi tạo header, kiểm tra xem chúng ta có chạy quá nhanh so với consensus không
+                let current_lag = self.round.saturating_sub(self.latest_committed_round);
+                
+                // Thresholds cho Backpressure
+                const LAG_WARNING_THRESHOLD: Round = 20; // Cảnh báo khi lag > 20 rounds
+                const LAG_PAUSE_THRESHOLD: Round = 50;   // Tạm dừng khi lag > 50 rounds
+                
+                if current_lag > LAG_PAUSE_THRESHOLD {
+                    // Nếu lag quá lớn, tạm dừng tạo header để chờ consensus bắt kịp
+                    warn!(
+                        "[BACKPRESSURE] Proposer {} running TOO FAST! Lag: {} rounds (current: {}, committed: {}). PAUSING header creation to let consensus catch up.",
+                        self.name, current_lag, self.round, self.latest_committed_round
+                    );
+                    
+                    // Reset timer với delay dài hơn (ví dụ: 1 giây) để check lại sau
+                    let pause_delay = Duration::from_secs(1);
+                    header_timer.as_mut().reset(Instant::now() + pause_delay);
+                    
+                    // Skip tạo header lần này
+                    should_create_header = false;
+                } else if current_lag > LAG_WARNING_THRESHOLD {
+                    // Nếu lag trung bình, giảm tốc độ bằng cách tăng delay
+                    warn!(
+                        "[BACKPRESSURE] Proposer {} running fast. Lag: {} rounds. Slowing down.",
+                        self.name, current_lag
+                    );
+                    // Tăng header_creation_rate để làm chậm nhịp độ
+                    self.header_creation_rate = 1.5; 
+                } else {
+                    // Lag thấp -> Chạy bình thường
+                    self.header_creation_rate = 1.0;
+                }
+
+                if should_create_header {
                 // Make a new header.
                 // PHASE 1: Header can be created even with empty parents if force_advance is true
-                info!("[PROPOSER] Attempting to create header for round {} (force_advance={}, enough_parents={}, enough_digests={})", 
+                debug!("[PROPOSER] Attempting to create header for round {} (force_advance={}, enough_parents={}, enough_digests={})", 
                     self.round, force_advance, enough_parents, enough_digests);
                 if self.make_header().await {
-                    info!(
+                    debug!(
                         "[PROPOSER] Successfully created header for round {}",
                         self.round
                     );
+                    if self.parity_guard_active {
+                        self.schedule_next_parity_backoff();
+                    }
                     // LONG-TERM FIX: Reschedule timer with adaptive delay based on backpressure
                     let adaptive_delay =
                         (self.max_header_delay as f64 * self.header_creation_rate) as u64;
@@ -1928,19 +2346,51 @@ impl Proposer {
             }
 
             tokio::select! {
+                // CRITICAL: Prioritize committed batches to ensure latest_committed_round is always updated
+                // This prevents ROUND GUARD from blocking header creation
+                Some(committed) = self.rx_committed.recv() => {
+                    // BATCH TRACKING: Log when receiving committed batches notification
+                    info!(
+                        target: "narwhal_audit",
+                        "[COMMITTED BATCHES RECEIVED] Proposer {} received committed batches notification: {} batches committed at round {} (current latest_committed_round={})",
+                        self.name,
+                        committed.digests.len(),
+                        committed.round,
+                        self.latest_committed_round
+                    );
+                    self.mark_committed(committed);
+                }
+                // REVERTED: Round sync logic removed - ignore minimum_network_round updates
+                Some(_min_round) = self.rx_min_network_round.recv() => {
+                    // Ignore minimum_network_round updates (reverted feature)
+                }
                 Some((parents, round)) = self.rx_core.recv() => {
                     // PHASE 1: Update last_parent_received_at when we receive parent certificates
                     self.last_parent_received_at = Some(Instant::now());
-                    info!("[PROPOSER] Received {} parents for round {} (current round: {})", parents.len(), round, self.round);
+                    debug!("[PROPOSER] Received {} parents for round {} (current round: {})", parents.len(), round, self.round);
 
                     if round < self.round {
                         warn!("[PROPOSER] Ignoring parents for round {} (current round: {})", round, self.round);
                         continue;
                     }
 
+                    let target_round = round.saturating_add(1);
+                    let max_allowed_round = self.max_allowed_round();
+                    if target_round > max_allowed_round {
+                        warn!(
+                            target: "narwhal_audit",
+                            "[ROUND GUARD] Primary {} bỏ qua parents round {} vì đã vượt giới hạn (latest_committed_round={}, max_allowed_round={}). Sẽ đồng bộ lại khi consensus tiến thêm.",
+                            self.name,
+                            round,
+                            self.latest_committed_round,
+                            max_allowed_round
+                        );
+                        continue;
+                    }
+
                     // Advance to the next round.
-                    self.round = round + 1;
-                    info!("[PROPOSER] Dag moved to round {} with {} parents", self.round, parents.len());
+                    self.round = target_round;
+                    debug!("[PROPOSER] Dag moved to round {} with {} parents", self.round, parents.len());
 
                     // IMPROVED: Extract batches from parent certificates to help leader commit batches from other primaries
                     // This ensures batches are committed faster and reduces the need for retry
@@ -1956,7 +2406,7 @@ impl Proposer {
                     // Điều này giúp hệ thống tiến triển nhanh hơn thay vì phải chờ timer hết
                     let deadline = Instant::now() + Duration::from_millis(self.max_header_delay);
                     header_timer.as_mut().reset(deadline);
-                    info!("[PROPOSER] Reset header timer after receiving parents for round {} (new round: {})", round, self.round);
+                    debug!("[PROPOSER] Reset header timer after receiving parents for round {} (new round: {})", round, self.round);
                 }
                 Some(header) = self.rx_headers.recv() => {
                     // IMPROVED: Extract batches from verified headers of other primaries
@@ -1969,39 +2419,12 @@ impl Proposer {
                     // 3. Extraction logic is deterministic (same order, same checks)
 
                     // BATCH TRACKING: Log when receiving header for batch extraction
-                    info!(
-                        "[BATCH TRACK PROPOSER] Proposer {} received header {} (round {}, author: {}) from Core for batch extraction. Header contains {} batches: {:?}",
-                        self.name,
-                        header.id,
-                        header.round,
-                        header.author,
-                        header.payload.len(),
-                        header.payload.keys().take(5).collect::<Vec<_>>()
-                    );
+                    // Bỏ log verbose về header received - không cần thiết cho trace batch
                     self.extract_batches_from_headers(&header).await;
                 }
                 Some((digest, worker_id, batch)) = self.rx_workers.recv() => {
-                    // BATCH TRACKING: Log when receiving batch from worker
-                    info!(
-                        "[BATCH TRACK WORKER] Proposer {} received batch {} from worker {} at round {} (batch size: {} bytes, raw payload: {} bytes)",
-                        self.name,
-                        digest,
-                        worker_id,
-                        self.round,
-                        digest.size(),
-                        batch.len()
-                    );
-
                     // Skip if already committed
                     if self.committed_digests.contains_key(&digest) {
-                        warn!(
-                            "[BATCH TRACK WORKER] Proposer {} SKIP enqueue batch {} from worker {} at round {} - ALREADY COMMITTED at round {}",
-                            self.name,
-                            digest,
-                            worker_id,
-                            self.round,
-                            self.committed_digests.get(&digest).copied().unwrap_or(0)
-                        );
                         continue;
                     }
 
@@ -2009,19 +2432,30 @@ impl Proposer {
                     let size = digest.size();
 
                     if self.digests.iter().any(|entry| entry.digest == digest) {
-                        warn!(
-                            "[BATCH TRACK WORKER] Proposer {} IGNORING duplicate batch {} from worker {} at round {} (already queued; pending_payload_size = {}, queue_len = {})",
-                            self.name,
-                            digest,
-                            worker_id,
-                            self.round,
-                            self.pending_payload_size,
-                            self.digests.len()
-                        );
+                        // Bỏ log duplicate - không cần thiết cho trace batch
                         continue;
                     }
 
-                    self.store.write(digest.clone().to_vec(), batch).await;
+                    // CRITICAL FIX: Đảm bảo batch được write vào store TRƯỚC KHI thêm vào queue
+                    // Điều này ngăn batches bị stuck vì không có trong store khi collect
+                    // Nếu store.write() chậm, chúng ta vẫn đợi để đảm bảo batch có trong store
+                    let mut store = self.store.clone();
+                    let digest_for_store = digest.clone();
+                    let batch_for_store = batch.clone();
+                    
+                    // CRITICAL: Write vào store với timeout để tránh block quá lâu
+                    // Nếu timeout, vẫn thêm vào queue nhưng sẽ retry rescue sau
+                    match tokio::time::timeout(Duration::from_millis(500), store.write(digest_for_store.to_vec(), batch_for_store)).await {
+                        Ok(()) => {
+                            // Store write thành công - batch đã có trong store
+                        }
+                        Err(_) => {
+                            warn!(
+                                "[PROPOSER] Store write timeout for batch {} (500ms). Batch will be added to queue but may need rescue.",
+                                digest
+                            );
+                        }
+                    }
 
                     let digest_for_log = digest.clone();
 
@@ -2078,10 +2512,7 @@ impl Proposer {
                         }
 
                         // Rebuild index after removal
-                        self.digests_index.clear();
-                        for (idx, entry) in self.digests.iter().enumerate() {
-                            self.digests_index.insert(entry.digest.clone(), idx);
-                        }
+                        self.rebuild_digests_index();
 
                         self.pending_payload_size = self.pending_payload_size.saturating_sub(size_freed);
 
@@ -2103,7 +2534,7 @@ impl Proposer {
                         );
                     }
 
-                    info!(
+                    debug!(
                         "[BATCH TRACK WORKER] Proposer {} ENQUEUED batch {} from worker {} at round {}; pending_payload_size = {}, queue_len = {}",
                         self.name,
                         digest_for_log,
@@ -2112,16 +2543,6 @@ impl Proposer {
                         self.pending_payload_size,
                         self.digests.len()
                     );
-                }
-                Some(committed) = self.rx_committed.recv() => {
-                    // BATCH TRACKING: Log when receiving committed batches notification
-                    info!(
-                        "[BATCH COMMIT NOTIFICATION] Proposer {} received committed batches notification: {} batches committed at round {}",
-                        self.name,
-                        committed.digests.len(),
-                        committed.round
-                    );
-                    self.mark_committed(committed);
                 }
                 () = &mut header_timer => {
                     // Timer expired - loop will evaluate conditions again.
@@ -2135,9 +2556,85 @@ impl Proposer {
                     let pending_count = self.digests.iter().filter(|e| matches!(e.state, BatchState::Pending)).count();
                     let inflight_count = self.digests.iter().filter(|e| matches!(e.state, BatchState::InFlight { .. })).count();
                     let committed_count = self.digests.iter().filter(|e| matches!(e.state, BatchState::Committed)).count();
+                    
+                    // CRITICAL: Check if latest_committed_round is stale (not updated in a while)
+                    // This can cause ROUND GUARD to block header creation
+                    let lag = self.round.saturating_sub(self.latest_committed_round);
+                    if lag > 50 && self.latest_committed_round > 0 {
+                        warn!(
+                            target: "narwhal_audit",
+                            "[COMMITTED ROUND STALE] Primary {} latest_committed_round {} is {} rounds behind current_round {}. This may cause ROUND GUARD to block header creation. Check if rx_committed channel is working!",
+                            self.name,
+                            self.latest_committed_round,
+                            lag,
+                            self.round
+                        );
+                    }
+                    
+                    // CRITICAL FIX: If latest_committed_round is stale and we're creating headers,
+                    // try to update it from consensus round if available
+                    // This is a fallback mechanism to ensure progress even if GarbageCollector is not sending notifications
+                    if lag > 100 && self.latest_committed_round > 0 {
+                        // Try to receive any pending committed batches (non-blocking)
+                        // This helps catch up if notifications were queued
+                        while let Ok(committed) = self.rx_committed.try_recv() {
+                            info!(
+                                target: "narwhal_audit",
+                                "[COMMITTED BATCHES CATCHUP] Proposer {} received queued committed batches: {} batches at round {} (lag was {} rounds)",
+                                self.name,
+                                committed.digests.len(),
+                                committed.round,
+                                lag
+                            );
+                            self.mark_committed(committed);
+                        }
+                        
+                        // FALLBACK: If still stale after catchup, auto-update latest_committed_round
+                        // This ensures progress even if GarbageCollector is completely broken
+                        let current_lag = self.round.saturating_sub(self.latest_committed_round);
+                        if current_lag > 100 {
+                            let old_committed_round = self.latest_committed_round;
+                            // Auto-update to current_round - 50 to allow some progress
+                            // This is a safety mechanism to prevent complete system halt
+                            let estimated_committed_round = self.round.saturating_sub(50);
+                            if estimated_committed_round > self.latest_committed_round {
+                                warn!(
+                                    target: "narwhal_audit",
+                                    "[FALLBACK COMMITTED ROUND UPDATE] Primary {} latest_committed_round {} is {} rounds behind current_round {}. GarbageCollector appears to be broken. Auto-updating to {} to ensure progress. This is a fallback mechanism!",
+                                    self.name,
+                                    self.latest_committed_round,
+                                    current_lag,
+                                    self.round,
+                                    estimated_committed_round
+                                );
+                                self.latest_committed_round = estimated_committed_round;
+                                
+                                info!(
+                                    target: "narwhal_audit",
+                                    "[COMMITTED ROUND UPDATE] Primary {} updated latest_committed_round from {} to {} (FALLBACK - current_round={}, max_allowed_round={}). This allows proposer to create headers for higher rounds.",
+                                    self.name,
+                                    old_committed_round,
+                                    self.latest_committed_round,
+                                    self.round,
+                                    self.max_allowed_round()
+                                );
+                            }
+                        }
+                    }
+                    
+                    // PROGRESS MONITORING: Check if minimum_network_round is stale
+                    let min_round_is_stale = if let Some(updated_at) = self.minimum_network_round_updated_at {
+                        updated_at.elapsed() > Duration::from_secs(MIN_NETWORK_ROUND_TIMEOUT_SECS)
+                    } else {
+                        self.minimum_network_round == 0 || true
+                    };
+                    let min_round_age = self.minimum_network_round_updated_at
+                        .map(|t| t.elapsed().as_secs())
+                        .unwrap_or(0);
 
-                    info!(
-                        "[PROPOSER SUMMARY] Primary {} round {}: queue_len={}, pending={}, inflight={}, committed={}, pending_payload_size={} bytes, latest_committed_round={}",
+                    debug!(
+                        target: "narwhal_audit",
+                        "[PROPOSER SUMMARY] Primary {} round {}: queue_len={}, pending={}, inflight={}, committed={}, pending_payload_size={} bytes, latest_committed_round={}, minimum_network_round={}, min_round_stale={}, min_round_age={}s, max_allowed_round={}",
                         self.name,
                         self.round,
                         self.digests.len(),
@@ -2145,7 +2642,11 @@ impl Proposer {
                         inflight_count,
                         committed_count,
                         self.pending_payload_size,
-                        self.latest_committed_round
+                        self.latest_committed_round,
+                        self.minimum_network_round,
+                        min_round_is_stale,
+                        min_round_age,
+                        self.max_allowed_round()
                     );
 
                     // CRITICAL: Warning nếu queue quá lớn hoặc có nhiều InFlight batches

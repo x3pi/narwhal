@@ -172,12 +172,17 @@ pub fn log_transaction_batch(log_batch: &TransactionLogBatch) {
 
 /// Log một transaction entry
 pub fn log_transaction_entry(index: usize, entry: &TransactionLogEntry) {
+    log_transaction_entry_with_logger(index, entry);
+}
+
+/// Log một transaction entry với structured logger (đã được thay thế bằng tracing)
+pub fn log_transaction_entry_with_logger(index: usize, entry: &TransactionLogEntry) {
     let hash_hex = hex::encode(&entry.transaction_hash);
     let from_hex = hex::encode(&entry.from_address);
     let to_hex = hex::encode(&entry.to_address);
     let amount_hex = hex::encode(&entry.amount);
 
-    info!(
+    let log_msg = format!(
         "[TX LOG {}] Hash: {}, From: {}, To: {}, Amount: {}, Gas: {}, GasPrice: {}, ChainID: {}, Type: {}, Size: {} bytes",
         index,
         hash_hex,
@@ -190,11 +195,30 @@ pub fn log_transaction_entry(index: usize, entry: &TransactionLogEntry) {
         entry.r#type,
         entry.size
     );
+
+    // Tracing: Received transaction
+    tracing::info!(
+        target: "narwhal_audit",
+        tx_hash = %hash_hex,
+        worker_id = entry.worker_id,
+        from = %from_hex,
+        to = %to_hex,
+        size = entry.size,
+        chain_id = entry.chain_id,
+        "[TX RECEIVED] Worker received transaction"
+    );
+
+    info!("{}", log_msg);
 }
 
 /// Parse và log transactions từ bytes (wrapper function tiện lợi)
 /// Cắt bỏ 8-byte length prefix trước khi parse
 pub fn parse_and_log_transactions_simple(data: &Bytes, worker_id: u32) {
+    parse_and_log_transactions_simple_with_logger(data, worker_id);
+}
+
+/// Parse và log transactions từ bytes với tracing
+pub fn parse_and_log_transactions_simple_with_logger(data: &Bytes, worker_id: u32) {
     const LENGTH_PREFIX_SIZE: usize = 8;
 
     // Kiểm tra xem có đủ 8 bytes để cắt prefix không
@@ -213,12 +237,22 @@ pub fn parse_and_log_transactions_simple(data: &Bytes, worker_id: u32) {
     match parse_and_log_transactions(payload, worker_id) {
         Ok(log_batch) => {
             log_transaction_batch(&log_batch);
+            // Tracing cho từng transaction trong batch
+            for entry in &log_batch.transaction_logs {
+                let hash_hex = hex::encode(&entry.transaction_hash);
+                tracing::info!(
+                    tx_hash = %hash_hex,
+                    worker_id = entry.worker_id,
+                    index = entry.index_in_batch,
+                    "[TX IN BATCH] Transaction included in batch"
+                );
+            }
         }
         Err(e) => {
             // Nếu parse Transactions failed, thử parse như single Transaction
             match parse_single_transaction(payload, worker_id) {
                 Ok(log_entry) => {
-                    log_transaction_entry(0, &log_entry);
+                    log_transaction_entry_with_logger(0, &log_entry);
                 }
                 Err(_) => {
                     warn!(

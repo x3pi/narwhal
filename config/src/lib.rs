@@ -294,27 +294,68 @@ impl Committee {
                 );
             }
 
-            let (worker_to_primary, primary_to_worker, transactions) =
-                if val.address.to_lowercase() == self_address.to_lowercase() {
-                    info!(
-                        "Assigning sequential internal ports for self (address: {}).",
-                        self_address
-                    );
-                    (
-                        format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
-                            .parse()
-                            .unwrap(),
-                        format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
-                            .parse()
-                            .unwrap(),
-                        format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
-                            .parse()
-                            .unwrap(),
-                    )
-                } else {
-                    let placeholder_addr: SocketAddr = "0.0.0.0:0".parse().unwrap();
-                    (placeholder_addr, placeholder_addr, placeholder_addr)
-                };
+            let (worker_to_primary, primary_to_worker, transactions): (
+                SocketAddr,
+                SocketAddr,
+                SocketAddr,
+            ) = {
+                info!(
+                    "[Config] Assigning sequential internal ports for validator {} (self={}): worker_to_primary_base={}, primary_to_worker_base={}, tx_base={}",
+                    val.address,
+                    val.address.eq_ignore_ascii_case(self_address),
+                    BASE_WORKER_TO_PRIMARY_PORT,
+                    BASE_PRIMARY_TO_WORKER_PORT,
+                    BASE_TRANSACTIONS_PORT
+                );
+
+                (
+                    format!("127.0.0.1:{}", BASE_WORKER_TO_PRIMARY_PORT + i as u16)
+                        .parse()
+                        .unwrap(),
+                    format!("127.0.0.1:{}", BASE_PRIMARY_TO_WORKER_PORT + i as u16)
+                        .parse()
+                        .unwrap(),
+                    format!("127.0.0.1:{}", BASE_TRANSACTIONS_PORT + i as u16)
+                        .parse()
+                        .unwrap(),
+                )
+            };
+
+            if worker_to_primary.ip().is_unspecified() || worker_to_primary.port() == 0 {
+                warn!(
+                    "[Config] ⚠️ INVALID worker_to_primary address for validator {}: {}",
+                    val.address, worker_to_primary
+                );
+            } else {
+                info!(
+                    "[Config] worker_to_primary for validator {} set to {}",
+                    val.address, worker_to_primary
+                );
+            }
+
+            if primary_to_worker.ip().is_unspecified() || primary_to_worker.port() == 0 {
+                warn!(
+                    "[Config] ⚠️ INVALID primary_to_worker address for validator {}: {}",
+                    val.address, primary_to_worker
+                );
+            } else {
+                info!(
+                    "[Config] primary_to_worker for validator {} set to {}",
+                    val.address, primary_to_worker
+                );
+            }
+
+            if transactions.ip().is_unspecified() || transactions.port() == 0 {
+                warn!(
+                    "[Config] ⚠️ INVALID transactions address for validator {}: {}",
+                    val.address, transactions
+                );
+            } else {
+                info!(
+                    "[Config] transactions endpoint for validator {} set to {}",
+                    val.address, transactions
+                );
+            }
 
             let workers = [(
                 0,

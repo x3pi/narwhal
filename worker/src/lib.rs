@@ -2,6 +2,8 @@
 mod batch_maker;
 mod helper;
 // mod primary_connector; // <--- XÓA DÒNG NÀY
+#[macro_use]
+mod logger;
 mod processor;
 mod quorum_waiter;
 mod synchronizer;

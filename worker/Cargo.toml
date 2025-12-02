@@ -24,6 +24,7 @@ store = { path = "../store" }
 config = { path = "../config" }
 network = { path = "../network" }
 primary = { path = "../primary" }
+tracing = "0.1"
 
 [dev-dependencies]
 rand = { version = "0.8", features = ["std"] }
